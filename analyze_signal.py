@@ -82,6 +82,32 @@ def _safe_rr(entry: float, sl: float, tp1: float, bias: str) -> Optional[float]:
         return None
 
 
+def estimate_tick_from_price(price: float) -> float:
+    """
+    Estimation du tick à partir du niveau de prix.
+
+    Ce n'est pas aussi précis que le tick Bitget, mais c'est beaucoup
+    mieux que 0.1 pour toutes les paires. On reste conservateur.
+    """
+    p = abs(float(price))
+    if p >= 10000:
+        return 1.0
+    elif p >= 1000:
+        return 0.1
+    elif p >= 100:
+        return 0.01
+    elif p >= 10:
+        return 0.001
+    elif p >= 1:
+        return 0.0001
+    elif p >= 0.1:
+        return 0.00001
+    elif p >= 0.01:
+        return 0.000001
+    else:
+        return 0.0000001
+
+
 def _compute_exits(df: pd.DataFrame, entry: float, bias: str, tick: float):
     if bias == "LONG":
         sl, meta = protective_stop_long(df, entry, tick, return_meta=True)
@@ -118,12 +144,10 @@ class SignalAnalyzer:
          - pas d'extension extrême contre le biais
          - RR >= RR_MIN_DESK_PRIORITY
          -> setup_type = "INST_CONTINUATION"
-
-    Dans les deux cas, la gestion SL/TP et le risk manager restent les mêmes.
     """
 
-    def __init__(self, api_key: str, api_secret: str, api_passphrase: str):
-        # plus de rr_min interne : tout est piloté via settings
+    def __init__(self, *args, **kwargs):
+        # Compat ancien code (API_KEY, etc.)
         pass
 
     async def analyze(
@@ -155,7 +179,6 @@ class SignalAnalyzer:
                 return None
         else:
             if bias not in ("LONG", "SHORT"):
-                # On peut laisser une chance plus tard, mais c'est rarement pertinent
                 LOGGER.info("[EVAL_PRE] Trend RANGE but REQUIRE_STRUCTURE=False")
 
         # ------------------------------------------------------------------
@@ -167,8 +190,7 @@ class SignalAnalyzer:
                 return None
 
         # ------------------------------------------------------------------
-        # 3 — BOS / BOS_QUALITY (on NE rejette pas encore, on stocke l'info)
-        #     → BOS_STRICT demandera bos_flag=True + quality OK
+        # 3 — BOS / BOS_QUALITY
         # ------------------------------------------------------------------
         bos_flag = struct.get("bos", False)
         bos_dir = struct.get("bos_direction", None)
@@ -233,7 +255,7 @@ class SignalAnalyzer:
                 )
                 return None
 
-        # Extension : on évite de rentrer pile dans un squeeze extrême
+        # Extension : pas rentrer dans une extension extrême
         if ext_sig == "OVEREXTENDED_LONG" and bias == "LONG":
             LOGGER.info(
                 "[EVAL_REJECT] Extension signal OVEREXTENDED_LONG for LONG bias (take-profit zone)"
@@ -254,11 +276,15 @@ class SignalAnalyzer:
         # ------------------------------------------------------------------
         # 7 — SL / TP1 / RR
         # ------------------------------------------------------------------
-        exits = _compute_exits(df_h1, entry, bias, tick=0.1)
-        rr = _safe_rr(entry, exits["sl"], exits["tp1"], bias)
+        tick = estimate_tick_from_price(entry)
+        exits = _compute_exits(df_h1, entry, bias, tick=tick)
+        sl = exits["sl"]
+        tp1 = exits["tp1"]
+
+        rr = _safe_rr(entry, sl, tp1, bias)
         LOGGER.info(
             f"[EVAL_PRE] RR={rr} raw_rr={exits['rr_used']} "
-            f"sl={exits['sl']} tp1={exits['tp1']}"
+            f"sl={sl} tp1={tp1} tick={tick}"
         )
 
         if rr is None or rr <= 0:
@@ -294,8 +320,8 @@ class SignalAnalyzer:
                 "side": "BUY" if bias == "LONG" else "SELL",
                 "bias": bias,
                 "entry": entry,
-                "sl": exits["sl"],
-                "tp1": exits["tp1"],
+                "sl": sl,
+                "tp1": tp1,
                 "tp2": None,
                 "rr": rr,
                 "qty": 1,
@@ -314,12 +340,6 @@ class SignalAnalyzer:
         inst_continuation_ok = False
 
         if DESK_EV_MODE:
-            # Conditions continuation :
-            #  - inst_score >= INST_SCORE_DESK_PRIORITY
-            #  - RR >= RR_MIN_DESK_PRIORITY
-            #  - composite momentum bien orienté
-            #  - momentum institutionnel aligné (déjà vérifié si REQUIRE_MOMENTUM=True)
-            #  - pas de signal d'extension contre le biais (déjà géré)
             good_inst = inst_score >= INST_SCORE_DESK_PRIORITY
             good_rr = rr >= RR_MIN_DESK_PRIORITY
 
@@ -349,8 +369,8 @@ class SignalAnalyzer:
                 "side": "BUY" if bias == "LONG" else "SELL",
                 "bias": bias,
                 "entry": entry,
-                "sl": exits["sl"],
-                "tp1": exits["tp1"],
+                "sl": sl,
+                "tp1": tp1,
                 "tp2": None,
                 "rr": rr,
                 "qty": 1,
