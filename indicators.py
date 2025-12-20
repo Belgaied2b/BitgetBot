@@ -1,511 +1,473 @@
 # =====================================================================
-# indicators.py — Institutional++ Technical & Momentum Suite
-# =====================================================================
-# Objectifs :
-#   - Fournir les briques techniques de base (EMA, RSI, MACD, ATR, OTE)
-#   - Ajouter une couche "desk" institutionnelle :
-#       * momentum composite
-#       * signal d'extension / mean-reversion
-#       * régimes de volatilité
-#   - Rester 100% compatible avec le reste du bot :
-#       * rsi, macd, ema, true_atr, compute_ote, volatility_regime,
-#         institutional_momentum, detect_rsi_divergence
+# indicators.py — Core + Institutional Indicators (Desk)
 # =====================================================================
 
-from typing import Dict, Any, Optional, Tuple
+from __future__ import annotations
+
+from typing import Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
 
-
-# =====================================================================
-# SAFE HELPERS
-# =====================================================================
-
-def _safe_len(obj) -> int:
-    try:
-        return len(obj)
-    except Exception:
-        return 0
-
-
-def _safe_series(series, fill: float = 0.0) -> pd.Series:
-    if series is None:
-        return pd.Series([fill])
-    try:
-        s = pd.Series(series, dtype="float64")
-    except Exception:
-        s = pd.Series([fill])
-    return s
+# Essayez de récupérer quelques params depuis settings.py, sinon valeurs par défaut
+try:
+    from settings import (
+        VOL_REGIME_ATR_PCT_LOW,
+        VOL_REGIME_ATR_PCT_HIGH,
+    )
+except Exception:
+    VOL_REGIME_ATR_PCT_LOW = 0.015
+    VOL_REGIME_ATR_PCT_HIGH = 0.035
 
 
 # =====================================================================
-# EMA / SMA
+# Helpers de base
 # =====================================================================
 
-def ema(series: pd.Series, length: int) -> pd.Series:
-    s = _safe_series(series)
-    if _safe_len(s) < 2:
-        return pd.Series([np.nan])
-    return s.ewm(span=length, adjust=False).mean()
+def _to_close_series(x: Any) -> pd.Series:
+    """
+    Accepte soit un DataFrame OHLC (avec colonne 'close'),
+    soit une Series déjà prête.
+    """
+    if isinstance(x, pd.Series):
+        return x.astype(float)
+    if isinstance(x, pd.DataFrame):
+        return x["close"].astype(float)
+    raise TypeError("Expected DataFrame with 'close' or Series for price input")
 
 
-def sma(series: pd.Series, length: int) -> pd.Series:
-    s = _safe_series(series)
-    if _safe_len(s) < length:
-        return pd.Series([np.nan] * _safe_len(s))
-    return s.rolling(window=length).mean()
+# =====================================================================
+# Moyennes mobiles (EMA / SMA)
+# =====================================================================
+
+def ema(series_or_df: Any, length: int = 20) -> pd.Series:
+    """
+    EMA classique sur la clôture (ou sur la Series fournie).
+    """
+    c = _to_close_series(series_or_df)
+    return c.ewm(span=length, adjust=False).mean()
+
+
+def sma(series_or_df: Any, length: int = 20) -> pd.Series:
+    """
+    SMA classique.
+    """
+    c = _to_close_series(series_or_df)
+    return c.rolling(window=length, min_periods=1).mean()
 
 
 # =====================================================================
 # RSI
 # =====================================================================
 
-def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+def rsi(series_or_df: Any, length: int = 14) -> pd.Series:
     """
-    RSI style Wilder, robuste et stable même sur peu de données.
+    Relative Strength Index (RSI), 0-100.
     """
-    s = _safe_series(series)
-    n = _safe_len(s)
-    if n <= length:
-        # on renvoie un RSI neutre quand on a peu d'historique
-        return pd.Series([50.0] * n, index=s.index)
+    c = _to_close_series(series_or_df)
+    delta = c.diff()
 
-    delta = s.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
 
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
+    gain_series = pd.Series(gain, index=c.index)
+    loss_series = pd.Series(loss, index=c.index)
 
-    # Moyenne exponentielle à la Wilder
-    avg_gain = gain.ewm(alpha=1 / length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / length, adjust=False).mean()
+    avg_gain = gain_series.ewm(alpha=1.0 / length, adjust=False).mean()
+    avg_loss = loss_series.ewm(alpha=1.0 / length, adjust=False).mean()
 
-    rs = avg_gain / (avg_loss + 1e-10)
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
     rsi_val = 100.0 - (100.0 / (1.0 + rs))
+    rsi_val = rsi_val.fillna(50.0)
 
-    return rsi_val.fillna(50.0)
+    return rsi_val
 
 
 # =====================================================================
 # MACD
 # =====================================================================
 
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+def macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
     """
-    MACD standard (12/26/9) retournant :
-      - macd_line
-      - signal_line
-      - histogram (macd_line - signal_line)
+    MACD standard :
+        - macd_line = EMA(fast) - EMA(slow)
+        - signal_line = EMA(macd_line, signal)
+        - hist = macd_line - signal_line
+
+    Retourne DataFrame avec colonnes ['macd', 'signal', 'hist'].
     """
-    s = _safe_series(series)
-    if _safe_len(s) < slow + signal:
-        nan = pd.Series([np.nan] * _safe_len(s), index=s.index)
-        return nan, nan, nan
-
-    ema_fast = s.ewm(span=fast, adjust=False).mean()
-    ema_slow = s.ewm(span=slow, adjust=False).mean()
-
+    close = df["close"].astype(float)
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     hist = macd_line - signal_line
 
-    return macd_line, signal_line, hist
+    out = pd.DataFrame(
+        {
+            "macd": macd_line,
+            "signal": signal_line,
+            "hist": hist,
+        },
+        index=df.index,
+    )
+    return out
 
 
 # =====================================================================
-# TRUE ATR
+# ATR (corrigé : plus de fillna(method="bfill"))
 # =====================================================================
 
-def true_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     """
-    Average True Range (Wilder) sur length périodes.
-    Utilisé pour SL institutionnel, RR, régimes de volatilité, etc.
+    Average True Range (ATR) simple, basé sur :
+      TR = max(
+        high - low,
+        |high - prev_close|,
+        |low - prev_close|
+      )
+      ATR = moyenne mobile simple sur 'length' périodes.
     """
-    if df is None or _safe_len(df) < 2:
-        return pd.Series([0.0])
-
     high = df["high"].astype(float)
     low = df["low"].astype(float)
     close = df["close"].astype(float)
 
     prev_close = close.shift(1)
-    tr1 = high - low
+
+    tr1 = (high - low).abs()
     tr2 = (high - prev_close).abs()
     tr3 = (low - prev_close).abs()
+
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    atr = tr.ewm(alpha=1.0 / length, adjust=False).mean()
-    return atr.fillna(method="bfill").fillna(0.0)
+    atr_raw = tr.rolling(window=length, min_periods=1).mean()
+    # 🔧 Correction du FutureWarning : on utilise .bfill() au lieu de fillna(method="bfill")
+    return atr_raw.bfill().fillna(0.0)
 
 
-# =====================================================================
-# VOLATILITY REGIME
-# =====================================================================
-
-def volatility_regime(df: pd.DataFrame, length: int = 14) -> str:
+def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     """
-    Classe le marché en régime de volatilité :
-      - "LOW"    : ATR% < 1 %
-      - "MEDIUM" : 1 % <= ATR% < 3 %
-      - "HIGH"   : ATR% >= 3 %
+    Alias pour atr(), pour compatibilité éventuelle.
     """
-    if df is None or _safe_len(df) < length + 2:
-        return "UNKNOWN"
-
-    atr = true_atr(df, length=length)
-    last_atr = float(atr.iloc[-1])
-    last_price = float(df["close"].iloc[-1])
-
-    if last_price <= 0:
-        return "UNKNOWN"
-
-    atr_pct = last_atr / last_price
-
-    if atr_pct < 0.01:
-        return "LOW"
-    if atr_pct < 0.03:
-        return "MEDIUM"
-    return "HIGH"
+    return atr(df, length=length)
 
 
 # =====================================================================
-# OTE (Optimal Trade Entry) — Value zones
+# OTE (Optimal Trade Entry) — approx
 # =====================================================================
 
-def compute_ote(df: pd.DataFrame, lookback: int = 80) -> Dict[str, Any]:
+def compute_ote(
+    df: pd.DataFrame,
+    bias: str,
+    lookback: int = 50,
+) -> Dict[str, Any]:
     """
-    Approximation OTE sur la dernière jambe swing :
-      - discount zone ~ zone d'achat idéale
-      - premium zone  ~ zone de vente idéale
+    Approximation "OTE ICT" :
+      - on prend le plus bas / plus haut sur les N dernières bougies,
+      - on calcule les niveaux 0.62 / 0.705 (golden zone),
+      - on vérifie si le prix actuel est dans la zone "OTE" du côté cohérent.
 
-    Retourne :
+    Retour :
       {
-        "discount_zone": (low_ote, high_ote),
-        "premium_zone": (low_ote, high_ote),
-        "in_discount": bool,
-        "in_premium": bool,
+        "in_ote": bool,
+        "ote_low": float,
+        "ote_high": float,
       }
     """
-    if df is None or _safe_len(df) < lookback:
-        return {
-            "discount_zone": (None, None),
-            "premium_zone": (None, None),
-            "in_discount": False,
-            "in_premium": False,
-        }
+    if df is None or len(df) < 10:
+        return {"in_ote": False, "ote_low": None, "ote_high": None}
 
-    w = df.tail(lookback)
-    high = float(w["high"].max())
-    low = float(w["low"].min())
-    last = float(w["close"].iloc[-1])
+    sub = df.tail(lookback)
+    high = float(sub["high"].max())
+    low = float(sub["low"].min())
+    last = float(sub["close"].iloc[-1])
 
     if high <= low:
-        return {
-            "discount_zone": (None, None),
-            "premium_zone": (None, None),
-            "in_discount": False,
-            "in_premium": False,
-        }
+        return {"in_ote": False, "ote_low": None, "ote_high": None}
 
+    # Fibonacci retracements
     diff = high - low
+    fib_62 = high - 0.62 * diff
+    fib_705 = high - 0.705 * diff
 
-    # Zones fibo classiques ICT-ish
-    discount_low = low + 0.62 * diff
-    discount_high = low + 0.79 * diff
+    ote_low = min(fib_62, fib_705)
+    ote_high = max(fib_62, fib_705)
 
-    premium_low = low + 0.20 * diff
-    premium_high = low + 0.38 * diff
-
-    in_discount = discount_low <= last <= discount_high
-    in_premium = premium_low <= last <= premium_high
+    in_ote = ote_low <= last <= ote_high
 
     return {
-        "discount_zone": (discount_low, discount_high),
-        "premium_zone": (premium_low, premium_high),
-        "in_discount": bool(in_discount),
-        "in_premium": bool(in_premium),
+        "in_ote": bool(in_ote),
+        "ote_low": float(ote_low),
+        "ote_high": float(ote_high),
     }
 
 
 # =====================================================================
-# EXTENSION / MEAN REVERSION SIGNAL
+# Volatility regime (basé sur ATR%)
 # =====================================================================
 
-def extension_signal(
-    df: pd.DataFrame,
-    ema_fast_len: int = 20,
-    ema_slow_len: int = 50,
-    atr_len: int = 14,
-    k: float = 1.5,
-) -> str:
+def volatility_regime(df: pd.DataFrame, atr_length: int = 14) -> str:
     """
-    Détecte une situation d'over-extension par rapport aux EMA + ATR.
+    Classe la volatilité en fonction de ATR% sur les dernières bougies.
 
-    Idée :
-      - On regarde la distance du prix actuel aux EMA20/50,
-        normalisée par l'ATR.
-      - Si c'est trop étendu dans un sens, on est en zone "mean reversion".
+    ATR% = ATR / close
+    Règles par défaut (modifiables via settings) :
+      - ATR% < VOL_REGIME_ATR_PCT_LOW  -> "LOW"
+      - ATR% > VOL_REGIME_ATR_PCT_HIGH -> "HIGH"
+      - sinon                           -> "MEDIUM"
+    """
+    if df is None or len(df) < atr_length + 5:
+        return "UNKNOWN"
+
+    atr_series = atr(df, length=atr_length)
+    close = df["close"].astype(float)
+    atr_pct = (atr_series / close).replace([np.inf, -np.inf], np.nan)
+
+    last = float(atr_pct.iloc[-1]) if not atr_pct.empty else np.nan
+    if not np.isfinite(last):
+        return "UNKNOWN"
+
+    if last < VOL_REGIME_ATR_PCT_LOW:
+        return "LOW"
+    if last > VOL_REGIME_ATR_PCT_HIGH:
+        return "HIGH"
+    return "MEDIUM"
+
+
+# =====================================================================
+# Extension signal (sur-extension prix / RSI)
+# =====================================================================
+
+def extension_signal(df: pd.DataFrame, ema_fast_len: int = 20, ema_slow_len: int = 50) -> Optional[str]:
+    """
+    Détecte une sur-extension simple :
+      - distance du prix par rapport à EMA50
+      - RSI extrême
 
     Retourne :
-      - "OVEREXTENDED_LONG"
-      - "OVEREXTENDED_SHORT"
-      - "NORMAL"
+      - "OVEREXTENDED_LONG"  : prix très au-dessus, RSI > 70
+      - "OVEREXTENDED_SHORT" : prix très en-dessous, RSI < 30
+      - None                 : pas de signal d'extension fort
     """
-    if df is None or _safe_len(df) < max(ema_slow_len, atr_len) + 5:
-        return "NORMAL"
+    if df is None or len(df) < max(ema_slow_len, 30):
+        return None
 
     close = df["close"].astype(float)
     ema_fast = ema(close, ema_fast_len)
     ema_slow = ema(close, ema_slow_len)
-    atr = true_atr(df, length=atr_len)
+    r = rsi(close)
 
-    last_price = float(close.iloc[-1])
-    last_ema = float(ema_fast.iloc[-1])
+    last_close = float(close.iloc[-1])
     last_ema_slow = float(ema_slow.iloc[-1])
-    last_atr = float(atr.iloc[-1])
+    last_rsi = float(r.iloc[-1])
 
-    if last_atr <= 0:
-        return "NORMAL"
+    if last_ema_slow <= 0:
+        return None
 
-    # Distance à l'EMA20 et EMA50
-    dist_fast = (last_price - last_ema) / last_atr
-    dist_slow = (last_price - last_ema_slow) / last_atr
+    dist_pct = (last_close - last_ema_slow) / last_ema_slow
 
-    # Si les deux sont dans le même sens et assez forts, on considère une extension
-    if dist_fast > k and dist_slow > k:
+    # seuils assez génériques, pas trop agressifs
+    if dist_pct > 0.06 and last_rsi > 70:
         return "OVEREXTENDED_LONG"
-    if dist_fast < -k and dist_slow < -k:
+    if dist_pct < -0.06 and last_rsi < 30:
         return "OVEREXTENDED_SHORT"
 
-    return "NORMAL"
+    return None
 
 
 # =====================================================================
-# MOMENTUM INSTITUTIONNEL & COMPOSITE
+# Momentum institutionnel (EMA spread + MACD + RSI + volume)
 # =====================================================================
 
 def institutional_momentum(df: pd.DataFrame) -> str:
     """
-    Version label simple (BACKWARD COMPATIBLE avec analyze_signal.py) :
+    Synthèse momentum orientée desk :
 
+      - EMA20 vs EMA50 (trend short-term)
+      - MACD (direction / force)
+      - RSI (position dans le range 0-100)
+      - Volume relatif
+
+    Retour :
       - "STRONG_BULLISH"
       - "BULLISH"
-      - "STRONG_BEARISH"
-      - "BEARISH"
       - "NEUTRAL"
-
-    Basé sur :
-      - MACD (signe + pente)
-      - EMA20/EMA50 (cross + pente)
-      - RSI
-      - Volume spike
+      - "BEARISH"
+      - "STRONG_BEARISH"
     """
-    if df is None or _safe_len(df) < 40:
+    if df is None or len(df) < 60:
         return "NEUTRAL"
 
     close = df["close"].astype(float)
     volume = df["volume"].astype(float)
 
-    r = rsi(close, length=14)
-    macd_line, signal_line, hist = macd(close)
-    ema20 = ema(close, 20)
-    ema50 = ema(close, 50)
+    ema_fast = ema(close, 20)
+    ema_slow = ema(close, 50)
+    m = macd(df)
+    r = rsi(close)
 
-    if _safe_len(macd_line) < 5:
-        return "NEUTRAL"
+    # Spread EMA
+    ema_spread = ema_fast - ema_slow
+    ema_spread_last = float(ema_spread.iloc[-1])
 
-    macd_slope = float(macd_line.iloc[-1] - macd_line.iloc[-5])
+    # MACD
+    macd_last = float(m["macd"].iloc[-1])
+    macd_hist_last = float(m["hist"].iloc[-1])
 
-    # Volume spike sur les 20 dernières barres
-    if _safe_len(volume) >= 20:
-        avg_vol = float(volume.iloc[-20:].mean())
-        vol_spike = float(volume.iloc[-1]) > 1.8 * avg_vol
-    else:
-        vol_spike = False
+    # RSI
+    r_last = float(r.iloc[-1])
 
-    last_rsi = float(r.iloc[-1])
-    last_hist = float(hist.iloc[-1])
-    last_ema20 = float(ema20.iloc[-1])
-    last_ema50 = float(ema50.iloc[-1])
+    # Volume relatif
+    vol_sub = volume.tail(40)
+    vol_avg = float(vol_sub.mean()) if not vol_sub.empty else 0.0
+    vol_last = float(volume.iloc[-1])
+    vol_factor = vol_last / vol_avg if vol_avg > 0 else 1.0
 
-    # Forte tendance haussière
-    if (
-        last_hist > 0
-        and macd_slope > 0
-        and last_ema20 > last_ema50
-        and last_rsi > 55
-    ):
-        return "STRONG_BULLISH" if not vol_spike else "BULLISH"
+    score = 0.0
 
-    # Tendance haussière modérée
-    if (
-        last_hist > 0
-        and last_ema20 > last_ema50
-        and last_rsi > 50
-    ):
+    # EMA spread
+    if ema_spread_last > 0:
+        score += 1.0
+    elif ema_spread_last < 0:
+        score -= 1.0
+
+    # MACD + hist
+    if macd_last > 0 and macd_hist_last > 0:
+        score += 1.0
+    elif macd_last < 0 and macd_hist_last < 0:
+        score -= 1.0
+
+    # RSI
+    if r_last > 60:
+        score += 0.5
+    elif r_last < 40:
+        score -= 0.5
+
+    # Volume
+    if vol_factor > 1.5:
+        score += 0.5
+    elif vol_factor < 0.7:
+        score -= 0.5
+
+    # classification finale
+    if score >= 2.0:
+        return "STRONG_BULLISH"
+    if score >= 0.5:
         return "BULLISH"
-
-    # Forte tendance baissière
-    if (
-        last_hist < 0
-        and macd_slope < 0
-        and last_ema20 < last_ema50
-        and last_rsi < 45
-    ):
-        return "STRONG_BEARISH" if not vol_spike else "BEARISH"
-
-    # Tendance baissière modérée
-    if (
-        last_hist < 0
-        and last_ema20 < last_ema50
-        and last_rsi < 50
-    ):
+    if score <= -2.0:
+        return "STRONG_BEARISH"
+    if score <= -0.5:
         return "BEARISH"
-
     return "NEUTRAL"
 
 
+# =====================================================================
+# Composite momentum (score 0-100 + label)
+# =====================================================================
+
 def composite_momentum(df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Version "desk lead++" : momentum composite sur 0–100.
+    Retourne un score "momentum composite" dans [0, 100] et un label textuel.
 
     Composants :
-      - Trend EMA20/EMA50 (direction + pente)
-      - MACD (signe + pente)
-      - RSI (distance à 50)
-      - Extension/Mean Reversion (via extension_signal)
-      - Volume (spike ou non)
-
-    Retourne :
-      {
-        "score": float 0–100,
-        "label": "VERY_BULLISH" / "BULLISH" /
-                 "NEUTRAL" / "BEARISH" / "VERY_BEARISH",
-        "components": { ... },
-      }
+      - trend_score : basé sur l'EMA spread (direction)
+      - macd_score  : basé sur MACD/hist
+      - rsi_score   : récompense RSI bull / bear raisonnable
+      - vol_score   : volume relatif
+      - ext_score   : pénalité si extension forte (overextended)
     """
-    if df is None or _safe_len(df) < 40:
-        return {"score": 50.0, "label": "NEUTRAL", "components": {}}
+    if df is None or len(df) < 60:
+        return {
+            "score": 50.0,
+            "label": "NEUTRAL",
+            "components": {},
+        }
 
     close = df["close"].astype(float)
     volume = df["volume"].astype(float)
 
-    # Base components
-    r = rsi(close, length=14)
-    macd_line, signal_line, hist = macd(close)
-    ema20 = ema(close, 20)
-    ema50 = ema(close, 50)
+    ema_fast = ema(close, 20)
+    ema_slow = ema(close, 50)
+    ema_spread = ema_fast - ema_slow
+    ema_spread_last = float(ema_spread.iloc[-1])
 
-    if _safe_len(macd_line) < 5:
-        return {"score": 50.0, "label": "NEUTRAL", "components": {}}
+    m = macd(df)
+    macd_last = float(m["macd"].iloc[-1])
+    macd_hist_last = float(m["hist"].iloc[-1])
 
-    macd_slope = float(macd_line.iloc[-1] - macd_line.iloc[-5])
-    last_rsi = float(r.iloc[-1])
-    last_hist = float(hist.iloc[-1])
-    last_ema20 = float(ema20.iloc[-1])
-    last_ema50 = float(ema50.iloc[-1])
+    r = rsi(close)
+    r_last = float(r.iloc[-1])
 
-    # Trend score (EMA)
-    if last_ema20 > last_ema50:
+    vol_sub = volume.tail(40)
+    vol_avg = float(vol_sub.mean()) if not vol_sub.empty else 0.0
+    vol_last = float(volume.iloc[-1])
+    vol_factor = vol_last / vol_avg if vol_avg > 0 else 1.0
+
+    ext = extension_signal(df)
+
+    # Trend score in [-1, +1]
+    if ema_spread_last > 0:
         trend_score = 1.0
-    elif last_ema20 < last_ema50:
+    elif ema_spread_last < 0:
         trend_score = -1.0
     else:
         trend_score = 0.0
 
-    # MACD score
-    macd_score = np.tanh(last_hist * 5.0) + np.tanh(macd_slope * 10.0)
-    macd_score = float(macd_score)  # ~[-2, 2]
+    # MACD score approx in [-1, +1]
+    macd_raw = macd_last + 0.5 * macd_hist_last
+    macd_score = float(np.tanh(macd_raw))
 
-    # RSI score (distance à 50)
-    rsi_score = (last_rsi - 50.0) / 25.0  # ~[-2, 2] pour RSI dans [0,100]
+    # RSI score : centré sur 50, normalisé
+    rsi_score = (r_last - 50.0) / 25.0  # ~ [-2, 2]
+    rsi_score = float(np.clip(rsi_score, -2.0, 2.0))
 
-    # Volume score
-    if _safe_len(volume) >= 20:
-        avg_vol = float(volume.iloc[-20:].mean())
-        vol_ratio = float(volume.iloc[-1]) / (avg_vol + 1e-8)
-        vol_score = np.tanh((vol_ratio - 1.0) * 2.0)  # [-1,1]
+    # Volume score : >1.5 -> +1, <0.7 -> -1
+    if vol_factor > 1.5:
+        vol_score = 1.0
+    elif vol_factor < 0.7:
+        vol_score = -1.0
     else:
         vol_score = 0.0
 
-    # Extension signal
-    ext = extension_signal(df)
-    if ext == "OVEREXTENDED_LONG":
-        ext_score = -0.7  # trop étiré à l'achat => risque de mean reversion
-    elif ext == "OVEREXTENDED_SHORT":
-        ext_score = 0.7   # trop étiré à la vente
+    # Extension penalty
+    if ext == "OVEREXTENDED_LONG" or ext == "OVEREXTENDED_SHORT":
+        ext_score = -0.7
     else:
         ext_score = 0.0
 
-    # Combine the components
-    raw = (
-        0.4 * trend_score +        # direction structurelle
-        0.4 * (macd_score / 2.0) + # normalise macd_score [-1,1]
-        0.3 * (rsi_score / 2.0) +  # normalise rsi_score [-1,1]
-        0.2 * vol_score +          # volume
-        0.3 * ext_score            # extension / mean revert
+    # Combine (pondérations arbitraires mais raisonnables)
+    raw_score = (
+        1.0 * trend_score
+        + 0.8 * macd_score
+        + 0.8 * rsi_score
+        + 0.7 * vol_score
+        + 1.0 * ext_score
     )
 
-    # raw ~ [-2, 2] environ → on mappe en [0, 100]
-    score = float(50.0 + 25.0 * raw)
-    score = max(0.0, min(100.0, score))
+    # compress & normalise to [0, 100]
+    norm = 50.0 + 25.0 * float(np.tanh(raw_score))  # ~[25,75] mais lissé
+    norm = float(np.clip(norm, 0.0, 100.0))
 
-    # Label discret
-    if score >= 75:
-        label = "VERY_BULLISH"
-    elif score >= 60:
+    # Label
+    if norm >= 70:
         label = "BULLISH"
-    elif score <= 25:
-        label = "VERY_BEARISH"
-    elif score <= 40:
+    elif norm >= 55:
+        label = "SLIGHT_BULLISH"
+    elif norm <= 30:
         label = "BEARISH"
+    elif norm <= 45:
+        label = "SLIGHT_BEARISH"
     else:
         label = "NEUTRAL"
 
     return {
-        "score": score,
+        "score": norm,
         "label": label,
         "components": {
-            "trend_score": float(trend_score),
-            "macd_score": float(macd_score),
-            "rsi_score": float(rsi_score),
-            "vol_score": float(vol_score),
-            "ext_score": float(ext_score),
+            "trend_score": trend_score,
+            "macd_score": macd_score,
+            "rsi_score": rsi_score,
+            "vol_score": vol_score,
+            "ext_score": ext_score,
         },
     }
-
-
-# =====================================================================
-# RSI DIVERGENCE SIMPLE
-# =====================================================================
-
-def detect_rsi_divergence(df: pd.DataFrame) -> Optional[str]:
-    """
-    Détection simple de divergence RSI sur ~5–10 barres.
-
-    Retourne :
-      - "bullish"  : prix fait un plus bas plus bas, RSI un plus bas plus haut
-      - "bearish"  : prix fait un plus haut plus haut, RSI un plus haut plus bas
-      - None       : pas de divergence claire
-    """
-    if df is None or _safe_len(df) < 15:
-        return None
-
-    close = df["close"].astype(float)
-    r = rsi(close, length=14)
-
-    # On regarde un point "récent" et un point "ancien"
-    p1 = float(close.iloc[-1])
-    p2 = float(close.iloc[-6])
-    r1 = float(r.iloc[-1])
-    r2 = float(r.iloc[-6])
-
-    # Divergence haussière
-    if p1 < p2 and r1 > r2:
-        return "bullish"
-
-    # Divergence baissière
-    if p1 > p2 and r1 < r2:
-        return "bearish"
-
-    return None
