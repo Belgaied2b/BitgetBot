@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional
 import numpy as np
 import pandas as pd
 
-# Essayez de récupérer quelques params depuis settings.py, sinon valeurs par défaut
+# Essaye de récupérer quelques params depuis settings.py, sinon valeurs par défaut
 try:
     from settings import (
         VOL_REGIME_ATR_PCT_LOW,
@@ -115,7 +115,7 @@ def macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> p
 
 
 # =====================================================================
-# ATR (corrigé : plus de fillna(method="bfill"))
+# ATR (corrigé) + alias true_atr
 # =====================================================================
 
 def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
@@ -141,13 +141,21 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
     atr_raw = tr.rolling(window=length, min_periods=1).mean()
-    # 🔧 Correction du FutureWarning : on utilise .bfill() au lieu de fillna(method="bfill")
+    # Correction du FutureWarning : on utilise .bfill() au lieu de fillna(method="bfill")
     return atr_raw.bfill().fillna(0.0)
 
 
 def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     """
     Alias pour atr(), pour compatibilité éventuelle.
+    """
+    return atr(df, length=length)
+
+
+def true_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    """
+    Alias backward-compat pour les modules (stops.py) qui importent true_atr.
+    Utilise la même logique que atr().
     """
     return atr(df, length=length)
 
