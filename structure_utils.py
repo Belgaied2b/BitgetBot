@@ -1,5 +1,5 @@
 # =====================================================================
-# structure_utils.py — Institutional Structure Engine ++
+# structure_utils.py — Institutional Structure Engine ++ (Desk v2)
 # BOS / CHOCH / Internal vs External / Liquidity / OB / FVG / HTF
 # =====================================================================
 
@@ -201,10 +201,8 @@ def _classify_bos(
     last_hi_level = None
     ext_hi_level = None
     if len(highs) >= 2:
-        # external high = max of last 3 highs
         hi_prices = [p for _, p in highs[-3:]]
         ext_hi_level = max(hi_prices)
-        # nearest recent high
         last_hi_level = highs[-1][1]
 
     last_lo_level = None
@@ -220,7 +218,6 @@ def _classify_bos(
     if last_hi_level is not None and last_close > last_hi_level:
         bos_up = True
         broken_up_level = last_hi_level
-        # if we also broke the external high, mark as EXTERNAL
         bos_type = "EXTERNAL" if ext_hi_level is not None and last_close > ext_hi_level else "INTERNAL"
     else:
         bos_type = None
@@ -328,7 +325,7 @@ def htf_trend_ok(df_htf: pd.DataFrame, bias: str) -> bool:
 
 
 # =====================================================================
-# BOS QUALITY (volume / OI / liquidity sweep)
+# BOS QUALITY v2 (score-based, missing OI = neutre)
 # =====================================================================
 
 def bos_quality_details(
@@ -341,29 +338,31 @@ def bos_quality_details(
     df_liq: Optional[pd.DataFrame] = None,
     price: Optional[float] = None,
     tick: float = 0.1,
+    direction: Optional[str] = None,  # "UP" / "DOWN"
 ) -> Dict[str, Any]:
     """
-    Evaluate BOS quality using multiple institutional signals:
+    BOS QUALITY v2 (desk ++, moins bloquante)
 
-      - Volume factor: last volume vs mean(volume[lookback])
-      - Body ratio: |close-open| / (high-low)
-      - OI slope: trend in open interest over last ~N bars
-      - Liquidity sweep: did we sweep an equal high/low?
-      - Close position in range (upper/lower quartile)
+    Idée :
+      - On calcule un SCORE global plutôt que de bloquer dès qu'un critère est
+        un peu faible.
+      - Composants :
+          * volume_factor (last_vol / avg_vol)
+          * body_ratio (|close-open| / range)
+          * OI slope (si oi_series réellement fourni)
+          * liquidity_sweep (equal highs/lows cassés)
+          * range_pos (position du close dans la bougie) vs direction
 
-    Returns:
-        {
-          "ok": bool,
-          "volume_factor": float,
-          "body_ratio": float,
-          "oi_slope": float,
-          "liquidity_sweep": bool,
-          "range_pos": float,
-          "reasons": [ ... ],
-        }
+    Behaviour :
+      - Si oi_series est None -> on ne pénalise PAS "weak_oi".
+      - ok = True si score >= 0
+      - ok = False si score < 0
+
+    On garde les trucs illiquides (volume_factor ~0, body_ratio ~0) en rejet
+    naturel via un score très négatif.
     """
     if df is None or len(df) < max(vol_lookback, 20):
-        return {"ok": True, "reason": "not_enough_data"}
+        return {"ok": True, "score": 0.0, "reason": "not_enough_data"}
 
     closes = df["close"].astype(float)
     opens = df["open"].astype(float)
@@ -377,22 +376,24 @@ def bos_quality_details(
     last_low = float(lows.iloc[-1])
     last_vol = float(vols.iloc[-1])
 
+    # Fenêtre de volume
     w = df.tail(vol_lookback)
     avg_vol = float(w["volume"].mean()) if not w["volume"].empty else 0.0
+
     volume_factor = last_vol / avg_vol if avg_vol > 0 else 1.0
 
     rng = last_high - last_low
     body = abs(last_close - last_open)
     body_ratio = body / rng if rng > 0 else 0.0
 
-    # position of close inside the bar range (0=low, 1=high)
     if rng > 0:
         range_pos = (last_close - last_low) / rng
     else:
         range_pos = 0.5
 
-    # OI slope (relative) over last 10 bars if available
+    # OI slope si dispo
     oi_slope = 0.0
+    oi_penalized = False
     if oi_series is not None:
         try:
             s = pd.Series(oi_series).astype(float)
@@ -403,7 +404,7 @@ def bos_quality_details(
         except Exception:
             oi_slope = 0.0
 
-    # liquidity sweep detection
+    # Liquidity sweep ?
     liquidity_sweep = False
     if df_liq is None:
         df_liq = df
@@ -413,7 +414,6 @@ def bos_quality_details(
         eq_lows = levels.get("eq_lows", []) or []
         ref_price = float(price) if price is not None else last_close
 
-        # if we close above an eq_high or below an eq_low, we consider it swept
         for lvl in eq_highs:
             if ref_price > lvl:
                 liquidity_sweep = True
@@ -426,30 +426,78 @@ def bos_quality_details(
     except Exception:
         liquidity_sweep = False
 
+    # ------------------------------------------------------------------
+    # SCORE GLOBAL
+    # ------------------------------------------------------------------
+    score = 0.0
     reasons: List[str] = []
 
-    # volume threshold: want at least vol_pct * avg_vol more than average
-    if volume_factor < (1.0 + vol_pct):
+    # Volume : on score par zones
+    if volume_factor >= 1.5:
+        score += 2.0
+    elif volume_factor >= 1.0:
+        score += 1.0
+    elif volume_factor >= 0.5:
+        score += 0.0
+    else:
+        score -= 1.0
         reasons.append("low_volume")
 
-    # want a decent body (no doji-style BOS)
-    if body_ratio < 0.35:
+    # Body ratio
+    if body_ratio >= 0.6:
+        score += 2.0
+    elif body_ratio >= 0.4:
+        score += 1.0
+    elif body_ratio >= 0.25:
+        score += 0.0
+    else:
+        score -= 1.0
         reasons.append("small_body")
 
-    # OI slope: if too small in absolute value, no real commitment
-    if abs(oi_slope) < oi_min_trend:
-        reasons.append("weak_oi")
+    # OI (uniquement si série fournie)
+    if oi_series is not None:
+        abs_oi = abs(oi_slope)
+        if abs_oi >= 0.01:
+            score += 2.0
+        elif abs_oi >= 0.004:
+            score += 1.0
+        elif abs_oi < 0.001:
+            score -= 1.0
+            oi_penalized = True
+            reasons.append("weak_oi")
 
-    ok = len(reasons) == 0
+    # Sweep de liquidité = bonus
+    if liquidity_sweep:
+        score += 1.0
+
+    # Position de close vs direction du BOS
+    if direction is not None:
+        d = direction.upper()
+        if d == "UP":
+            if range_pos > 0.6:
+                score += 1.0
+            elif range_pos < 0.3:
+                score -= 1.0
+                reasons.append("close_not_in_upper_range")
+        elif d == "DOWN":
+            if range_pos < 0.4:
+                score += 1.0
+            elif range_pos > 0.7:
+                score -= 1.0
+                reasons.append("close_not_in_lower_range")
+
+    ok = score >= 0.0
 
     return {
         "ok": ok,
+        "score": float(score),
         "volume_factor": float(volume_factor),
         "body_ratio": float(body_ratio),
         "oi_slope": float(oi_slope),
         "liquidity_sweep": bool(liquidity_sweep),
         "range_pos": float(range_pos),
         "reasons": reasons,
+        "oi_penalized": bool(oi_penalized),
     }
 
 
@@ -462,12 +510,6 @@ def _detect_order_blocks(df: pd.DataFrame, lookback: int = 80) -> Dict[str, Any]
 
     - Bullish OB: last bearish candle before an impulsive move up.
     - Bearish OB: last bullish candle before an impulsive move down.
-
-    Returns:
-        {
-          "bullish": {"index": int, "low": float, "high": float} or None,
-          "bearish": {...} or None,
-        }
     """
     if df is None or len(df) < 20:
         return {"bullish": None, "bearish": None}
@@ -475,15 +517,11 @@ def _detect_order_blocks(df: pd.DataFrame, lookback: int = 80) -> Dict[str, Any]
     sub = df.tail(lookback)
     o = sub["open"].astype(float).to_numpy()
     c = sub["close"].astype(float).to_numpy()
-    h = sub["high"].astype(float).to_numpy()
-    l = sub["low"].astype(float).to_numpy()
 
-    # Impulsive up move: strong close-to-close change over N bars
     closes = c
     if closes.size < 10:
         return {"bullish": None, "bearish": None}
 
-    # Define recent impulse window ~ last 5 bars
     N = min(5, closes.size - 1)
     impulse_ret = (closes[-1] - closes[-1 - N]) / max(abs(closes[-1 - N]), 1e-8)
 
@@ -493,7 +531,6 @@ def _detect_order_blocks(df: pd.DataFrame, lookback: int = 80) -> Dict[str, Any]
     idx_offset = len(df) - len(sub)
 
     if impulse_ret > 0.03:  # > 3% up move
-        # last bearish candle in the impulse window
         for i in range(len(sub) - N - 1, len(sub) - 1):
             if c[i] < o[i]:  # bearish
                 bullish_ob = {
@@ -514,19 +551,7 @@ def _detect_order_blocks(df: pd.DataFrame, lookback: int = 80) -> Dict[str, Any]
 
 
 def _detect_fvg(df: pd.DataFrame, lookback: int = 80) -> List[Dict[str, Any]]:
-    """Detects simple Fair Value Gaps (FVG) on last `lookback` bars.
-
-    A bullish FVG (3-candle) example:
-        low[1] > high[0]  AND  low[1] > high[2]
-    A bearish FVG:
-        high[1] < low[0] AND   high[1] < low[2]
-
-    Returns a list of zones:
-        [
-          {"type": "bullish"/"bearish", "start": float, "end": float, "index": int},
-          ...
-        ]
-    """
+    """Detects simple Fair Value Gaps (FVG) on last `lookback` bars."""
     zones: List[Dict[str, Any]] = []
 
     if df is None or len(df) < 5:
@@ -566,22 +591,6 @@ def _detect_fvg(df: pd.DataFrame, lookback: int = 80) -> List[Dict[str, Any]]:
 def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Main structure analysis entrypoint for H1.
-
-    Returns a rich structure context:
-
-        {
-          "trend": "LONG" / "SHORT" / "RANGE",
-          "swings": {"highs": [...], "lows": [...]},
-          "liquidity": {"eq_highs": [...], "eq_lows": [...]},
-          "bos": bool,
-          "choch": bool,
-          "cos": bool,
-          "bos_type": "INTERNAL" / "EXTERNAL" / None,
-          "bos_direction": "UP" / "DOWN" / None,
-          "order_blocks": {"bullish": {...} or None, "bearish": {...} or None},
-          "fvg_zones": [ {...}, ... ],
-          "oi_series": pd.Series or None,
-        }
     """
     if df is None or len(df) < 30:
         return {
@@ -633,16 +642,7 @@ def commitment_score(
 ) -> float:
     """
     Very lightweight commitment proxy combining OI & CVD behaviours.
-
-    - If OI rising + CVD rising → strong long commitment.
-    - If OI rising + CVD falling → strong short build.
-    - If OI flat / falling → weaker conviction.
-
-    Returns:
-        score in [-1, +1] where:
-          +1  ~ strong long build
-          -1  ~ strong short build
-           0  ~ neutral / unclear
+    Returns score in [-1, +1].
     """
     try:
         if oi_series is None or cvd_series is None:
@@ -657,7 +657,6 @@ def commitment_score(
         d_oi = float(oi.iloc[-1] - oi.iloc[-10])
         d_cvd = float(cvd.iloc[-1] - cvd.iloc[-10])
 
-        # Normalize via tanh to keep in [-1, 1]
         score_oi = float(np.tanh(d_oi * 10.0))
         score_cvd = float(np.tanh(d_cvd * 10.0))
 
