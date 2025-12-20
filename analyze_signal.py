@@ -1,5 +1,3 @@
-print("🔥 analyze_signal.py LOADED (DESK SUPREME v3 — BOS_STRICT + INST_CONTINUATION)")
-
 from __future__ import annotations
 
 import logging
