@@ -1,544 +1,375 @@
 # =====================================================================
-# bitget_trader.py — Bitget USDT-Futures execution layer (robuste, 2025)
+# bitget_trader.py — Bitget Futures Trader (USDT-FUTURES) — 2025
 # =====================================================================
-# Objectif :
-#   - Fix "float division by zero" (tick/step=0, quantize => price=0)
-#   - Fix appels _request (BitgetClient._request est keyword-only)
-#   - Meta cache safe (priceEndStep/pricePlace, sizeMultiplier/volumePlace)
-#   - API v2 :
-#       POST /api/v2/mix/order/place-order
-#       POST /api/v2/mix/order/place-plan-order
-#
-# Notes :
-#   - On calcule la size à partir d'une marge fixe (MARGIN_USDT) + LEVERAGE.
-#   - SL/TP sont placés en "plan orders" MARKET reduceOnly (plus robuste).
+# Objectif:
+# - Calculer une taille stable (marge fixe * levier) + quantize via meta contrats
+# - Placer un LIMIT d'entrée via /api/v2/mix/order/place-order
+# - Corriger les erreurs courantes:
+#     * marginMode manquant (400172)
+#     * position mode mismatch (40774) -> fallback auto tradeSide
+# - Ne dépend PAS d'un _request() qui raise sur HTTP 4xx: on fait une requête
+#   "no-raise" dédiée pour lire code/msg sur les erreurs 4xx.
 # =====================================================================
 
 from __future__ import annotations
 
+import json
 import math
 import time
 import logging
-from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from bitget_client import BitgetClient, normalize_symbol
-
-try:
-    from settings import PRODUCT_TYPE, MARGIN_COIN, MARGIN_USDT, LEVERAGE
-except Exception:
-    PRODUCT_TYPE = "USDT-FUTURES"
-    MARGIN_COIN = "USDT"
-    MARGIN_USDT = 20.0
-    LEVERAGE = 10.0
+from bitget_client import BitgetClient
 
 logger = logging.getLogger(__name__)
 
-
-# =====================================================================
-# Helpers
-# =====================================================================
-
-def _to_float(x: Any) -> Optional[float]:
-    if x is None:
-        return None
-    try:
-        if isinstance(x, (int, float)):
-            return float(x)
-        s = str(x).strip()
-        if not s:
-            return None
-        return float(s)
-    except Exception:
-        return None
-
-
-def _to_int(x: Any, default: int = 0) -> int:
-    try:
-        if x is None:
-            return default
-        return int(float(x))
-    except Exception:
-        return default
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def _gen_client_oid(prefix: str = "desk") -> str:
-    return f"{prefix}-{_now_ms()}"
-
-
-def _force_side(side: str) -> str:
-    """
-    Bitget mix side : 'buy' / 'sell'
-    """
-    s = (side or "").strip().lower()
-    if s in ("buy", "long"):
-        return "buy"
-    if s in ("sell", "short"):
-        return "sell"
-    # fallback : assume buy
-    return "buy"
-
-
-def _close_side(open_side: str) -> str:
-    return "sell" if _force_side(open_side) == "buy" else "buy"
-
-
-def _tick_fallback(price: float) -> float:
-    p = abs(float(price))
-    if p >= 10000:
-        return 1.0
-    if p >= 1000:
-        return 0.1
-    if p >= 100:
-        return 0.01
-    if p >= 10:
-        return 0.001
-    if p >= 1:
-        return 0.0001
-    if p >= 0.1:
-        return 0.00001
-    if p >= 0.01:
-        return 0.000001
-    return 0.0000001
-
-
-def _fmt(v: float, decimals: int) -> str:
-    decimals = max(0, int(decimals))
-    return f"{float(v):.{decimals}f}"
-
-
-# =====================================================================
-# Meta cache
-# =====================================================================
-
-@dataclass
-class ContractMeta:
-    symbol: str
-    price_decimals: int
-    tick_size: float
-    size_decimals: int
-    size_step: float
-    min_trade_num: float
-    max_order_qty: Optional[float]
+# Valeurs Bitget v2
+DEFAULT_PRODUCT_TYPE = "USDT-FUTURES"
+DEFAULT_MARGIN_COIN = "USDT"
 
 
 class SymbolMetaCache:
-    def __init__(self, client: BitgetClient, product_type: str = PRODUCT_TYPE, ttl_seconds: int = 300):
+    """
+    Cache des métadonnées contrats Bitget.
+    Endpoint: GET /api/v2/mix/market/contracts?productType=USDT-FUTURES
+
+    On garde:
+      - pricePlace / priceEndStep -> tick_size
+      - volumePlace / sizeMultiplier -> size_step
+      - minTradeNum / maxOrderQty
+    """
+
+    def __init__(self, client: BitgetClient, product_type: str = DEFAULT_PRODUCT_TYPE, ttl_seconds: int = 300):
         self.client = client
         self.product_type = product_type
-        self.ttl_seconds = ttl_seconds
-        self._cache: Dict[str, ContractMeta] = {}
+        self.ttl_seconds = int(ttl_seconds)
+
+        self._cache: Dict[str, Dict[str, Any]] = {}
         self._last_fetch: float = 0.0
-
-    def _parse_meta(self, raw: Dict[str, Any]) -> Optional[ContractMeta]:
-        sym = normalize_symbol(str(raw.get("symbol", "")))
-        if not sym:
-            return None
-
-        price_place = _to_int(raw.get("pricePlace"), 0)
-        volume_place = _to_int(raw.get("volumePlace"), 0)
-
-        price_end_step = _to_float(raw.get("priceEndStep"))
-        size_multiplier = _to_float(raw.get("sizeMultiplier"))
-
-        min_trade_num = _to_float(raw.get("minTradeNum")) or 0.0
-
-        max_order_qty_raw = raw.get("maxOrderQty")
-        max_order_qty = _to_float(max_order_qty_raw) if max_order_qty_raw is not None else None
-
-        # --------------------------------------------------------------
-        # Tick size
-        # - Certains retours ont priceEndStep déjà "réel" (ex 0.0001)
-        # - D'autres ont un step entier (ex 1) + pricePlace (ex 5)
-        # --------------------------------------------------------------
-        tick_size: Optional[float] = None
-        if price_end_step is not None:
-            if price_end_step < 1:
-                tick_size = float(price_end_step)
-            else:
-                tick_size = float(price_end_step) * (10 ** -max(price_place, 0))
-
-        if tick_size is None or tick_size <= 0:
-            # fallback conservateur (évite division par zéro)
-            tick_size = 10 ** (-max(price_place, 6)) if price_place > 0 else _tick_fallback(1.0)
-
-        # --------------------------------------------------------------
-        # Size step
-        # - sizeMultiplier est souvent déjà la granularité de size
-        # - si 0/None => fallback
-        # --------------------------------------------------------------
-        size_step: Optional[float] = None
-        if size_multiplier is not None and size_multiplier > 0:
-            size_step = float(size_multiplier)
-        else:
-            size_step = 10 ** (-max(volume_place, 0)) if volume_place > 0 else 1.0
-
-        if size_step <= 0:
-            size_step = 1.0
-
-        return ContractMeta(
-            symbol=sym,
-            price_decimals=max(price_place, 0),
-            tick_size=float(tick_size),
-            size_decimals=max(volume_place, 0),
-            size_step=float(size_step),
-            min_trade_num=float(min_trade_num),
-            max_order_qty=float(max_order_qty) if max_order_qty is not None else None,
-        )
 
     async def _refresh_all(self) -> None:
         now = time.time()
         if self._cache and (now - self._last_fetch) < self.ttl_seconds:
             return
 
-        try:
-            resp = await self.client._request(
-                "GET",
-                "/api/v2/mix/market/contracts",
-                params={"productType": self.product_type},
-                auth=False,
-            )
-        except Exception as e:
-            logger.error("[META] error fetching contracts list: %s", e)
-            return
+        resp = await self.client._request(
+            "GET",
+            "/api/v2/mix/market/contracts",
+            params={"productType": self.product_type},
+            auth=False,
+        )
 
         data = resp.get("data") if isinstance(resp, dict) else None
         if not isinstance(data, list):
-            logger.error("[META] unexpected contracts response: %s", resp)
             return
 
-        new_cache: Dict[str, ContractMeta] = {}
+        new_cache: Dict[str, Dict[str, Any]] = {}
         for c in data:
             try:
-                meta = self._parse_meta(c if isinstance(c, dict) else {})
-                if meta:
-                    new_cache[meta.symbol] = meta
+                sym = str(c.get("symbol", "")).upper().strip()
+                if not sym:
+                    continue
+
+                price_place = int(c.get("pricePlace", "0") or 0)
+                price_end_step = float(c.get("priceEndStep", "1") or 1)
+                volume_place = int(c.get("volumePlace", "0") or 0)
+                size_multiplier = float(c.get("sizeMultiplier", "1") or 1)
+                min_trade_num = float(c.get("minTradeNum", "0") or 0)
+
+                max_order_qty_raw = c.get("maxOrderQty")
+                max_order_qty = float(max_order_qty_raw) if max_order_qty_raw not in (None, "") else None
+
+                # tick = step * 10^(-pricePlace)
+                tick_size = price_end_step * (10 ** -price_place)
+
+                # Sanity guards (évite division by zero)
+                if tick_size <= 0:
+                    tick_size = None
+                if size_multiplier <= 0:
+                    size_multiplier = None
+
+                new_cache[sym] = {
+                    "symbol": sym,
+                    "price_decimals": price_place,
+                    "tick_size": tick_size,
+                    "size_decimals": volume_place,
+                    "size_step": size_multiplier,
+                    "min_trade_num": min_trade_num,
+                    "max_order_qty": max_order_qty,
+                }
             except Exception:
                 continue
 
         if new_cache:
             self._cache = new_cache
             self._last_fetch = now
-            logger.info("[META] refreshed contracts cache (%d symbols)", len(new_cache))
+            logger.info("[META] refreshed contracts cache (%s symbols)", len(new_cache))
 
-    async def get(self, symbol: str) -> Optional[ContractMeta]:
-        symbol = normalize_symbol(symbol)
+    async def get(self, symbol: str) -> Optional[Dict[str, Any]]:
+        symbol = str(symbol).upper().strip()
         await self._refresh_all()
-        meta = self._cache.get(symbol)
-        if meta:
-            return meta
-
-        # fallback single fetch
-        try:
-            resp = await self.client._request(
-                "GET",
-                "/api/v2/mix/market/contracts",
-                params={"productType": self.product_type, "symbol": symbol},
-                auth=False,
-            )
-        except Exception as e:
-            logger.error("[META] error fetching contract for %s: %s", symbol, e)
-            return None
-
-        data = resp.get("data") if isinstance(resp, dict) else None
-        if not isinstance(data, list) or not data:
-            logger.error("[META] empty contracts data for %s: %s", symbol, resp)
-            return None
-
-        meta = self._parse_meta(data[0] if isinstance(data[0], dict) else {})
-        if meta:
-            self._cache[symbol] = meta
-        return meta
+        return self._cache.get(symbol)
 
 
-# =====================================================================
-# Trader
-# =====================================================================
+class BitgetTrader:
+    """
+    Trader wrapper pour BitgetClient.
+    """
 
-class BitgetTrader(BitgetClient):
     def __init__(
         self,
-        api_key: str,
-        api_secret: str,
-        passphrase: str,
+        client: BitgetClient,
         *,
-        product_type: str = PRODUCT_TYPE,
-        margin_coin: str = MARGIN_COIN,
-        margin_mode: str = "isolated",
-        target_margin_usdt: float = float(MARGIN_USDT),
-        leverage: float = float(LEVERAGE),
+        product_type: str = DEFAULT_PRODUCT_TYPE,
+        margin_coin: str = DEFAULT_MARGIN_COIN,
+        margin_mode: str = "isolated",   # "isolated" ou "crossed"
+        leverage: float = 10.0,
+        margin_usdt: float = 20.0,
+        # compat:
+        target_margin_usdt: Optional[float] = None,
     ):
-        super().__init__(api_key, api_secret, passphrase)
+        self.client = client
+        self.product_type = str(product_type)
+        self.margin_coin = str(margin_coin)
 
-        self.PRODUCT_TYPE = product_type
-        self.MARGIN_COIN = margin_coin
-        self.MARGIN_MODE = margin_mode
-        self.TARGET_MARGIN_USDT = float(target_margin_usdt)
-        self.LEVERAGE = float(leverage)
+        mm = (margin_mode or "isolated").lower().strip()
+        if mm not in ("isolated", "crossed"):
+            mm = "isolated"
+        self.margin_mode = mm
 
-        self._meta_cache = SymbolMetaCache(self, product_type=self.PRODUCT_TYPE, ttl_seconds=300)
+        if target_margin_usdt is not None:
+            margin_usdt = float(target_margin_usdt)
 
-        # mémoriser la size d'entrée par symbole (utile pour TP/SL fractions)
-        self._entry_size: Dict[str, float] = {}
+        self.leverage = float(leverage)
+        self.margin_usdt = float(margin_usdt)
+
+        self._meta = SymbolMetaCache(client, product_type=self.product_type, ttl_seconds=300)
 
     # ------------------------------------------------------------------
-    # Quantize safe
+    # Low-level request that DOES NOT raise on HTTP 4xx (for order placement)
     # ------------------------------------------------------------------
+    async def _request_any_status(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        auth: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Copie légère de BitgetClient._request, mais retourne le JSON même en HTTP 4xx.
+        (Bitget renvoie souvent {code,msg,data} avec un status 400)
+        """
+        await self.client._ensure_session()
 
-    def _q_price(self, meta: Optional[ContractMeta], price: float) -> float:
+        params = params or {}
+        data = data or {}
+
+        query = ""
+        if params:
+            query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
+
+        url = self.client.BASE + path + query
+        body = json.dumps(data, separators=(",", ":")) if data else ""
+
+        ts = str(int(time.time() * 1000))
+        headers: Dict[str, str] = {}
+
+        if auth:
+            sig = self.client._sign(ts, method.upper(), path, query, body)
+            headers = {
+                "ACCESS-KEY": self.client.api_key,
+                "ACCESS-SIGN": sig,
+                "ACCESS-TIMESTAMP": ts,
+                "ACCESS-PASSPHRASE": self.client.api_passphrase,
+                "Content-Type": "application/json",
+            }
+
+        async with self.client._session.request(method.upper(), url, data=body, headers=headers, timeout=12) as resp:
+            txt = await resp.text()
+            status = resp.status
+            try:
+                js = json.loads(txt) if txt else {}
+            except Exception:
+                js = {"code": "HTTP_ERROR", "msg": txt}
+
+            if isinstance(js, dict):
+                js.setdefault("http_status", status)
+            return js
+
+    # ------------------------------------------------------------------
+    # Formatting / quantize
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fmt(x: float, decimals: int) -> str:
+        decimals = max(0, int(decimals))
+        return f"{float(x):.{decimals}f}"
+
+    def _quantize_price(self, meta: Optional[Dict[str, Any]], price: float) -> float:
         raw = float(price)
-        if raw <= 0:
-            return raw
-
         if not meta:
             return raw
 
-        tick = float(meta.tick_size)
-        if tick <= 0:
-            return raw
+        tick = meta.get("tick_size")
+        decimals = int(meta.get("price_decimals", 0) or 0)
 
+        if not tick or float(tick) <= 0:
+            return float(self._fmt(raw, decimals))
+
+        tick = float(tick)
         q = math.floor(raw / tick) * tick
-        if q <= 0:
-            # Meta suspect (tick trop grand). On évite 0 à tout prix.
-            if tick <= raw * 2:
-                q = tick
-            else:
-                q = raw
+        return float(self._fmt(q, decimals))
 
-        return float(_fmt(q, meta.price_decimals))
-
-    def _q_size(self, meta: Optional[ContractMeta], size: float) -> float:
+    def _quantize_size(self, meta: Optional[Dict[str, Any]], size: float) -> float:
         raw = float(size)
         if raw <= 0:
-            raise ValueError(f"invalid size {raw}")
+            raise ValueError("size<=0")
 
         if not meta:
             return raw
 
-        step = float(meta.size_step)
-        if step <= 0:
-            step = 1.0
+        step = meta.get("size_step")
+        decimals = int(meta.get("size_decimals", 0) or 0)
+        min_trade = float(meta.get("min_trade_num", 0) or 0)
+        max_qty = meta.get("max_order_qty")
 
-        q = math.floor(raw / step) * step
-        if q <= 0:
-            if step <= raw * 2:
-                q = step
-            else:
-                q = raw
+        if not step or float(step) <= 0:
+            # fallback uniquement par décimales
+            sz = float(self._fmt(raw, decimals))
+        else:
+            step = float(step)
+            sz = math.floor(raw / step) * step
+            sz = float(self._fmt(sz, decimals))
 
-        # min trade
-        min_trade = float(meta.min_trade_num or 0.0)
-        if min_trade > 0 and q < min_trade:
-            q = min_trade
+        if max_qty not in (None, ""):
+            try:
+                max_qty_f = float(max_qty)
+                if max_qty_f > 0 and sz > max_qty_f:
+                    # clamp sur maxQty
+                    if step and float(step) > 0:
+                        sz = math.floor(max_qty_f / float(step)) * float(step)
+                    else:
+                        sz = max_qty_f
+                    sz = float(self._fmt(sz, decimals))
+            except Exception:
+                pass
 
-        # max qty
-        if meta.max_order_qty is not None and q > float(meta.max_order_qty):
-            q = float(meta.max_order_qty)
+        # minTradeNum guard
+        if min_trade and sz < min_trade:
+            sz = float(self._fmt(min_trade, decimals))
 
-        return float(_fmt(q, meta.size_decimals))
-
-    # ------------------------------------------------------------------
-    # Response wrapper
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _wrap(resp: Any, *, extra: Optional[Dict[str, Any]] = None, error: Optional[str] = None) -> Dict[str, Any]:
-        out: Dict[str, Any] = {"ok": False, "resp": resp}
-        if extra:
-            out.update(extra)
-        if error:
-            out["error"] = error
-
-        if isinstance(resp, dict):
-            code = resp.get("code")
-            if code == "00000":
-                out["ok"] = True
-        return out
+        return float(sz)
 
     # ------------------------------------------------------------------
-    # Orders
+    # Public: place LIMIT
     # ------------------------------------------------------------------
-
     async def place_limit(
         self,
+        *,
         symbol: str,
-        side: str,
+        side: str,            # "BUY"/"SELL" ou "buy"/"sell"
         price: float,
         size: Optional[float] = None,
-        *,
         client_oid: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        # compat params (si ton code les passe)
+        preset_sl: Optional[float] = None,
+        preset_tp: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
-        Place un LIMIT d'ouverture.
-        - side: buy/sell (ou BUY/SELL/LONG/SHORT)
-        - size: si None => size calculée à partir margin+levier (notional = margin*levier)
+        Place un LIMIT d'entrée. Fallback automatique sur tradeSide si erreur 40774.
+
+        - En one-way mode: ne PAS mettre tradeSide
+        - En hedge mode: mettre tradeSide="open"
         """
-        sym = normalize_symbol(symbol)
-        side = _force_side(side)
-        client_oid = client_oid or _gen_client_oid("entry")
-
-        meta = await self._meta_cache.get(sym)
-        price_q = self._q_price(meta, float(price))
-
-        if price_q <= 0:
-            return self._wrap(
-                None,
-                extra={"symbol": sym, "side": side, "price": price, "price_q": price_q},
-                error="invalid_price_after_quantize",
-            )
-
-        # sizing
-        if size is None:
-            notional_target = float(self.TARGET_MARGIN_USDT * self.LEVERAGE)
-            size_raw = notional_target / float(price_q)
+        sym = str(symbol).upper().strip()
+        sd = str(side).lower().strip()
+        if sd in ("buy", "long"):
+            sd = "buy"
+        elif sd in ("sell", "short"):
+            sd = "sell"
         else:
-            size_raw = float(size)
+            raise ValueError(f"invalid side={side}")
 
-        try:
-            size_q = self._q_size(meta, size_raw)
-        except Exception as e:
-            return self._wrap(
-                None,
-                extra={"symbol": sym, "side": side, "price_q": price_q, "size_raw": size_raw},
-                error=f"invalid_size: {e}",
-            )
+        if client_oid is None:
+            client_oid = f"entry-{sym}-{int(time.time() * 1000)}"
+        client_oid = str(client_oid)
 
-        self._entry_size[sym] = float(size_q)
+        meta = await self._meta.get(sym)
+        q_price = self._quantize_price(meta, float(price))
 
-        payload = {
-            "symbol": sym,
-            "productType": self.PRODUCT_TYPE,
-            "marginMode": self.MARGIN_MODE,
-            "marginCoin": self.MARGIN_COIN,
-            "size": str(size_q),
-            "price": str(price_q),
-            "side": side,
-            "orderType": "limit",
-            "force": "gtc",
-            "clientOid": client_oid,
-        }
+        # Taille
+        if size is None:
+            # notional cible ~ marge * levier
+            notional_target = max(0.0, self.margin_usdt) * max(1e-9, self.leverage)
+            if q_price <= 0:
+                raise ValueError("price<=0")
+            raw_size = notional_target / q_price
+        else:
+            raw_size = float(size)
 
+        q_size = self._quantize_size(meta, raw_size)
+
+        # Logs
+        approx_notional = q_size * q_price
         logger.info(
-            "[TRADER] place_limit %s %s price=%s size=%s (notional≈%.2f USDT, margin≈%.2f USDT, levier=%.1fx, oid=%s)",
-            sym,
-            side,
-            price_q,
-            size_q,
-            float(price_q) * float(size_q),
-            float(price_q) * float(size_q) / max(self.LEVERAGE, 1e-9),
-            self.LEVERAGE,
-            client_oid,
+            "[EXEC] place LIMIT %s %s price=%s size=%s notional≈%.2f (marginMode=%s lev=%.1fx)",
+            sym, sd,
+            self._fmt(q_price, int(meta.get("price_decimals", 6) if meta else 6)),
+            self._fmt(q_size, int(meta.get("size_decimals", 4) if meta else 4)),
+            approx_notional,
+            self.margin_mode,
+            self.leverage,
         )
 
-        try:
-            resp = await self._request("POST", "/api/v2/mix/order/place-order", data=payload, auth=True)
-            return self._wrap(resp, extra={"symbol": sym, "side": side, "price": price_q, "size": size_q, "clientOid": client_oid})
-        except Exception as e:
-            logger.error("[TRADER] place_limit HTTP error %s: %s", sym, e)
-            return self._wrap(None, extra={"symbol": sym, "side": side, "price": price_q, "size": size_q}, error=str(e))
-
-    async def _place_plan_market_close(
-        self,
-        symbol: str,
-        open_side: str,
-        trigger_price: float,
-        size: float,
-        *,
-        client_oid: Optional[str] = None,
-        tag: str = "plan",
-    ) -> Dict[str, Any]:
-        sym = normalize_symbol(symbol)
-        open_side = _force_side(open_side)
-        close_side = _close_side(open_side)
-        client_oid = client_oid or _gen_client_oid(tag)
-
-        meta = await self._meta_cache.get(sym)
-        trigger_q = self._q_price(meta, float(trigger_price))
-        if trigger_q <= 0:
-            return self._wrap(None, extra={"symbol": sym, "trigger": trigger_price, "trigger_q": trigger_q}, error="invalid_trigger_price")
-
-        try:
-            size_q = self._q_size(meta, float(size))
-        except Exception as e:
-            return self._wrap(None, extra={"symbol": sym, "size_raw": size}, error=f"invalid_size: {e}")
-
-        payload = {
-            "planType": "normal_plan",
+        base_payload: Dict[str, Any] = {
             "symbol": sym,
-            "productType": self.PRODUCT_TYPE,
-            "marginMode": self.MARGIN_MODE,
-            "marginCoin": self.MARGIN_COIN,
-            "size": str(size_q),
-            "triggerPrice": str(trigger_q),
-            "triggerType": "mark_price",
-            "side": close_side,
-            "orderType": "market",
-            "reduceOnly": "yes",
+            "productType": self.product_type,
+            "marginCoin": self.margin_coin,
+            "marginMode": self.margin_mode,         # IMPORTANT
+            "size": str(q_size),
+            "price": str(q_price),
+            "side": sd,
+            "orderType": "limit",
+            "timeInForceValue": "normal",
             "clientOid": client_oid,
         }
 
-        logger.info("[TRADER] %s %s close_side=%s trigger=%s size=%s oid=%s", tag, sym, close_side, trigger_q, size_q, client_oid)
+        # NOTE: preset_sl / preset_tp
+        # Bitget v2 ne gère pas toujours un "preset" direct sur place-order selon configs.
+        # On les ignore ici volontairement pour fiabiliser l'entrée.
+        _ = preset_sl, preset_tp
 
-        try:
-            resp = await self._request("POST", "/api/v2/mix/order/place-plan-order", data=payload, auth=True)
-            return self._wrap(resp, extra={"symbol": sym, "side": close_side, "trigger": trigger_q, "size": size_q, "clientOid": client_oid})
-        except Exception as e:
-            logger.error("[TRADER] %s HTTP error %s: %s", tag, sym, e)
-            return self._wrap(None, extra={"symbol": sym, "side": close_side, "trigger": trigger_q, "size": size_q}, error=str(e))
-
-    async def place_stop_loss(
-        self,
-        symbol: str,
-        open_side: str,
-        trigger_price: float,
-        *,
-        fraction: float = 1.0,
-        client_oid: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        sym = normalize_symbol(symbol)
-        base_size = float(self._entry_size.get(sym, 0.0))
-        if base_size <= 0:
-            return self._wrap(None, extra={"symbol": sym}, error="missing_entry_size_for_sl")
-
-        frac = max(0.0, min(1.0, float(fraction)))
-        size = base_size * frac if frac > 0 else base_size
-
-        return await self._place_plan_market_close(
-            sym,
-            open_side,
-            trigger_price,
-            size,
-            client_oid=client_oid,
-            tag="sl",
+        # 1) Try one-way style (no tradeSide)
+        resp = await self._request_any_status(
+            "POST",
+            "/api/v2/mix/order/place-order",
+            data=base_payload,
+            auth=True,
         )
 
-    async def place_take_profit(
-        self,
-        symbol: str,
-        open_side: str,
-        trigger_price: float,
-        *,
-        fraction: float = 0.5,
-        client_oid: Optional[str] = None,
-        tag: str = "tp",
-    ) -> Dict[str, Any]:
-        sym = normalize_symbol(symbol)
-        base_size = float(self._entry_size.get(sym, 0.0))
-        if base_size <= 0:
-            return self._wrap(None, extra={"symbol": sym}, error="missing_entry_size_for_tp")
+        code = str(resp.get("code", ""))
+        if code == "00000":
+            resp["ok"] = True
+            return resp
 
-        frac = max(0.0, min(1.0, float(fraction)))
-        size = base_size * frac if frac > 0 else base_size
+        # 2) If mismatch, try hedge style
+        if code == "40774":
+            hedge_payload = dict(base_payload)
+            hedge_payload["tradeSide"] = "open"
+            resp2 = await self._request_any_status(
+                "POST",
+                "/api/v2/mix/order/place-order",
+                data=hedge_payload,
+                auth=True,
+            )
+            resp2["ok"] = str(resp2.get("code", "")) == "00000"
+            if resp2["ok"]:
+                return resp2
 
-        return await self._place_plan_market_close(
-            sym,
-            open_side,
-            trigger_price,
-            size,
-            client_oid=client_oid,
-            tag=tag,
-        )
+            logger.error("[EXEC] place-order failed (hedge retry) %s: %s", sym, resp2)
+            return resp2
+
+        resp["ok"] = False
+        logger.error("[EXEC] place-order failed %s: %s", sym, resp)
+        return resp
