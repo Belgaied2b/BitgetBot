@@ -1,168 +1,169 @@
 # =====================================================================
-# bitget_trader.py — Trader Bitget FUTURES (compatible bitget_client.py)
+# bitget_trader.py — Bitget Execution (Entry + TP1/TP2 + SL->BE)
 # =====================================================================
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import math
 import time
-from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
 
-from bitget_client import BitgetClient, normalize_symbol
+from settings import PRODUCT_TYPE, MARGIN_COIN
 
 logger = logging.getLogger(__name__)
 
 
-def _d(x: Any) -> Decimal:
+# =====================================================================
+# Helpers
+# =====================================================================
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _to_trigger_type(v: str) -> str:
+    """
+    Settings:
+      MP -> mark_price
+      FP -> fill_price
+      TP -> fill_price (fallback)
+    """
+    s = (v or "").strip().upper()
+    if s == "MP":
+        return "mark_price"
+    if s == "FP":
+        return "fill_price"
+    return "fill_price"
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
-        return Decimal(str(x))
+        return float(x)
     except Exception:
-        return Decimal("0")
-
-
-def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
-    if step <= 0:
-        return value
-    n = (value / step).to_integral_value(rounding=ROUND_DOWN)
-    return n * step
-
-
-def _fmt_decimal(x: Decimal) -> str:
-    # string sans scientific notation
-    s = format(x, "f")
-    # trim léger (optionnel)
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s if s else "0"
+        return default
 
 
 def _is_ok(resp: Any) -> bool:
-    return isinstance(resp, dict) and (resp.get("ok") is True or str(resp.get("code", "")) == "00000")
+    if not isinstance(resp, dict):
+        return False
+    if resp.get("ok") is True:
+        return True
+    return str(resp.get("code", "")) == "00000"
+
+
+# =====================================================================
+# Contract meta cache (tick/lot)
+# =====================================================================
+
+@dataclass
+class ContractMeta:
+    symbol: str
+    price_place: int
+    price_tick: float
+    qty_place: int
+    qty_step: float
+    min_qty: float
 
 
 class ContractMetaCache:
-    """
-    Cache des metas depuis:
-      GET /api/v2/mix/market/contracts?productType=USDT-FUTURES
-
-    On parse:
-      - pricePlace + priceEndStep -> tick
-      - sizeMultiplier -> size_step
-      - minTradeNum -> min_size
-    """
-
-    def __init__(self, client: BitgetClient, product_type: str = "USDT-FUTURES", ttl_s: int = 600):
+    def __init__(self, client, ttl_s: int = 600):
         self.client = client
-        self.product_type = product_type
-        self.ttl_s = int(ttl_s)
+        self.ttl_s = ttl_s
         self._ts = 0.0
-        self._meta: Dict[str, Dict[str, Any]] = {}
+        self._by_symbol: Dict[str, ContractMeta] = {}
 
     async def refresh(self) -> None:
+        """
+        Pull metas from Bitget market contracts v2:
+          GET /api/v2/mix/market/contracts?productType=USDT-FUTURES
+        """
         now = time.time()
-        if self._meta and (now - self._ts) < self.ttl_s:
+        if self._by_symbol and (now - self._ts) < self.ttl_s:
             return
 
-        # IMPORTANT: on n'appelle PAS client.get_contracts_list(product_type=...) (ça n'existe pas)
-        await self.client._ensure_session()
         js = await self.client._request(
             "GET",
             "/api/v2/mix/market/contracts",
-            params={"productType": self.product_type},
+            params={"productType": PRODUCT_TYPE},
             auth=False,
         )
 
-        data = js.get("data") if isinstance(js, dict) else None
-        if not isinstance(data, list):
-            logger.error("[META] unexpected contracts response: %s", js)
+        if not isinstance(js, dict) or "data" not in js:
+            logger.error("[META] bad contracts response: %s", js)
             return
 
-        meta: Dict[str, Dict[str, Any]] = {}
-        for c in data:
-            try:
-                sym = normalize_symbol(c.get("symbol", ""))
-                if not sym:
-                    continue
+        by_symbol: Dict[str, ContractMeta] = {}
 
-                price_place = int(c.get("pricePlace", 0) or 0)
-                price_end_step = Decimal(str(c.get("priceEndStep", 1) or 1))
-                size_multiplier = Decimal(str(c.get("sizeMultiplier", 1) or 1))
-                min_trade_num = Decimal(str(c.get("minTradeNum", 0) or 0))
-
-                tick = price_end_step * (Decimal(10) ** Decimal(-price_place))
-                if tick <= 0:
-                    tick = Decimal("0.00000001")
-                if size_multiplier <= 0:
-                    size_multiplier = Decimal("0.000001")
-
-                meta[sym] = {
-                    "tick": tick,
-                    "size_step": size_multiplier,
-                    "min_size": min_trade_num if min_trade_num > 0 else Decimal("0"),
-                }
-            except Exception:
+        for c in js.get("data", []):
+            sym = (c.get("symbol") or "").upper()
+            if not sym:
                 continue
 
-        if meta:
-            self._meta = meta
-            self._ts = now
-            logger.info("[META] refreshed contracts cache (%d symbols)", len(meta))
+            # Bitget fields vary. We use robust fallbacks:
+            price_place = int(_safe_float(c.get("pricePlace"), 6))
+            qty_place = int(_safe_float(c.get("volumePlace"), 4))
 
-    async def get(self, symbol: str) -> Optional[Dict[str, Any]]:
+            price_tick = _safe_float(c.get("priceEndStep"), 0.0) or (10 ** (-price_place))
+            qty_step = _safe_float(c.get("sizeMultiplier"), 0.0) or _safe_float(c.get("minTradeNum"), 0.0) or (10 ** (-qty_place))
+
+            min_qty = _safe_float(c.get("minTradeNum"), 0.0) or qty_step
+
+            by_symbol[sym] = ContractMeta(
+                symbol=sym,
+                price_place=price_place,
+                price_tick=float(price_tick),
+                qty_place=qty_place,
+                qty_step=float(qty_step),
+                min_qty=float(min_qty),
+            )
+
+        self._by_symbol = by_symbol
+        self._ts = now
+        logger.info("[META] refreshed contracts cache (%d symbols)", len(by_symbol))
+
+    async def get(self, symbol: str) -> Optional[ContractMeta]:
+        sym = (symbol or "").upper()
         await self.refresh()
-        return self._meta.get(normalize_symbol(symbol))
+        return self._by_symbol.get(sym)
 
+
+# =====================================================================
+# Trader
+# =====================================================================
 
 class BitgetTrader:
     """
-    Trader qui accepte:
-      BitgetTrader(client, margin_usdt=..., leverage=..., margin_mode="isolated")
-    et aussi:
-      BitgetTrader(api_key, api_secret, api_passphrase, ...)
+    NOTE:
+    - This trader reuses BitgetClient's auth signing internals via client._sign()
+    - It does NOT rely on BitgetClient._request() for private endpoints because _request()
+      raises on HTTP>=400 (we need to catch bodies & codes).
     """
+
+    BASE = "https://api.bitget.com"
 
     def __init__(
         self,
-        client_or_key,
-        api_secret: Optional[str] = None,
-        api_passphrase: Optional[str] = None,
-        *,
+        client,
         margin_usdt: float = 20.0,
         leverage: float = 10.0,
         margin_mode: str = "isolated",
-        product_type: str = "USDT-FUTURES",
-        margin_coin: str = "USDT",
-        # compat alias
-        target_margin_usdt: Optional[float] = None,
-        **_ignored,
+        product_type: str = PRODUCT_TYPE,
+        margin_coin: str = MARGIN_COIN,
+        target_margin_usdt: Optional[float] = None,  # alias compat
     ):
-        if isinstance(client_or_key, BitgetClient):
-            self.client = client_or_key
-        else:
-            self.client = BitgetClient(
-                api_key=str(client_or_key or ""),
-                api_secret=str(api_secret or ""),
-                passphrase=str(api_passphrase or ""),
-            )
-
-        if target_margin_usdt is not None:
-            margin_usdt = float(target_margin_usdt)
-
-        self.margin_usdt = float(margin_usdt)
+        self.client = client
+        self.margin_usdt = float(target_margin_usdt if target_margin_usdt is not None else margin_usdt)
         self.leverage = float(leverage)
+        self.margin_mode = (margin_mode or "isolated").lower()
+        self.product_type = (product_type or PRODUCT_TYPE)
+        self.margin_coin = (margin_coin or MARGIN_COIN)
 
-        mm = (margin_mode or "isolated").lower().strip()
-        if mm not in ("isolated", "crossed"):
-            mm = "isolated"
-        self.margin_mode = mm
+        self._meta = ContractMetaCache(client)
 
-        self.product_type = product_type
-        self.margin_coin = margin_coin
-
-        self._meta = ContractMetaCache(self.client, product_type=self.product_type, ttl_s=600)
+    # ---------------------------------------------------------------
 
     async def _request_any_status(
         self,
@@ -171,17 +172,10 @@ class BitgetTrader:
         *,
         params: Optional[Dict[str, Any]] = None,
         data: Optional[Dict[str, Any]] = None,
+        timeout: int = 12,
         auth: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Même signature que client._request, mais:
-        - ne raise pas sur HTTP 4xx
-        - retourne le JSON Bitget (code/msg/data)
-        """
         await self.client._ensure_session()
-        session = self.client.session
-        if session is None:
-            return {"ok": False, "code": "NO_SESSION", "msg": "session not initialized"}
 
         params = params or {}
         data = data or {}
@@ -190,10 +184,10 @@ class BitgetTrader:
         if params:
             query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
 
-        url = self.client.BASE + path + query
+        url = self.BASE + path + query
         body = json.dumps(data, separators=(",", ":")) if data else ""
 
-        ts = str(int(time.time() * 1000))
+        ts = str(_now_ms())
         headers: Dict[str, str] = {"Content-Type": "application/json"}
 
         if auth:
@@ -208,144 +202,234 @@ class BitgetTrader:
             )
 
         try:
-            async with session.request(method.upper(), url, headers=headers, data=body if data else None) as resp:
+            async with self.client.session.request(
+                method.upper(), url, headers=headers, data=body if data else None, timeout=timeout
+            ) as resp:
                 txt = await resp.text()
+                status = resp.status
+
                 try:
                     js = json.loads(txt) if txt else {}
                 except Exception:
-                    js = {"raw": txt}
+                    return {"ok": False, "status": status, "raw": txt}
 
-                if isinstance(js, dict):
-                    js["http_status"] = resp.status
-                    js["ok"] = (resp.status < 400 and str(js.get("code", "")) == "00000")
-                return js if isinstance(js, dict) else {"ok": False, "raw": txt, "http_status": resp.status}
+                code = str(js.get("code", ""))
+                ok = (status < 400) and (code == "00000")
+                js["ok"] = ok
+                js["_http_status"] = status
+                return js
+
         except Exception as e:
-            return {"ok": False, "code": "HTTP_ERROR", "msg": str(e)}
+            return {"ok": False, "error": str(e)}
 
-    @staticmethod
-    def _to_side(side: str) -> str:
-        s = (side or "").upper()
-        return "buy" if s == "BUY" else "sell"
+    # ---------------------------------------------------------------
 
-    @staticmethod
-    def _symbol_id_v1(symbol: str) -> str:
-        sym = normalize_symbol(symbol)
-        return f"{sym}_UMCBL"
+    async def _quantize(self, symbol: str, price: float, qty: float) -> Tuple[float, float, float]:
+        meta = await self._meta.get(symbol)
+        if not meta:
+            # fallback
+            return float(price), float(qty), 1e-6
+
+        tick = float(meta.price_tick or (10 ** (-meta.price_place)))
+        step = float(meta.qty_step or (10 ** (-meta.qty_place)))
+
+        # Quantize price to tick
+        p = float(round(price / tick) * tick)
+
+        # Quantize qty to step
+        q = float(int(qty / step) * step)
+
+        # ensure min qty
+        if q < meta.min_qty:
+            q = 0.0
+
+        # clamp rounding noise
+        p = float(f"{p:.{max(0, meta.price_place)}f}") if meta.price_place >= 0 else p
+        q = float(f"{q:.{max(0, meta.qty_place)}f}") if meta.qty_place >= 0 else q
+
+        return p, q, tick
+
+    async def get_tick(self, symbol: str) -> float:
+        meta = await self._meta.get(symbol)
+        if not meta:
+            return 1e-6
+        return float(meta.price_tick or (10 ** (-meta.price_place)))
+
+    # ---------------------------------------------------------------
+    # Orders
+    # ---------------------------------------------------------------
 
     async def place_limit(
         self,
-        *,
         symbol: str,
-        side: str,              # "BUY"/"SELL"
+        side: str,
         price: float,
-        size: Optional[float] = None,        # si None => calc auto via margin_usdt*leverage
-        qty: Optional[float] = None,         # compat
+        size: Optional[float] = None,
         client_oid: Optional[str] = None,
-        preset_sl: Optional[float] = None,   # acceptés mais non utilisés ici (stabilité)
-        preset_tp: Optional[float] = None,   # acceptés mais non utilisés ici (stabilité)
-        **_ignored,
+        trade_side: str = "open",
+        reduce_only: bool = False,
     ) -> Dict[str, Any]:
-        sym = normalize_symbol(symbol)
-        sd = self._to_side(side)
+        """
+        Standard LIMIT order on v2:
+          POST /api/v2/mix/order/place-order
+        """
+        sym = (symbol or "").upper()
+        s = (side or "").lower()  # buy/sell
 
-        px = _d(price)
-        if px <= 0:
-            return {"ok": False, "code": "BAD_PRICE", "msg": f"price<=0 ({price})"}
-
-        # qty/size resolution
-        if qty is not None and size is None:
-            size = qty
-
+        # auto compute size from margin*lev if missing
         if size is None:
-            notional = Decimal(str(max(0.0, self.margin_usdt))) * Decimal(str(max(0.0, self.leverage)))
-            raw_size = notional / px
+            notional = self.margin_usdt * self.leverage
+            raw_qty = notional / max(1e-12, float(price))
         else:
-            raw_size = _d(size)
+            raw_qty = float(size)
 
-        if raw_size <= 0:
-            return {"ok": False, "code": "BAD_SIZE", "msg": f"size<=0 ({size})"}
+        q_price, q_qty, _tick = await self._quantize(sym, float(price), float(raw_qty))
+        if q_qty <= 0:
+            return {"ok": False, "code": "QTY0", "msg": "quantized qty is 0"}
 
-        meta = await self._meta.get(sym)
-        tick = meta["tick"] if meta else Decimal("0.00000001")
-        step = meta["size_step"] if meta else Decimal("0.000001")
-        min_size = meta["min_size"] if meta else Decimal("0")
-
-        px_q = _floor_to_step(px, tick)
-        sz_q = _floor_to_step(raw_size, step)
-
-        if min_size > 0 and sz_q < min_size:
-            sz_q = min_size
-
-        price_s = _fmt_decimal(px_q)
-        size_s = _fmt_decimal(sz_q)
-
-        if client_oid is None:
-            client_oid = f"entry-{sym}-{int(time.time() * 1000)}"
-
-        logger.info(
-            "[EXEC] place LIMIT %s %s price=%s size=%s notional≈%.2f (marginMode=%s lev=%.1fx)",
-            sym, sd, price_s, size_s, float(px_q * sz_q), self.margin_mode, self.leverage
-        )
-
-        # ---- v2 attempt 1 (tradeSide open)
-        payload_v2 = {
+        payload = {
             "symbol": sym,
             "productType": self.product_type,
             "marginCoin": self.margin_coin,
             "marginMode": self.margin_mode,
-            "size": size_s,
-            "price": price_s,
-            "side": sd,
-            "tradeSide": "open",
+            "size": str(q_qty),
+            "price": str(q_price),
+            "side": s,
             "orderType": "limit",
             "timeInForceValue": "normal",
-            "clientOid": str(client_oid),
+            "clientOid": client_oid or f"oid-{sym}-{_now_ms()}",
+            # v2 position open/close
+            "tradeSide": (trade_side or "open").lower(),
         }
 
-        resp = await self._request_any_status("POST", "/api/v2/mix/order/place-order", data=payload_v2, auth=True)
-        if _is_ok(resp):
-            return resp
+        if reduce_only:
+            payload["reduceOnly"] = "YES"
 
-        code = str(resp.get("code", ""))
-        msg = str(resp.get("msg", ""))
-
-        # ---- v2 attempt 2 (no tradeSide) si 40774
-        if code == "40774":
-            payload_v2b = dict(payload_v2)
-            payload_v2b.pop("tradeSide", None)
-            resp2 = await self._request_any_status("POST", "/api/v2/mix/order/place-order", data=payload_v2b, auth=True)
-            if _is_ok(resp2):
-                return resp2
-            code = str(resp2.get("code", ""))
-            msg = str(resp2.get("msg", ""))
-
-        # ---- fallback v1 si toujours "unilateral" / 40774
-        if code == "40774" or "unilateral" in msg.lower():
-            symbol_id = self._symbol_id_v1(sym)
-
-            # single-hold
-            side_v1 = "buy_single" if sd == "buy" else "sell_single"
-            payload_v1 = {
-                "symbol": symbol_id,
-                "marginCoin": self.margin_coin,
-                "size": size_s,
-                "price": price_s,
-                "side": side_v1,
-                "orderType": "limit",
-                "timeInForceValue": "normal",
-                "clientOid": str(client_oid),
-            }
-            resp3 = await self._request_any_status("POST", "/api/mix/v1/order/placeOrder", data=payload_v1, auth=True)
-            if _is_ok(resp3):
-                return resp3
-
-            # hedge fallback
-            side_v1b = "open_long" if sd == "buy" else "open_short"
-            payload_v1b = dict(payload_v1)
-            payload_v1b["side"] = side_v1b
-            resp4 = await self._request_any_status("POST", "/api/mix/v1/order/placeOrder", data=payload_v1b, auth=True)
-            return resp4
-
-        # presets (acceptés mais ignorés ici)
-        _ = preset_sl, preset_tp
+        resp = await self._request_any_status("POST", "/api/v2/mix/order/place-order", data=payload, auth=True)
+        if resp.get("ok") is True:
+            resp["qty"] = q_qty
+            resp["price"] = q_price
         return resp
+
+    async def place_reduce_limit_tp(
+        self,
+        symbol: str,
+        close_side: str,
+        price: float,
+        qty: float,
+        client_oid: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        TP as a reduce-only limit order (tradeSide=close).
+        """
+        return await self.place_limit(
+            symbol=symbol,
+            side=close_side,
+            price=price,
+            size=qty,
+            client_oid=client_oid,
+            trade_side="close",
+            reduce_only=True,
+        )
+
+    async def place_stop_market_sl(
+        self,
+        symbol: str,
+        close_side: str,
+        trigger_price: float,
+        qty: float,
+        *,
+        client_oid: Optional[str] = None,
+        trigger_type: str = "mark_price",
+    ) -> Dict[str, Any]:
+        """
+        SL as trigger order:
+          POST /api/v2/mix/order/place-plan-order
+        """
+        sym = (symbol or "").upper()
+        close_s = (close_side or "").lower()
+
+        # plan orders still need size quantized
+        _, q_qty, _tick = await self._quantize(sym, float(trigger_price), float(qty))
+        if q_qty <= 0:
+            return {"ok": False, "code": "QTY0", "msg": "quantized qty is 0"}
+
+        payload = {
+            "symbol": sym,
+            "productType": self.product_type,
+            "marginCoin": self.margin_coin,
+            "marginMode": self.margin_mode,
+            "size": str(q_qty),
+            "side": close_s,
+            "orderType": "market",
+            "triggerPrice": str(trigger_price),
+            "triggerType": trigger_type,
+            "planType": "normal_plan",
+            "tradeSide": "close",
+            "reduceOnly": "YES",
+            "clientOid": client_oid or f"sl-{sym}-{_now_ms()}",
+            "executePrice": "0",  # market
+        }
+
+        resp = await self._request_any_status("POST", "/api/v2/mix/order/place-plan-order", data=payload, auth=True)
+        if resp.get("ok") is True:
+            resp["qty"] = q_qty
+        return resp
+
+    async def cancel_plan_orders(
+        self,
+        symbol: str,
+        order_ids: list[str],
+    ) -> Dict[str, Any]:
+        """
+        Cancel trigger orders:
+          POST /api/v2/mix/order/cancel-plan-order
+        """
+        sym = (symbol or "").upper()
+        payload = {
+            "symbol": sym,
+            "productType": self.product_type,
+            "planType": "normal_plan",
+            "orderIdList": order_ids,
+        }
+        return await self._request_any_status("POST", "/api/v2/mix/order/cancel-plan-order", data=payload, auth=True)
+
+    async def get_order_detail(
+        self,
+        symbol: str,
+        *,
+        order_id: Optional[str] = None,
+        client_oid: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Order detail:
+          GET /api/v2/mix/order/detail?symbol=...&productType=...&orderId=...&clientOid=...
+        """
+        sym = (symbol or "").upper()
+        params: Dict[str, Any] = {
+            "symbol": sym,
+            "productType": self.product_type,
+        }
+        if order_id:
+            params["orderId"] = order_id
+        if client_oid:
+            params["clientOid"] = client_oid
+
+        return await self._request_any_status("GET", "/api/v2/mix/order/detail", params=params, auth=True)
+
+    # ---------------------------------------------------------------
+
+    @staticmethod
+    def is_filled(order_detail_resp: Dict[str, Any]) -> bool:
+        if not _is_ok(order_detail_resp):
+            return False
+        data = order_detail_resp.get("data") or {}
+        # Common state fields on Bitget:
+        state = str(data.get("state") or data.get("status") or "").lower()
+        if state in {"filled", "full_fill", "fullfill", "completed", "success"}:
+            return True
+
+        # Fallback: check filled size vs size
+        filled = _safe_float(data.get("baseVolume") or data.get("filledQty") or data.get("filledSize"), 0.0)
+        size = _safe_float(data.get("size") or data.get("quantity") or data.get("qty"), 0.0)
+        return (size > 0) and (filled >= size * 0.999)
