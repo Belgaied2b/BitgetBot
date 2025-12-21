@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import pandas as pd
 
@@ -36,7 +37,6 @@ from retry_utils import retry_async
 
 logger = logging.getLogger(__name__)
 
-
 # =====================================================================
 # GLOBALS
 # =====================================================================
@@ -57,13 +57,11 @@ MAX_CONCURRENT_FETCH = 8
 # =====================================================================
 
 async def send_telegram(msg: str) -> None:
-    """
-    Envoi Telegram sans bloquer l'event loop.
-    """
+    """Envoi Telegram sans bloquer l'event loop."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    import requests  # local import pour éviter overhead si telegram désactivé
+    import requests  # local import
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -88,8 +86,8 @@ async def send_telegram(msg: str) -> None:
 
 def _is_ok(resp: Any) -> bool:
     """
-    Bitget success: code == "00000"
-    Ton BitgetTrader ajoute aussi resp["ok"].
+    Succès Bitget: code == "00000"
+    Certains traders ajoutent aussi resp["ok"].
     """
     if not isinstance(resp, dict):
         return False
@@ -101,6 +99,15 @@ def _is_ok(resp: Any) -> bool:
 def _side_to_direction(side: str) -> str:
     s = (side or "").upper()
     return "LONG" if s == "BUY" else "SHORT"
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 
 def _build_signal_message(result: Dict[str, Any]) -> str:
@@ -129,7 +136,10 @@ def _build_signal_message(result: Dict[str, Any]) -> str:
     if tp2 is not None:
         msg += f"• TP2: `{tp2}`\n"
     if rr is not None:
-        msg += f"• RR: `{round(float(rr), 3)}`\n"
+        try:
+            msg += f"• RR: `{round(float(rr), 3)}`\n"
+        except Exception:
+            msg += f"• RR: `{rr}`\n"
     if setup:
         msg += f"• Setup: `{setup}`\n"
 
@@ -146,6 +156,40 @@ def _build_signal_message(result: Dict[str, Any]) -> str:
         msg += "\n\n🧪 *DRY_RUN=ON* (aucun ordre envoyé)"
 
     return msg
+
+
+async def _place_limit_compat(
+    trader: BitgetTrader,
+    *,
+    symbol: str,
+    side: str,
+    price: float,
+    size: float,
+    client_oid: str,
+    sl: float,
+    tp1: float,
+) -> Any:
+    """
+    Appel place_limit compatible quelle que soit ta version de BitgetTrader:
+    - Si preset_sl/preset_tp existent -> on les passe
+    - Sinon -> on ne les passe pas
+    """
+    sig = inspect.signature(trader.place_limit)
+    kwargs: Dict[str, Any] = {
+        "symbol": symbol,
+        "side": side,
+        "price": price,
+        "size": size,
+        "client_oid": client_oid,
+    }
+
+    # certaines versions acceptent preset_sl/preset_tp
+    if "preset_sl" in sig.parameters:
+        kwargs["preset_sl"] = sl
+    if "preset_tp" in sig.parameters:
+        kwargs["preset_tp"] = (tp1 if tp1 > 0 else None)
+
+    return await trader.place_limit(**kwargs)
 
 
 # =====================================================================
@@ -179,8 +223,9 @@ async def process_symbol(
     - duplicate guard
     - risk checks
     - telegram
-    - place limit (preset SL/TP1)
+    - place limit
     """
+    acquired_budget = False
     try:
         async with fetch_sem:
             df_h1, df_h4 = await _fetch_dfs(client, symbol)
@@ -192,7 +237,7 @@ async def process_symbol(
         if len(df_h1) < 80 or len(df_h4) < 80:
             return
 
-        macro = {}  # placeholder si tu ajoutes macro plus tard
+        macro = {}  # placeholder
         result = await analyzer.analyze(symbol, df_h1, df_h4, macro)
 
         if not result or not result.get("valid"):
@@ -204,29 +249,35 @@ async def process_symbol(
 
         direction = _side_to_direction(side)
 
-        entry = float(result.get("entry", 0.0))
-        sl = float(result.get("sl", 0.0))
+        entry = _safe_float(result.get("entry"), 0.0)
+        sl = _safe_float(result.get("sl"), 0.0)
         tp1 = result.get("tp1")
-        tp1_val = float(tp1) if tp1 is not None else 0.0
+        tp1_val = _safe_float(tp1, 0.0)
+
+        if entry <= 0:
+            logger.info("[%s] invalid entry <= 0 -> skip", symbol)
+            return
 
         rr = result.get("rr")
         setup = result.get("setup_type")
+
         inst = result.get("institutional") or {}
         inst_score = inst.get("institutional_score", 0)
 
-        # Fingerprint stable anti-doublons
+        # Anti-doublons (stable)
         fp = make_fingerprint(symbol, side, entry, sl, tp1_val, extra=setup, precision=6)
         if DUP_GUARD.is_duplicate(fp):
             logger.info("[DUP] skip %s %s (déjà envoyé)", symbol, side)
             return
 
-        # Risk gating (niveau desk)
+        # Risk gating (desk)
         notional = float(MARGIN_USDT) * float(LEVERAGE)
+
         allowed, reason = RISK.can_trade(
             symbol=symbol,
             side=direction,
             notional=notional,
-            rr=float(rr) if rr is not None else None,
+            rr=_safe_float(rr, 0.0) if rr is not None else None,
             inst_score=int(inst_score) if inst_score is not None else 0,
             commitment=None,
         )
@@ -241,31 +292,44 @@ async def process_symbol(
         if DRY_RUN:
             return
 
-        # Budget ordres par scan (non bloquant)
+        # Budget ordres par scan
         try:
             await asyncio.wait_for(order_budget.acquire(), timeout=0.01)
+            acquired_budget = True
         except asyncio.TimeoutError:
             logger.info("[BUDGET] max orders per scan atteint → skip %s", symbol)
             return
 
+        # ✅ FIX IMPORTANT: calculer la size ICI (évite division par 0 dans le trader)
+        # (notional = margin * leverage) / entry
+        if entry <= 0:
+            return
+        size_for_trader = notional / entry
+        if size_for_trader <= 0:
+            logger.info("[%s] size_for_trader <= 0 -> skip", symbol)
+            return
+
         client_oid = f"{symbol}-{int(time.time() * 1000)}"
 
-        # Place LIMIT avec preset SL + preset TP1 (si dispo)
-        entry_res = await trader.place_limit(
+        entry_res = await _place_limit_compat(
+            trader,
             symbol=symbol,
-            side=side,          # "BUY"/"SELL" accepté (sera lower() dans trader)
+            side=side,
             price=entry,
-            size=None,          # laisse trader calculer via marge*levier (stable)
+            size=size_for_trader,
             client_oid=client_oid,
-            preset_sl=sl,
-            preset_tp=(tp1_val if tp1_val > 0 else None),
+            sl=sl,
+            tp1=tp1_val,
         )
 
         if not _is_ok(entry_res):
             logger.error("[ENTRY] FAILED %s → %s", symbol, entry_res)
-            await send_telegram(
-                f"❌ *ENTRY FAILED* {symbol} {side} @ `{entry}`\n`{entry_res}`"
-            )
+            await send_telegram(f"❌ *ENTRY FAILED* {symbol} {side} @ `{entry}`\n`{entry_res}`")
+
+            # On libère le budget si l’ordre a échoué (sinon tu perds 1 slot)
+            if acquired_budget:
+                order_budget.release()
+                acquired_budget = False
             return
 
         # Register open (approx)
@@ -278,8 +342,16 @@ async def process_symbol(
 
         logger.info("[ENTRY] OK %s %s @ %s (oid=%s)", symbol, side, entry, client_oid)
 
-    except Exception as e:
-        logger.error("[%s] process_symbol error: %s", symbol, e)
+    except Exception:
+        # ✅ IMPORTANT: on veut la stacktrace complète
+        logger.exception("[%s] process_symbol error", symbol)
+
+        # Si erreur après acquire, on libère
+        if acquired_budget:
+            try:
+                order_budget.release()
+            except Exception:
+                pass
 
 
 # =====================================================================
@@ -305,9 +377,7 @@ async def scan_once(client, analyzer: SignalAnalyzer, trader: BitgetTrader) -> N
 
 
 async def start_scanner() -> None:
-    """
-    Démarre le scanner en boucle infinie.
-    """
+    """Démarre le scanner en boucle infinie."""
     logging.basicConfig(level=logging.INFO)
 
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
@@ -326,17 +396,13 @@ async def start_scanner() -> None:
         t0 = time.time()
         try:
             await scan_once(client, analyzer, trader)
-        except Exception as e:
-            logger.error("SCAN ERROR: %s", e)
+        except Exception:
+            logger.exception("SCAN ERROR")
 
         dt = time.time() - t0
         sleep_s = max(1, int(float(SCAN_INTERVAL_MIN) * 60 - dt))
         await asyncio.sleep(sleep_s)
 
-
-# =====================================================================
-# MODE LOCAL
-# =====================================================================
 
 if __name__ == "__main__":
     try:
