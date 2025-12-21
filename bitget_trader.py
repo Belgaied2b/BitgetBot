@@ -319,7 +319,9 @@ class BitgetTrader(BitgetClient):
             f"levier={self.TARGET_LEVERAGE:.1f}x, clientOid={client_oid_str})"
         )
 
-        body = {
+        # IMPORTANT : BitgetClient._request ne supporte pas 'body='
+        # On envoie tout dans params, même en POST.
+        params = {
             "symbol": symbol,
             "productType": self.PRODUCT_TYPE,
             "marginMode": self.MARGIN_MODE,
@@ -337,8 +339,7 @@ class BitgetTrader(BitgetClient):
         resp = await self._request(
             "POST",
             "/api/v2/mix/order/place-order",
-            params={},
-            body=body,
+            params=params,
             auth=True,
         )
         return resp
@@ -396,7 +397,7 @@ class BitgetTrader(BitgetClient):
             f"(fraction={fraction:.3f}, clientOid={client_oid_str})"
         )
 
-        body = {
+        params = {
             "planType": "normal_plan",
             "productType": self.PRODUCT_TYPE,
             "symbol": symbol,
@@ -416,8 +417,7 @@ class BitgetTrader(BitgetClient):
         resp = await self._request(
             "POST",
             "/api/v2/mix/order/place-plan-order",
-            params={},
-            body=body,
+            params=params,
             auth=True,
         )
         return resp
@@ -474,7 +474,7 @@ class BitgetTrader(BitgetClient):
             f"(fraction={fraction:.3f}, clientOid={client_oid_str})"
         )
 
-        body = {
+        params = {
             "planType": "normal_plan",
             "productType": self.PRODUCT_TYPE,
             "symbol": symbol,
@@ -494,8 +494,7 @@ class BitgetTrader(BitgetClient):
         resp = await self._request(
             "POST",
             "/api/v2/mix/order/place-plan-order",
-            params={},
-            body=body,
+            params=params,
             auth=True,
         )
         return resp
