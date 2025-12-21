@@ -15,9 +15,15 @@ except Exception:  # fallback si pas défini dans settings.py
 
 logger = logging.getLogger(__name__)
 
+# ----------------------------------------------------------------------
+# Constantes Bitget
+# ----------------------------------------------------------------------
 
-PRODUCT_TYPE = "USDT-FUTURES"
+# Forme canonique côté Bitget (voir doc) : "usdt-futures"
+PRODUCT_TYPE = "usdt-futures"
+
 MARGIN_COIN = "USDT"
+# En pratique Bitget accepte "isolated" / "crossed" (ici on reste en isolé)
 MARGIN_MODE = "isolated"
 
 
@@ -259,6 +265,24 @@ class BitgetTrader(BitgetClient):
 
         return float(self._fmt(sz, decimals))
 
+    @staticmethod
+    def _sanitize_client_oid(symbol: str, client_oid: Optional[str]) -> str:
+        """
+        Sanitise le clientOid pour respecter les contraintes Bitget.
+        - max 32 chars
+        - caractères alphanum + - _ #
+        """
+        if client_oid is None:
+            base = f"entry-{symbol}-{int(time.time() * 1000)}"
+        else:
+            base = str(client_oid)
+
+        cleaned = "".join(c if c.isalnum() or c in "-_#" else "_" for c in base)
+        if not cleaned:
+            cleaned = f"entry-{symbol}-{int(time.time() * 1000)}"
+        # Bitget docs: limite typique 32 chars
+        return cleaned[:32]
+
     # ------------------------------------------------------------------
     # PLACE LIMIT
     # ------------------------------------------------------------------
@@ -274,9 +298,6 @@ class BitgetTrader(BitgetClient):
         Place un ordre LIMIT d'ouverture en respectant les contraintes :
           - tick de prix
           - sizeStep / minTradeNum
-
-        Conformément à la doc Bitget /api/v2/mix/order/place-order
-        pour un ordre limit.
         """
         side = side.lower()  # "buy" ou "sell"
 
@@ -299,11 +320,7 @@ class BitgetTrader(BitgetClient):
         approx_notional = q_size * q_price
         approx_margin = approx_notional / self.TARGET_LEVERAGE
 
-        # clientOid : on force une string, même si le caller envoie un float
-        if client_oid:
-            client_oid_str = str(client_oid)
-        else:
-            client_oid_str = f"entry-{symbol}-{int(time.time() * 1000)}"
+        safe_client_oid = self._sanitize_client_oid(symbol, client_oid)
 
         # format price/size en string avec les bons décimales
         if meta:
@@ -316,30 +333,26 @@ class BitgetTrader(BitgetClient):
         logger.info(
             f"[TRADER] place_limit {symbol} {side} price={price_str} size={size_str} "
             f"(notional≈{approx_notional:.2f} USDT, marge≈{approx_margin:.2f} USDT, "
-            f"levier={self.TARGET_LEVERAGE:.1f}x, clientOid={client_oid_str})"
+            f"levier={self.TARGET_LEVERAGE:.1f}x, clientOid={safe_client_oid})"
         )
 
-        # IMPORTANT : BitgetClient._request ne supporte pas 'body='
-        # On envoie tout dans params, même en POST.
-        params = {
-            "symbol": symbol,
+        # IMPORTANT : on envoie un body minimaliste conforme à la doc.
+        body = {
             "productType": self.PRODUCT_TYPE,
+            "symbol": symbol,
             "marginMode": self.MARGIN_MODE,
             "marginCoin": self.MARGIN_COIN,
             "size": size_str,
             "price": price_str,
             "side": side,           # "buy" ou "sell"
-            "tradeSide": "open",    # ignoré en one-way-mode, OK en hedge-mode
             "orderType": "limit",
-            "force": "gtc",         # REQUIS pour limit d'après la doc
-            "clientOid": client_oid_str,
-            "reduceOnly": "NO",
+            "clientOid": safe_client_oid,
         }
 
         resp = await self._request(
             "POST",
             "/api/v2/mix/order/place-order",
-            params=params,
+            params=body,
             auth=True,
         )
         return resp
@@ -379,10 +392,7 @@ class BitgetTrader(BitgetClient):
 
         q_price = self._quantize_price_from_meta(meta, sl_price)
 
-        if client_oid:
-            client_oid_str = str(client_oid)
-        else:
-            client_oid_str = f"sl-{symbol}-{int(time.time() * 1000)}"
+        safe_client_oid = self._sanitize_client_oid(symbol, client_oid)
 
         if meta:
             price_str = self._fmt(q_price, meta["price_decimals"])
@@ -394,10 +404,10 @@ class BitgetTrader(BitgetClient):
         logger.info(
             f"[TRADER] place_stop_loss {symbol} side(open)={open_side_up} "
             f"trigger_side={trigger_side} sl={price_str} size={size_str} "
-            f"(fraction={fraction:.3f}, clientOid={client_oid_str})"
+            f"(fraction={fraction:.3f}, clientOid={safe_client_oid})"
         )
 
-        params = {
+        body = {
             "planType": "normal_plan",
             "productType": self.PRODUCT_TYPE,
             "symbol": symbol,
@@ -411,13 +421,13 @@ class BitgetTrader(BitgetClient):
             "side": trigger_side,
             "tradeSide": "close",
             "reduceOnly": "YES",
-            "clientOid": client_oid_str,
+            "clientOid": safe_client_oid,
         }
 
         resp = await self._request(
             "POST",
             "/api/v2/mix/order/place-plan-order",
-            params=params,
+            params=body,
             auth=True,
         )
         return resp
@@ -456,10 +466,7 @@ class BitgetTrader(BitgetClient):
 
         q_price = self._quantize_price_from_meta(meta, tp_price)
 
-        if client_oid:
-            client_oid_str = str(client_oid)
-        else:
-            client_oid_str = f"tp-{symbol}-{int(time.time() * 1000)}"
+        safe_client_oid = self._sanitize_client_oid(symbol, client_oid)
 
         if meta:
             price_str = self._fmt(q_price, meta["price_decimals"])
@@ -471,10 +478,10 @@ class BitgetTrader(BitgetClient):
         logger.info(
             f"[TRADER] place_take_profit {symbol} side(open)={open_side_up} "
             f"trigger_side={trigger_side} tp={price_str} size={size_str} "
-            f"(fraction={fraction:.3f}, clientOid={client_oid_str})"
+            f"(fraction={fraction:.3f}, clientOid={safe_client_oid})"
         )
 
-        params = {
+        body = {
             "planType": "normal_plan",
             "productType": self.PRODUCT_TYPE,
             "symbol": symbol,
@@ -488,13 +495,13 @@ class BitgetTrader(BitgetClient):
             "side": trigger_side,
             "tradeSide": "close",
             "reduceOnly": "YES",
-            "clientOid": client_oid_str,
+            "clientOid": safe_client_oid,
         }
 
         resp = await self._request(
             "POST",
             "/api/v2/mix/order/place-plan-order",
-            params=params,
+            params=body,
             auth=True,
         )
         return resp
