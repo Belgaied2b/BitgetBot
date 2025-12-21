@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import aiohttp
 
@@ -59,10 +59,15 @@ _FUNDING_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 # (on garde le dernier snapshot pour calculer un slope simple)
 _OI_HISTORY: Dict[str, Tuple[float, float]] = {}
 
+# Cache symboles Binance Futures USDT-perp
+_BINANCE_SYMBOLS: Optional[Set[str]] = None
+_BINANCE_SYMBOLS_TS: float = 0.0
+
 # TTLs (en secondes)
 KLINES_TTL = 60.0
 FUNDING_TTL = 60.0
 OI_TTL = 60.0  # si on veut un jour filtrer par temps, déjà prêt
+BINANCE_SYMBOLS_TTL = 900.0  # 15 minutes pour la liste des symboles
 
 
 # =====================================================================
@@ -91,28 +96,79 @@ async def _http_get(
 
 
 # =====================================================================
+# Symboles Binance Futures (cache exchangeInfo)
+# =====================================================================
+
+async def _get_binance_symbols(
+    session: aiohttp.ClientSession,
+) -> Set[str]:
+    """
+    Charge / met à jour la liste des symboles Binance Futures USDT-perp (PERPETUAL, quoteAsset=USDT).
+    Résultat mis en cache pour BINANCE_SYMBOLS_TTL secondes.
+    """
+    global _BINANCE_SYMBOLS, _BINANCE_SYMBOLS_TS
+
+    now = time.time()
+    if _BINANCE_SYMBOLS is not None and (now - _BINANCE_SYMBOLS_TS) < BINANCE_SYMBOLS_TTL:
+        return _BINANCE_SYMBOLS
+
+    data = await _http_get(session, "/fapi/v1/exchangeInfo", params=None)
+    symbols: Set[str] = set()
+
+    if not isinstance(data, dict) or "symbols" not in data:
+        LOGGER.warning("[INST] Unable to fetch Binance exchangeInfo, keeping old symbols cache")
+        if _BINANCE_SYMBOLS is None:
+            _BINANCE_SYMBOLS = set()
+        return _BINANCE_SYMBOLS
+
+    for s in data["symbols"]:
+        try:
+            if s.get("status") != "TRADING":
+                continue
+            if s.get("contractType") != "PERPETUAL":
+                continue
+            if s.get("quoteAsset") != "USDT":
+                continue
+
+            sym = str(s.get("symbol", "")).upper()
+            if sym:
+                symbols.add(sym)
+        except Exception:
+            continue
+
+    _BINANCE_SYMBOLS = symbols
+    _BINANCE_SYMBOLS_TS = now
+
+    LOGGER.info("[INST] Binance futures symbols loaded: %d", len(symbols))
+    return _BINANCE_SYMBOLS
+
+
+# =====================================================================
 # Symbol mapping Bitget -> Binance
 # =====================================================================
 
-def _map_symbol_to_binance(symbol: str) -> Optional[str]:
+def _map_symbol_to_binance(symbol: str, binance_symbols: Set[str]) -> Optional[str]:
     """
-    Map symbol Bitget (ex: 'BTCUSDT') to Binance USDT-M futures symbol.
+    Map symbol Bitget (ex: 'BTCUSDT') vers Binance USDT-M futures symbol.
 
-    Par défaut, on considère que c'est le même (BTCUSDT -> BTCUSDT).
-
-    Si un jour tu veux gérer des exceptions (tokens exotiques / stocks),
-    tu pourras étendre cette fonction avec un mapping explicite.
+    - Cas direct : BTCUSDT -> BTCUSDT si présent dans binance_symbols.
+    - Cas 1000TOKENUSDT -> TOKENUSDT si TOKENUSDT est présent.
+    - Sinon -> None (pas de couverture insti Binance).
     """
     s = symbol.upper()
 
-    # Exemple de mapping spécial si tu en as besoin :
-    # mapping_exceptions = {
-    #     "PEPUSDT": None,   # pas dispo sur Binance -> score neutre
-    # }
-    # if s in mapping_exceptions:
-    #     return mapping_exceptions[s]
+    # Mapping direct
+    if s in binance_symbols:
+        return s
 
-    return s
+    # Cas 1000TOKENUSDT -> TOKENUSDT
+    if s.startswith("1000"):
+        alt = s[4:]
+        if alt in binance_symbols:
+            return alt
+
+    # Ici tu peux ajouter d'autres règles si besoin (tokens exotiques)
+    return None
 
 
 # =====================================================================
@@ -462,26 +518,10 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
     Calcule un score institutionnel pour un symbol Bitget donné, en utilisant
     les données Binance USDT-M Futures (klines, OI, funding).
 
-    Si Binance ne connaît pas le symbole -> score neutre (0) mais le reste
-    de la pipeline continue.
+    - Si Binance ne connaît pas le symbole -> score neutre (0), available=False,
+      mais le reste de la pipeline peut continuer (structure/momentum/RR).
     """
     bias = bias.upper()
-    binance_symbol = _map_symbol_to_binance(symbol)
-
-    if binance_symbol is None:
-        return {
-            "institutional_score": 0,
-            "binance_symbol": None,
-            "available": False,
-            "oi": None,
-            "oi_slope": None,
-            "cvd_slope": None,
-            "funding_rate": None,
-            "funding_regime": "unknown",
-            "crowding_regime": "unknown",
-            "flow_regime": "unknown",
-            "warnings": ["symbol_not_mapped_to_binance"],
-        }
 
     warnings: List[str] = []
     oi_value: Optional[float] = None
@@ -490,6 +530,26 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
     funding_rate: Optional[float] = None
 
     async with aiohttp.ClientSession() as session:
+        # 0) Récupérer / rafraîchir la liste des symboles Binance Futures
+        binance_symbols = await _get_binance_symbols(session)
+        binance_symbol = _map_symbol_to_binance(symbol, binance_symbols)
+
+        # Si aucun mapping viable -> pas de couverture insti Binance
+        if binance_symbol is None:
+            return {
+                "institutional_score": 0,
+                "binance_symbol": None,
+                "available": False,
+                "oi": None,
+                "oi_slope": None,
+                "cvd_slope": None,
+                "funding_rate": None,
+                "funding_regime": "unknown",
+                "crowding_regime": "unknown",
+                "flow_regime": "unknown",
+                "warnings": ["symbol_not_mapped_to_binance"],
+            }
+
         # 1) Klines -> CVD
         klines = await _fetch_klines_1h(session, binance_symbol, limit=120)
         if not klines:
@@ -531,10 +591,17 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
         funding_rate=funding_rate,
     )
 
+    # available = on a AU MOINS une info exploitable (klines, oi ou funding)
+    available = any([
+        oi_value is not None,
+        cvd_slope is not None,
+        funding_rate is not None,
+    ])
+
     return {
         "institutional_score": inst_score,
         "binance_symbol": binance_symbol,
-        "available": not warnings,  # best effort
+        "available": available,
         "oi": oi_value,
         "oi_slope": oi_slope,
         "cvd_slope": cvd_slope,
