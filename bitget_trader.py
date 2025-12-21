@@ -3,7 +3,7 @@ import time
 import logging
 from typing import Dict, Any, Optional
 
-from bitget_client import BitgetClient
+from bitget_client import BitgetClient, normalize_symbol
 
 try:
     # Optionnel : récup config globale si dispo
@@ -23,17 +23,6 @@ MARGIN_COIN = "USDT"
 class SymbolMetaCache:
     """
     Cache des métadonnées contrats Bitget pour USDT-FUTURES.
-
-    On interroge :
-      GET /api/v2/mix/market/contracts?productType=USDT-FUTURES
-
-    et on en tire :
-      - pricePlace      -> nb de décimales du prix
-      - priceEndStep    -> taille du pas de prix
-      - volumePlace     -> nb de décimales de size
-      - sizeMultiplier  -> (contrat unit) utilisé comme step de taille
-      - minTradeNum     -> taille minimale
-      - maxOrderQty     -> taille max par ordre
     """
 
     def __init__(self, client: BitgetClient, product_type: str = PRODUCT_TYPE, ttl_seconds: int = 300):
@@ -54,11 +43,12 @@ class SymbolMetaCache:
 
         params = {"productType": self.product_type}
         try:
+            # ✅ FIX: keyword-only args (params=..., auth=...)
             resp = await self.client._request(
                 "GET",
                 "/api/v2/mix/market/contracts",
-                params,
-                False,
+                params=params,
+                auth=False,
             )
         except Exception as e:
             logger.error(f"[META] error fetching contracts list: {e}")
@@ -71,9 +61,11 @@ class SymbolMetaCache:
 
         new_cache: Dict[str, Dict[str, Any]] = {}
         for c in data:
-            sym = c.get("symbol")
-            if not sym:
+            sym_raw = c.get("symbol")
+            if not sym_raw:
                 continue
+
+            sym = normalize_symbol(sym_raw)
             try:
                 price_place = int(c.get("pricePlace", "0"))
                 price_end_step = float(c.get("priceEndStep", "1"))
@@ -86,7 +78,7 @@ class SymbolMetaCache:
                 # Tick = step * 10^(-pricePlace)
                 tick_size = price_end_step * (10 ** -price_place)
 
-                new_cache[sym] = {
+                meta = {
                     "symbol": sym,
                     "price_decimals": price_place,
                     "tick_size": tick_size,
@@ -95,6 +87,8 @@ class SymbolMetaCache:
                     "min_trade_num": min_trade_num,
                     "max_order_qty": max_order_qty,
                 }
+
+                new_cache[sym] = meta
             except Exception as e:
                 logger.warning(f"[META] skipping contract {c}: {e}")
 
@@ -107,25 +101,31 @@ class SymbolMetaCache:
         """
         Fetch meta pour un seul symbole si pas présent dans le cache global.
         """
-        params = {"productType": self.product_type, "symbol": symbol}
+        symbol_n = normalize_symbol(symbol)
+        params = {"productType": self.product_type, "symbol": symbol_n}
+
         try:
+            # ✅ FIX: keyword-only args
             resp = await self.client._request(
                 "GET",
                 "/api/v2/mix/market/contracts",
-                params,
-                False,
+                params=params,
+                auth=False,
             )
         except Exception as e:
-            logger.error(f"[META] error fetching contract for {symbol}: {e}")
+            logger.error(f"[META] error fetching contract for {symbol_n}: {e}")
             return None
 
         data = resp.get("data") if isinstance(resp, dict) else None
         if not isinstance(data, list) or not data:
-            logger.error(f"[META] empty contracts data for symbol={symbol}: {resp}")
+            logger.error(f"[META] empty contracts data for symbol={symbol_n}: {resp}")
             return None
 
         c = data[0]
         try:
+            sym_raw = c.get("symbol") or symbol_n
+            sym = normalize_symbol(sym_raw)
+
             price_place = int(c.get("pricePlace", "0"))
             price_end_step = float(c.get("priceEndStep", "1"))
             volume_place = int(c.get("volumePlace", "0"))
@@ -136,6 +136,7 @@ class SymbolMetaCache:
 
             tick_size = price_end_step * (10 ** -price_place)
 
+            # ✅ FIX: sym défini (et cohérent)
             meta = {
                 "symbol": sym,
                 "price_decimals": price_place,
@@ -145,34 +146,31 @@ class SymbolMetaCache:
                 "min_trade_num": min_trade_num,
                 "max_order_qty": max_order_qty,
             }
-            self._cache[symbol] = meta
-            logger.info(f"[META] fetched single contract meta for {symbol}: {meta}")
+
+            # on stocke sous la clé normalisée
+            self._cache[sym] = meta
+            self._cache[symbol_n] = meta  # alias si jamais
+            logger.info(f"[META] fetched single contract meta for {symbol_n}: {meta}")
             return meta
         except Exception as e:
-            logger.error(f"[META] error parsing single contract {c} for symbol={symbol}: {e}")
+            logger.error(f"[META] error parsing single contract {c} for symbol={symbol_n}: {e}")
             return None
 
     async def get(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
         Retourne la meta pour un symbole donné (ou None si échec).
         """
+        symbol_n = normalize_symbol(symbol)
         await self._refresh_all()
-        meta = self._cache.get(symbol)
+        meta = self._cache.get(symbol_n)
         if meta is not None:
             return meta
-        return await self._fetch_single(symbol)
+        return await self._fetch_single(symbol_n)
 
 
 class BitgetTrader(BitgetClient):
     """
     Trader Bitget Futures USDT (USDT-FUTURES) en mode desk institutionnel.
-
-    - Utilise un cache de contrats pour respecter tick & sizeScale
-    - Calcule la taille en fonction d'une marge fixe (TARGET_MARGIN_USDT)
-      et d'un levier fixe (TARGET_LEVERAGE)
-    - Place :
-        * ordre LIMIT d'ouverture (v2)
-        * plan orders STOP LOSS / TAKE PROFIT (on les alignera ensuite)
     """
 
     def __init__(
@@ -187,20 +185,13 @@ class BitgetTrader(BitgetClient):
         leverage: float = TARGET_LEVERAGE,
     ):
         super().__init__(api_key, api_secret, passphrase)
-        self.PRODUCT_TYPE = product_type          # "USDT-FUTURES"
-        self.MARGIN_COIN = margin_coin            # "USDT"
+        self.PRODUCT_TYPE = product_type
+        self.MARGIN_COIN = margin_coin
         self.TARGET_MARGIN_USDT = float(target_margin_usdt)
         self.TARGET_LEVERAGE = float(leverage)
 
-        # Cache des métas contrats
         self._meta_cache = SymbolMetaCache(self, product_type=self.PRODUCT_TYPE)
-
-        # Taille d'entrée mémorisée par symbole pour SL/TP
         self._entry_size: Dict[str, float] = {}
-
-    # ------------------------------------------------------------------
-    # Helpers de quantization
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _fmt(value: float, decimals: int) -> str:
@@ -229,10 +220,8 @@ class BitgetTrader(BitgetClient):
         if raw <= 0:
             raise ValueError(f"invalid size {raw}")
 
-        # Align sur le step
         sz = math.floor(raw / step) * step
 
-        # clamp max
         if max_qty is not None:
             max_qty = float(max_qty)
             if sz > max_qty:
@@ -243,54 +232,38 @@ class BitgetTrader(BitgetClient):
 
         return float(self._fmt(sz, decimals))
 
-    # ------------------------------------------------------------------
-    # PLACE LIMIT (v2, one-way / netting compatible)
-    # ------------------------------------------------------------------
-
     async def place_limit(
         self,
         symbol: str,
-        side: str,      # "buy" ou "sell"
+        side: str,
         price: float,
         client_oid: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """
-        Place un ordre LIMIT d'ouverture en mode v2.
-
-        Paramètres envoyés à Bitget :
-          - productType: "USDT-FUTURES"
-          - symbol: ex. "TRXUSDT"
-          - marginCoin: "USDT"
-          - side: "buy" ou "sell" (Netting / one-way OK)
-          - orderType: "limit"
-          - timeInForceValue: "normal"
-        """
         side = side.lower()
         if side not in ("buy", "sell"):
             raise ValueError(f"invalid side {side}")
 
-        meta = await self._meta_cache.get(symbol)
+        symbol_n = normalize_symbol(symbol)
+
+        meta = await self._meta_cache.get(symbol_n)
         q_price = self._quantize_price_from_meta(meta, price)
 
-        # notionnel cible ~ marge * levier
         notional_target = self.TARGET_MARGIN_USDT * self.TARGET_LEVERAGE
         raw_size = notional_target / q_price
 
         try:
             q_size = self._quantize_size_from_meta(meta, raw_size)
         except ValueError as e:
-            logger.error(f"[TRADER] {symbol} size too small for limit: {e}")
+            logger.error(f"[TRADER] {symbol_n} size too small for limit: {e}")
             return None
 
-        # Mémoriser la taille d'entrée pour SL/TP
-        self._entry_size[symbol] = q_size
+        self._entry_size[symbol_n] = q_size
 
         approx_notional = q_size * q_price
         approx_margin = approx_notional / self.TARGET_LEVERAGE
 
         if client_oid is None:
-            client_oid = f"entry-{symbol}-{int(time.time() * 1000)}"
-
+            client_oid = f"entry-{symbol_n}-{int(time.time() * 1000)}"
         client_oid_str = str(client_oid)
 
         if meta:
@@ -301,87 +274,74 @@ class BitgetTrader(BitgetClient):
             size_str = f"{q_size:.4f}"
 
         logger.info(
-            f"[TRADER] place_limit {symbol} ({self.PRODUCT_TYPE}) {side} "
+            f"[TRADER] place_limit {symbol_n} ({self.PRODUCT_TYPE}) {side} "
             f"price={price_str} size={size_str} "
             f"(notional≈{approx_notional:.2f} USDT, marge≈{approx_margin:.2f} USDT, "
             f"levier={self.TARGET_LEVERAGE:.1f}x, clientOid={client_oid_str})"
         )
 
         payload = {
-            "symbol": symbol,
+            "symbol": symbol_n,
             "productType": self.PRODUCT_TYPE,
             "marginCoin": self.MARGIN_COIN,
             "size": size_str,
             "price": price_str,
-            "side": side,                    # "buy" ou "sell"
+            "side": side,
             "orderType": "limit",
             "timeInForceValue": "normal",
             "clientOid": client_oid_str,
         }
 
         try:
+            # ✅ FIX: keyword-only args
             resp = await self._request(
                 "POST",
                 "/api/v2/mix/order/place-order",
-                payload,
-                True,
+                data=payload,
+                auth=True,
             )
         except Exception as e:
-            logger.error(f"[TRADER] place_limit HTTP error {symbol}: {e}")
+            logger.error(f"[TRADER] place_limit HTTP error {symbol_n}: {e}")
             return None
 
         code = str(resp.get("code", ""))
         if code != "00000":
             logger.error(
-                f"[TRADER] place_limit Bitget error {symbol}: "
+                f"[TRADER] place_limit Bitget error {symbol_n}: "
                 f"code={code}, msg={resp.get('msg')}, resp={resp}"
             )
             return None
 
         return resp
 
-    # ------------------------------------------------------------------
-    # PLACE STOP LOSS & TAKE PROFIT (v2 plan orders)
-    # ------------------------------------------------------------------
-    # NOTE : on les garde simples pour l’instant. Ils ne seront utilisés
-    # que quand les entrées fonctionneront proprement. On pourra les
-    # raffiner ensuite si besoin.
-
     async def place_stop_loss(
         self,
         symbol: str,
-        open_side: str,        # "buy"/"sell" ou "LONG"/"SHORT"
+        open_side: str,
         sl_price: float,
         size: float,
         fraction: float = 1.0,
         client_oid: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """
-        Place un plan order STOP LOSS (normal_plan) pour close la position.
-        """
-        meta = await self._meta_cache.get(symbol)
+        symbol_n = normalize_symbol(symbol)
+        meta = await self._meta_cache.get(symbol_n)
 
         open_side_up = open_side.upper()
-        # Si on est long (ou buy) -> SL = sell
-        # Si on est short (ou sell) -> SL = buy
-        if open_side_up in ("BUY", "LONG"):
-            trigger_side = "sell"
-        else:
-            trigger_side = "buy"
+        trigger_side = "sell" if open_side_up in ("BUY", "LONG") else "buy"
 
-        base_size = self._entry_size.get(symbol, float(size))
+        base_size = self._entry_size.get(symbol_n, float(size))
         eff_size = base_size * float(fraction)
 
         try:
             q_size = self._quantize_size_from_meta(meta, eff_size)
         except ValueError as e:
-            logger.error(f"[TRADER] SL {symbol} size too small: {e}")
+            logger.error(f"[TRADER] SL {symbol_n} size too small: {e}")
             return None
 
         q_price = self._quantize_price_from_meta(meta, sl_price)
 
         if client_oid is None:
-            client_oid = f"sl-{symbol}-{int(time.time() * 1000)}"
+            client_oid = f"sl-{symbol_n}-{int(time.time() * 1000)}"
         client_oid_str = str(client_oid)
 
         if meta:
@@ -392,12 +352,12 @@ class BitgetTrader(BitgetClient):
             size_str = f"{q_size:.4f}"
 
         logger.info(
-            f"[TRADER] place_stop_loss {symbol} side(open)={open_side_up} "
+            f"[TRADER] place_stop_loss {symbol_n} side(open)={open_side_up} "
             f"trigger_side={trigger_side} sl={price_str} size={size_str} (fraction={fraction:.3f})"
         )
 
         payload = {
-            "symbol": symbol,
+            "symbol": symbol_n,
             "productType": self.PRODUCT_TYPE,
             "marginCoin": self.MARGIN_COIN,
             "size": size_str,
@@ -411,20 +371,21 @@ class BitgetTrader(BitgetClient):
         }
 
         try:
+            # ✅ FIX: keyword-only args
             resp = await self._request(
                 "POST",
                 "/api/v2/mix/order/place-plan-order",
-                payload,
-                True,
+                data=payload,
+                auth=True,
             )
         except Exception as e:
-            logger.error(f"[TRADER] place_stop_loss HTTP error {symbol}: {e}")
+            logger.error(f"[TRADER] place_stop_loss HTTP error {symbol_n}: {e}")
             return None
 
         code = str(resp.get("code", ""))
         if code != "00000":
             logger.error(
-                f"[TRADER] place_stop_loss Bitget error {symbol}: "
+                f"[TRADER] place_stop_loss Bitget error {symbol_n}: "
                 f"code={code}, msg={resp.get('msg')}, resp={resp}"
             )
             return None
@@ -440,30 +401,25 @@ class BitgetTrader(BitgetClient):
         fraction: float = 0.5,
         client_oid: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """
-        Place un plan order TAKE PROFIT pour close partiellement la position.
-        """
-        meta = await self._meta_cache.get(symbol)
+        symbol_n = normalize_symbol(symbol)
+        meta = await self._meta_cache.get(symbol_n)
 
         open_side_up = open_side.upper()
-        if open_side_up in ("BUY", "LONG"):
-            trigger_side = "sell"
-        else:
-            trigger_side = "buy"
+        trigger_side = "sell" if open_side_up in ("BUY", "LONG") else "buy"
 
-        base_size = self._entry_size.get(symbol, float(size))
+        base_size = self._entry_size.get(symbol_n, float(size))
         eff_size = base_size * float(fraction)
 
         try:
             q_size = self._quantize_size_from_meta(meta, eff_size)
         except ValueError as e:
-            logger.error(f"[TRADER] TP {symbol} size too small: {e}")
+            logger.error(f"[TRADER] TP {symbol_n} size too small: {e}")
             return None
 
         q_price = self._quantize_price_from_meta(meta, tp_price)
 
         if client_oid is None:
-            client_oid = f"tp-{symbol}-{int(time.time() * 1000)}"
+            client_oid = f"tp-{symbol_n}-{int(time.time() * 1000)}"
         client_oid_str = str(client_oid)
 
         if meta:
@@ -474,12 +430,12 @@ class BitgetTrader(BitgetClient):
             size_str = f"{q_size:.4f}"
 
         logger.info(
-            f"[TRADER] place_take_profit {symbol} side(open)={open_side_up} "
+            f"[TRADER] place_take_profit {symbol_n} side(open)={open_side_up} "
             f"trigger_side={trigger_side} tp={price_str} size={size_str} (fraction={fraction:.3f})"
         )
 
         payload = {
-            "symbol": symbol,
+            "symbol": symbol_n,
             "productType": self.PRODUCT_TYPE,
             "marginCoin": self.MARGIN_COIN,
             "size": size_str,
@@ -493,20 +449,21 @@ class BitgetTrader(BitgetClient):
         }
 
         try:
+            # ✅ FIX: keyword-only args
             resp = await self._request(
                 "POST",
                 "/api/v2/mix/order/place-plan-order",
-                payload,
-                True,
+                data=payload,
+                auth=True,
             )
         except Exception as e:
-            logger.error(f"[TRADER] place_take_profit HTTP error {symbol}: {e}")
+            logger.error(f"[TRADER] place_take_profit HTTP error {symbol_n}: {e}")
             return None
 
         code = str(resp.get("code", ""))
         if code != "00000":
             logger.error(
-                f"[TRADER] place_take_profit Bitget error {symbol}: "
+                f"[TRADER] place_take_profit Bitget error {symbol_n}: "
                 f"code={code}, msg={resp.get('msg')}, resp={resp}"
             )
             return None
