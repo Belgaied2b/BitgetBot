@@ -1,12 +1,7 @@
 # =====================================================================
 # scanner.py — Bitget Desk Lead Scanner (Institutionnel H1 + Validation H4)
 # + Exec: ENTRY -> (TP1/TP2 + SL) after fill, SL->BE after TP1
-# + Desk-grade logging: trade_id correlation + compact summaries + timings
-#
-# UPDATE (anti-spam logs):
-# - [SCAN] step=start -> DEBUG (plus en INFO)
-# - logs INFO uniquement sur: reject/valid + exec + watcher events
-# - reject_reason: on tente result["reject_reason"] sinon fallback propre
+# + Clean logs: scanner-focused + per-scan summary + optional reject spam
 # =====================================================================
 
 from __future__ import annotations
@@ -15,6 +10,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections import Counter
 from typing import Any, Dict, Tuple, Optional
 
 import pandas as pd
@@ -63,9 +59,15 @@ MAX_CONCURRENT_FETCH = 8
 TP1_CLOSE_PCT = 0.50
 WATCH_INTERVAL_S = 3.0
 
+# Logging controls
+LOG_REJECTS = False          # True = spam reject lines per symbol (pas conseillé en prod)
+LOG_SKIPS = False            # True = log aussi skip (empty df / not enough candles)
+ANALYZER_LOG_LEVEL = logging.WARNING  # coupe le bruit analyze_signal
+INSTITUTIONAL_LOG_LEVEL = logging.WARNING  # coupe le spam institutional_data
+
 
 # =====================================================================
-# Desk-grade logging
+# Desk logging helpers
 # =====================================================================
 
 def _new_tid(symbol: str) -> str:
@@ -77,7 +79,6 @@ def desk_log(level: int, tag: str, symbol: str, tid: str = "-", **kv: Any) -> No
     for k, v in kv.items():
         if v is None:
             continue
-        # keep it compact
         if isinstance(v, float):
             parts.append(f"{k}={v:.6g}")
         else:
@@ -133,6 +134,26 @@ def _close_side(entry_side: str) -> str:
     return "SELL" if (entry_side or "").upper() == "BUY" else "BUY"
 
 
+def _extract_reject_reason(result: Any) -> str:
+    if not isinstance(result, dict):
+        return "not_valid"
+
+    r = result.get("reject_reason") or result.get("reason")
+    if r:
+        return str(r)
+
+    inst = result.get("institutional") or {}
+    iscore = inst.get("institutional_score")
+    if iscore is not None:
+        return f"inst_score={iscore}"
+
+    st = result.get("setup_type")
+    if st:
+        return f"setup_reject={st}"
+
+    return "not_valid"
+
+
 def _build_signal_message(result: Dict[str, Any], tid: str) -> str:
     symbol = result.get("symbol", "?")
     side = result.get("side", "?")
@@ -179,33 +200,8 @@ def _build_signal_message(result: Dict[str, Any], tid: str) -> str:
     return msg
 
 
-def _extract_reject_reason(result: Any) -> str:
-    """
-    Best-effort: prefer explicit reject_reason (ideal).
-    Fallback to some common patterns to avoid 'not_valid' everywhere.
-    """
-    if not isinstance(result, dict):
-        return "not_valid"
-    r = result.get("reject_reason") or result.get("reason")
-    if r:
-        return str(r)
-
-    # common fallback: institutional score
-    inst = result.get("institutional") or {}
-    iscore = inst.get("institutional_score")
-    if iscore is not None:
-        return f"inst_score={iscore}"
-
-    # if analyzer provides something like 'setup_type' but not valid
-    st = result.get("setup_type")
-    if st:
-        return f"setup_reject={st}"
-
-    return "not_valid"
-
-
 # =====================================================================
-# WATCHER STATE (in-memory)
+# WATCHER STATE
 # =====================================================================
 
 PENDING: Dict[str, Dict[str, Any]] = {}
@@ -228,7 +224,7 @@ def _be_price(entry: float, tick: float, side: str) -> float:
 
 
 # =====================================================================
-# Core fetch/analyze
+# Fetch
 # =====================================================================
 
 async def _fetch_dfs(client, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -243,6 +239,36 @@ async def _fetch_dfs(client, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return df_h1, df_h4
 
 
+# =====================================================================
+# Per-scan stats
+# =====================================================================
+
+class ScanStats:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.total = 0
+        self.skips = 0
+        self.rejects = 0
+        self.valids = 0
+        self.duplicates = 0
+        self.risk_rejects = 0
+        self.exec_sent = 0
+        self.exec_failed = 0
+        self.reasons = Counter()
+
+    async def inc(self, field: str, n: int = 1) -> None:
+        async with self.lock:
+            setattr(self, field, getattr(self, field) + n)
+
+    async def add_reason(self, reason: str) -> None:
+        async with self.lock:
+            self.reasons[reason] += 1
+
+
+# =====================================================================
+# Core processing
+# =====================================================================
+
 async def process_symbol(
     symbol: str,
     client,
@@ -250,13 +276,13 @@ async def process_symbol(
     trader: BitgetTrader,
     order_budget: asyncio.Semaphore,
     fetch_sem: asyncio.Semaphore,
+    stats: ScanStats,
 ) -> None:
     tid = _new_tid(symbol)
 
-    try:
-        # START: DEBUG only (anti-spam)
-        desk_log(logging.DEBUG, "SCAN", symbol, tid, step="start")
+    await stats.inc("total", 1)
 
+    try:
         # FETCH
         async with fetch_sem:
             t0 = time.time()
@@ -264,30 +290,40 @@ async def process_symbol(
             fetch_ms = int((time.time() - t0) * 1000)
 
         if df_h1 is None or df_h4 is None:
-            desk_log(logging.DEBUG, "SCAN", symbol, tid, step="skip", reason="no_df", fetch_ms=fetch_ms)
+            await stats.inc("skips", 1)
+            if LOG_SKIPS:
+                desk_log(logging.INFO, "SCAN", symbol, tid, step="skip", reason="no_df", fetch_ms=fetch_ms)
             return
         if getattr(df_h1, "empty", True) or getattr(df_h4, "empty", True):
-            desk_log(logging.DEBUG, "SCAN", symbol, tid, step="skip", reason="empty_df", fetch_ms=fetch_ms)
+            await stats.inc("skips", 1)
+            if LOG_SKIPS:
+                desk_log(logging.INFO, "SCAN", symbol, tid, step="skip", reason="empty_df", fetch_ms=fetch_ms)
             return
         if len(df_h1) < 80 or len(df_h4) < 80:
-            desk_log(logging.DEBUG, "SCAN", symbol, tid, step="skip", reason="not_enough_candles", n1=len(df_h1), n4=len(df_h4))
+            await stats.inc("skips", 1)
+            if LOG_SKIPS:
+                desk_log(logging.INFO, "SCAN", symbol, tid, step="skip", reason="not_enough_candles", n1=len(df_h1), n4=len(df_h4))
             return
 
         # ANALYZE
         t1 = time.time()
-        macro = {}
-        result = await analyzer.analyze(symbol, df_h1, df_h4, macro)
+        result = await analyzer.analyze(symbol, df_h1, df_h4, macro={})
         analyze_ms = int((time.time() - t1) * 1000)
 
         if not result or not result.get("valid"):
             reason = _extract_reject_reason(result)
-            # REJECT is INFO (useful)
-            desk_log(logging.INFO, "SCAN", symbol, tid, step="reject", fetch_ms=fetch_ms, analyze_ms=analyze_ms, reason=reason)
+            await stats.inc("rejects", 1)
+            await stats.add_reason(reason)
+            if LOG_REJECTS:
+                desk_log(logging.INFO, "SCAN", symbol, tid, step="reject", fetch_ms=fetch_ms, analyze_ms=analyze_ms, reason=reason)
             return
 
         side = str(result.get("side", "")).upper()
         if side not in ("BUY", "SELL"):
-            desk_log(logging.INFO, "SCAN", symbol, tid, step="reject", reason=f"bad_side={side}")
+            await stats.inc("rejects", 1)
+            await stats.add_reason("bad_side")
+            if LOG_REJECTS:
+                desk_log(logging.INFO, "SCAN", symbol, tid, step="reject", reason=f"bad_side={side}")
             return
 
         entry = float(result.get("entry", 0.0) or 0.0)
@@ -296,25 +332,31 @@ async def process_symbol(
         tp2 = result.get("tp2")
 
         if entry <= 0 or sl <= 0:
-            desk_log(logging.INFO, "SCAN", symbol, tid, step="reject", reason="bad_entry_sl", entry=entry, sl=sl)
+            await stats.inc("rejects", 1)
+            await stats.add_reason("bad_entry_sl")
+            if LOG_REJECTS:
+                desk_log(logging.INFO, "SCAN", symbol, tid, step="reject", reason="bad_entry_sl", entry=entry, sl=sl)
             return
 
         tp1_val = float(tp1) if tp1 is not None else 0.0
         tp2_val = float(tp2) if tp2 is not None else 0.0
         if tp1_val <= 0 or tp2_val <= 0:
-            desk_log(logging.INFO, "SCAN", symbol, tid, step="skip", reason="missing_tp", tp1=tp1, tp2=tp2)
+            await stats.inc("skips", 1)
+            await stats.add_reason("missing_tp")
+            if LOG_SKIPS:
+                desk_log(logging.INFO, "SCAN", symbol, tid, step="skip", reason="missing_tp", tp1=tp1, tp2=tp2)
             return
 
         rr = result.get("rr")
         setup = result.get("setup_type")
 
-        # Anti-doublon
+        # DUP
         fp = make_fingerprint(symbol, side, entry, sl, tp1_val, extra=setup, precision=6)
         if DUP_GUARD.is_duplicate(fp):
-            desk_log(logging.INFO, "DUP", symbol, tid, step="skip", reason="duplicate")
+            await stats.inc("duplicates", 1)
             return
 
-        # Risk gating
+        # RISK
         direction = _side_to_direction(side)
         notional = float(MARGIN_USDT) * float(LEVERAGE)
 
@@ -330,22 +372,23 @@ async def process_symbol(
             commitment=None,
         )
         if not allowed:
-            desk_log(logging.INFO, "RISK", symbol, tid, step="reject", reason=reason, rr=rr, inst_score=inst_score, notional=round(notional, 2))
+            await stats.inc("risk_rejects", 1)
+            await stats.add_reason(f"risk:{reason}")
+            if LOG_REJECTS:
+                desk_log(logging.INFO, "RISK", symbol, tid, step="reject", reason=reason, rr=rr, inst_score=inst_score)
             return
 
-        # VALID summary (INFO)
+        # VALID (INFO)
+        await stats.inc("valids", 1)
         desk_log(
             logging.INFO,
-            "SCAN",
+            "VALID",
             symbol,
             tid,
-            step="valid",
-            fetch_ms=fetch_ms,
-            analyze_ms=analyze_ms,
             side=side,
             setup=setup,
             rr=(round(float(rr), 3) if rr is not None else None),
-            inst_score=inst_score,
+            inst=inst_score,
         )
 
         # Telegram + mark dup
@@ -353,18 +396,18 @@ async def process_symbol(
         DUP_GUARD.mark(fp)
 
         if DRY_RUN:
-            desk_log(logging.INFO, "EXEC", symbol, tid, step="dry_run")
             return
 
         # Budget
         try:
             await asyncio.wait_for(order_budget.acquire(), timeout=0.01)
         except asyncio.TimeoutError:
-            desk_log(logging.INFO, "BUDGET", symbol, tid, step="skip", reason="max_orders_per_scan")
+            await stats.add_reason("budget:max_orders_per_scan")
             return
 
-        # EXEC: ENTRY
+        # EXEC ENTRY
         oid = f"entry-{tid}"
+        await stats.inc("exec_sent", 1)
         desk_log(logging.INFO, "EXEC", symbol, tid, action="entry_send", entry=entry, notional=round(notional, 2), oid=oid)
 
         entry_resp = await trader.place_limit(
@@ -378,16 +421,8 @@ async def process_symbol(
         )
 
         if not _is_ok(entry_resp):
-            desk_log(
-                logging.ERROR,
-                "EXEC",
-                symbol,
-                tid,
-                action="entry_fail",
-                code=entry_resp.get("code"),
-                msg=entry_resp.get("msg"),
-                http=entry_resp.get("_http_status"),
-            )
+            await stats.inc("exec_failed", 1)
+            desk_log(logging.ERROR, "EXEC", symbol, tid, action="entry_fail", code=entry_resp.get("code"), msg=entry_resp.get("msg"))
             await send_telegram(f"❌ *ENTRY FAILED* {symbol} {side} @ `{entry}`\nID: `{tid}`\n`{entry_resp}`")
             return
 
@@ -396,7 +431,7 @@ async def process_symbol(
 
         desk_log(logging.INFO, "EXEC", symbol, tid, action="entry_ok", orderId=entry_order_id, qty=(qty_total if qty_total else None))
 
-        # Store pending for watcher (SL/TP after fill)
+        # watcher state: SL/TP after fill
         async with PENDING_LOCK:
             PENDING[tid] = {
                 "symbol": str(symbol).upper(),
@@ -420,15 +455,13 @@ async def process_symbol(
                 "created_ts": time.time(),
             }
 
-        desk_log(logging.INFO, "EXEC", symbol, tid, step="entry_sent", oid=oid)
-
     except Exception as e:
         desk_log(logging.ERROR, "ERR", symbol, tid, where="process_symbol", err=str(e))
         logger.exception("[%s] process_symbol error: %s", symbol, e)
 
 
 # =====================================================================
-# WATCHER: after fill -> place SL/TPs ; after TP1 -> SL->BE
+# WATCHER
 # =====================================================================
 
 async def _watcher_loop(trader: BitgetTrader) -> None:
@@ -453,7 +486,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                 tp1 = float(st["tp1"])
                 tp2 = float(st["tp2"])
 
-                # 0) Check entry filled
+                # 0) Wait entry fill -> arm TP/SL
                 if not st["armed"]:
                     detail = await trader.get_order_detail(
                         sym,
@@ -477,7 +510,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                     desk_log(logging.INFO, "WATCH", sym, tid, step="arm_start", qty_total=qty_total)
 
-                    # TP1 reduce limit
                     tp1_resp = await trader.place_reduce_limit_tp(
                         symbol=sym,
                         close_side=close_side.lower(),
@@ -491,7 +523,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         continue
                     tp1_order_id = (tp1_resp.get("data") or {}).get("orderId") or tp1_resp.get("orderId")
 
-                    # TP2 reduce limit (runner)
                     tp2_resp = await trader.place_reduce_limit_tp(
                         symbol=sym,
                         close_side=close_side.lower(),
@@ -505,7 +536,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         continue
                     tp2_order_id = (tp2_resp.get("data") or {}).get("orderId") or tp2_resp.get("orderId")
 
-                    # SL stop market (trigger)
                     sl_resp = await trader.place_stop_market_sl(
                         symbol=sym,
                         close_side=close_side.lower(),
@@ -520,7 +550,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         continue
                     sl_plan_id = (sl_resp.get("data") or {}).get("orderId") or (sl_resp.get("data") or {}).get("planOrderId") or sl_resp.get("orderId")
 
-                    # Update state
                     async with PENDING_LOCK:
                         if tid in PENDING:
                             PENDING[tid]["armed"] = True
@@ -531,7 +560,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                             PENDING[tid]["tp2_order_id"] = str(tp2_order_id) if tp2_order_id else None
                             PENDING[tid]["sl_plan_id"] = str(sl_plan_id) if sl_plan_id else None
 
-                    # Risk register open now
                     notional = float(MARGIN_USDT) * float(LEVERAGE)
                     RISK.register_open(
                         symbol=sym,
@@ -555,8 +583,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     tp1_detail = await trader.get_order_detail(sym, order_id=st.get("tp1_order_id"))
                     if not trader.is_filled(tp1_detail):
                         continue
-
-                    desk_log(logging.INFO, "WATCH", sym, tid, step="tp1_filled")
 
                     tick = await trader.get_tick(sym)
                     new_sl = _be_price(entry, tick, entry_side)
@@ -634,6 +660,9 @@ def _ensure_watcher(trader: BitgetTrader) -> None:
 # =====================================================================
 
 async def scan_once(client, analyzer: SignalAnalyzer, trader: BitgetTrader) -> None:
+    stats = ScanStats()
+
+    t_scan0 = time.time()
     symbols = await retry_async(client.get_contracts_list, retries=3, base_delay=0.6)
     if not symbols:
         logger.warning("⚠️ get_contracts_list() vide")
@@ -646,13 +675,41 @@ async def scan_once(client, analyzer: SignalAnalyzer, trader: BitgetTrader) -> N
     order_budget = asyncio.Semaphore(int(MAX_ORDERS_PER_SCAN))
 
     async def _worker(sym: str):
-        await process_symbol(sym, client, analyzer, trader, order_budget, fetch_sem)
+        await process_symbol(sym, client, analyzer, trader, order_budget, fetch_sem, stats)
 
     await asyncio.gather(*[_worker(sym) for sym in symbols])
 
+    # ===== Summary =====
+    dt = time.time() - t_scan0
+    # top 8 reasons
+    reasons = stats.reasons.most_common(8)
+    reasons_str = ", ".join([f"{k}:{v}" for k, v in reasons]) if reasons else "-"
+
+    logger.info(
+        "🧾 Scan summary: total=%s valids=%s rejects=%s skips=%s dup=%s risk_rejects=%s exec_sent=%s exec_failed=%s time=%.1fs | top_reasons=%s",
+        stats.total,
+        stats.valids,
+        stats.rejects,
+        stats.skips,
+        stats.duplicates,
+        stats.risk_rejects,
+        stats.exec_sent,
+        stats.exec_failed,
+        dt,
+        reasons_str,
+    )
+
 
 async def start_scanner() -> None:
-    logging.basicConfig(level=logging.INFO)
+    # Root logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    )
+
+    # Hard-stop noisy modules
+    logging.getLogger("analyze_signal").setLevel(ANALYZER_LOG_LEVEL)
+    logging.getLogger("institutional_data").setLevel(INSTITUTIONAL_LOG_LEVEL)
 
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
 
