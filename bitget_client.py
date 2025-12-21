@@ -36,7 +36,7 @@ async def _async_retry(fn, retries: int = 3, base_delay: float = 0.3):
     for attempt in range(retries + 1):
         try:
             return await fn()
-        except Exception as exc:
+        except Exception:
             if attempt >= retries:
                 raise
             await asyncio.sleep(base_delay * (2 ** attempt))
@@ -82,21 +82,19 @@ class BitgetClient:
         self._contracts_cache: Optional[List[str]] = None
         self._contracts_ts: float = 0.0
 
-    # ---------------------------------------------------------------
+    async def close(self) -> None:
+        if self.session and not self.session.closed:
+            await self.session.close()
 
     async def _ensure_session(self):
         if self.session is None or self.session.closed:
             timeout = aiohttp.ClientTimeout(total=25)
             self.session = aiohttp.ClientSession(timeout=timeout)
 
-    # ---------------------------------------------------------------
-
     def _sign(self, ts: str, method: str, path: str, query: str, body: str) -> str:
         msg = f"{ts}{method}{path}{query}{body}"
         mac = hmac.new(self.api_secret, msg.encode(), hashlib.sha256).digest()
         return base64.b64encode(mac).decode()
-
-    # ---------------------------------------------------------------
 
     async def _request(
         self,
@@ -117,7 +115,9 @@ class BitgetClient:
 
         query = ""
         if params:
-            query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
+            # ordre stable pour éviter des signatures bizarres
+            items = sorted(params.items(), key=lambda kv: kv[0])
+            query = "?" + "&".join(f"{k}={v}" for k, v in items)
 
         url = self.BASE + path + query
         body = json.dumps(data, separators=(",", ":")) if data else ""
@@ -151,7 +151,6 @@ class BitgetClient:
                         "HTTP 429 %s %s params=%s body=%s raw=%s",
                         method, path, params, body, txt,
                     )
-                    # on remonte l'erreur pour que _async_retry gère le backoff
                     raise RuntimeError("HTTP 429 Too Many Requests")
 
                 if status >= 400:
@@ -220,14 +219,7 @@ class BitgetClient:
         limit: int = 200,
     ) -> pd.DataFrame:
         """
-        Candles v3 :
-        GET /api/v3/market/candles
-        params:
-          category=USDT-FUTURES
-          symbol=BTCUSDT
-          interval=1H
-          type=market
-          limit<=100
+        Candles v3 : max 100 par page
         """
         interval = tf.upper()
         valid_intervals = {
@@ -238,7 +230,6 @@ class BitgetClient:
             LOGGER.error("❌ INVALID INTERVAL %s (symbol=%s)", tf, symbol)
             return pd.DataFrame()
 
-        # Bitget doc : max 100 par page (on se cale à 100)
         limit_int = max(10, min(int(limit), 100))
 
         params = {
@@ -278,13 +269,9 @@ class BitgetClient:
             return pd.DataFrame()
 
         try:
-            # data[i] = [
-            #   ts, open, high, low, close, volume, turnover
-            # ]
             cols = ["time", "open", "high", "low", "close", "volume", "turnover"]
             df = pd.DataFrame(data, columns=cols[: len(data[0])])
 
-            # conversion float
             for c in ["time", "open", "high", "low", "close", "volume"]:
                 df[c] = df[c].astype(float)
 
@@ -292,9 +279,7 @@ class BitgetClient:
             df.sort_values("ts", inplace=True)
             df.rename(columns={"ts": "time"}, inplace=True)
 
-            # on garde juste OHLCV
             df = df[["time", "open", "high", "low", "close", "volume"]]
-
             return df.reset_index(drop=True)
 
         except Exception as exc:
