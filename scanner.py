@@ -1,247 +1,347 @@
 # =====================================================================
-# scanner.py — Bitget Desk Lead Scanner (Institutionnel H1+H4)
+# scanner.py — Bitget Desk Lead Scanner (Institutionnel H1 + Validation H4)
 # =====================================================================
+
+from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from typing import Any, Dict, Optional, Tuple
+
 import pandas as pd
 
 from settings import (
-    API_KEY, API_SECRET, API_PASSPHRASE,
-    TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN,
+    API_KEY,
+    API_SECRET,
+    API_PASSPHRASE,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
     SCAN_INTERVAL_MIN,
+    TOP_N_SYMBOLS,
+    MAX_ORDERS_PER_SCAN,
+    DRY_RUN,
+    MARGIN_USDT,
+    LEVERAGE,
+    RISK_USDT,
 )
 
 from bitget_client import get_client
 from bitget_trader import BitgetTrader
 from analyze_signal import SignalAnalyzer
-from telegram.ext import Application
-from duplicate_guard import DuplicateGuard
+
+from duplicate_guard import DuplicateGuard, fingerprint as make_fingerprint
 from risk_manager import RiskManager
 from retry_utils import retry_async
 
-LOGGER = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+
 
 # =====================================================================
-# TELEGRAM (singleton)
+# GLOBALS
 # =====================================================================
 
-TELEGRAM_APP: Application | None = None
-
-# Anti-doublons et Risk Manager globaux
 DUP_GUARD = DuplicateGuard(ttl_seconds=3600)
-RISK_MANAGER = RiskManager()
+RISK = RiskManager()
 
+TF_H1 = "1H"
+TF_H4 = "4H"
+CANDLE_LIMIT = 200
 
-async def init_telegram():
-    """Initialise l'Application Telegram une seule fois."""
-    global TELEGRAM_APP
-    if TELEGRAM_APP is None:
-        TELEGRAM_APP = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        await TELEGRAM_APP.initialize()
-        await TELEGRAM_APP.start()
-
-
-async def send_telegram(text: str):
-    """Envoie un message Telegram, avec gestion d'erreurs soft."""
-    try:
-        await init_telegram()
-        await TELEGRAM_APP.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=text,
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        LOGGER.error(f"Telegram error: {e}")
+# Concurrency scan (évite de spammer l’API)
+MAX_CONCURRENT_FETCH = 8
 
 
 # =====================================================================
-# OHLCV normalisation (optionnel, si besoin ailleurs)
+# Telegram (async-safe via to_thread)
 # =====================================================================
 
-def to_df(raw):
-    if not raw:
-        return pd.DataFrame()
-    df = pd.DataFrame(raw, columns=["time", "open", "high", "low", "close", "volume"])
-    df = df.astype(float)
-    return df.sort_values("time").reset_index(drop=True)
-
-
-# =====================================================================
-# PROCESSING SYMBOL
-# =====================================================================
-
-async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTrader, client):
+async def send_telegram(msg: str) -> None:
     """
-    Pipeline complet pour un symbole :
-      - Récup H1 / H4
-      - Analyse structure + insti (analyze_signal.SignalAnalyzer)
-      - Envoi Telegram
-      - Placement LIMIT + TP / SL sur Bitget
+    Envoi Telegram sans bloquer l'event loop.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    import requests  # local import pour éviter overhead si telegram désactivé
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+
+    def _do():
+        try:
+            requests.post(url, json=payload, timeout=8)
+        except Exception as e:
+            logger.error("Telegram error: %s", e)
+
+    await asyncio.to_thread(_do)
+
+
+# =====================================================================
+# Helpers
+# =====================================================================
+
+def _is_ok(resp: Any) -> bool:
+    """
+    Bitget success: code == "00000"
+    Ton BitgetTrader ajoute aussi resp["ok"].
+    """
+    if not isinstance(resp, dict):
+        return False
+    if resp.get("ok") is True:
+        return True
+    return str(resp.get("code", "")) == "00000"
+
+
+def _side_to_direction(side: str) -> str:
+    s = (side or "").upper()
+    return "LONG" if s == "BUY" else "SHORT"
+
+
+def _build_signal_message(result: Dict[str, Any]) -> str:
+    symbol = result.get("symbol", "?")
+    side = result.get("side", "?")
+    entry = result.get("entry")
+    sl = result.get("sl")
+    tp1 = result.get("tp1")
+    tp2 = result.get("tp2")
+    rr = result.get("rr")
+    setup = result.get("setup_type")
+
+    inst = result.get("institutional") or {}
+    inst_score = inst.get("institutional_score")
+    flow_regime = inst.get("flow_regime")
+    funding = inst.get("funding_rate")
+    crowd = inst.get("crowding_regime")
+
+    msg = (
+        f"🎯 *SIGNAL {symbol}* → *{side}*\n"
+        f"• Entrée: `{entry}`\n"
+        f"• SL: `{sl}`\n"
+    )
+    if tp1 is not None:
+        msg += f"• TP1: `{tp1}`\n"
+    if tp2 is not None:
+        msg += f"• TP2: `{tp2}`\n"
+    if rr is not None:
+        msg += f"• RR: `{round(float(rr), 3)}`\n"
+    if setup:
+        msg += f"• Setup: `{setup}`\n"
+
+    if inst_score is not None:
+        msg += f"\n🏛 *Institutionnel*\n• Score: `{inst_score}`"
+        if flow_regime:
+            msg += f"\n• Flow: `{flow_regime}`"
+        if crowd:
+            msg += f"\n• Crowding: `{crowd}`"
+        if funding is not None:
+            msg += f"\n• Funding: `{funding}`"
+
+    if DRY_RUN:
+        msg += "\n\n🧪 *DRY_RUN=ON* (aucun ordre envoyé)"
+
+    return msg
+
+
+# =====================================================================
+# Core processing
+# =====================================================================
+
+async def _fetch_dfs(client, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    async def _h1():
+        return await client.get_klines_df(symbol, TF_H1, CANDLE_LIMIT)
+
+    async def _h4():
+        return await client.get_klines_df(symbol, TF_H4, CANDLE_LIMIT)
+
+    df_h1 = await retry_async(_h1, retries=3, base_delay=0.4)
+    df_h4 = await retry_async(_h4, retries=3, base_delay=0.4)
+    return df_h1, df_h4
+
+
+async def process_symbol(
+    symbol: str,
+    client,
+    analyzer: SignalAnalyzer,
+    trader: BitgetTrader,
+    order_budget: asyncio.Semaphore,
+    fetch_sem: asyncio.Semaphore,
+) -> None:
+    """
+    Pipeline complet :
+    - fetch H1/H4
+    - analyze
+    - duplicate guard
+    - risk checks
+    - telegram
+    - place limit (preset SL/TP1)
     """
     try:
-        # ====== MARKETDATA H1 / H4 ======
-        async def _fetch_h1():
-            return await client.get_klines_df(symbol, "1H", 200)
+        async with fetch_sem:
+            df_h1, df_h4 = await _fetch_dfs(client, symbol)
 
-        async def _fetch_h4():
-            return await client.get_klines_df(symbol, "4H", 200)
-
-        df_h1 = await retry_async(_fetch_h1)
-        df_h4 = await retry_async(_fetch_h4)
-
-        if df_h1.empty or df_h4.empty or len(df_h1) < 80:
+        if df_h1 is None or df_h4 is None:
+            return
+        if getattr(df_h1, "empty", True) or getattr(df_h4, "empty", True):
+            return
+        if len(df_h1) < 80 or len(df_h4) < 80:
             return
 
-        macro = {}  # placeholder : BTC / TOTAL / DOMINANCE plus tard
-
-        # ====== ANALYSE INSTITUTIONNELLE + STRUCTURE ======
+        macro = {}  # placeholder si tu ajoutes macro plus tard
         result = await analyzer.analyze(symbol, df_h1, df_h4, macro)
 
-        # analyze_signal 2025 renvoie un dict avec "valid": True si signal OK
         if not result or not result.get("valid"):
             return
 
-        side = result["side"]
-        entry = float(result["entry"])
-        sl = float(result["sl"])
+        side = str(result.get("side", "")).upper()
+        if side not in ("BUY", "SELL"):
+            return
+
+        direction = _side_to_direction(side)
+
+        entry = float(result.get("entry", 0.0))
+        sl = float(result.get("sl", 0.0))
         tp1 = result.get("tp1")
-        tp2 = result.get("tp2")
-        qty = float(result["qty"])
-        inst_score = result.get("institutional_score", None)
+        tp1_val = float(tp1) if tp1 is not None else 0.0
+
         rr = result.get("rr")
+        setup = result.get("setup_type")
+        inst = result.get("institutional") or {}
+        inst_score = inst.get("institutional_score", 0)
 
-        # Normalisation LONG/SHORT pour RiskManager / DuplicateGuard
-        side_upper = str(side).upper()
-        direction = "LONG" if side_upper in ("BUY", "LONG") else "SHORT"
-
-        # Anti-doublon : même symbole / même direction / même zone (entry/SL/TP1)
-        fp_tp1 = tp1 if tp1 is not None else 0.0
-        fingerprint = f"{symbol}-{direction}-{round(entry, 4)}-{round(sl, 4)}-{round(float(fp_tp1), 4)}"
-        if DUP_GUARD.seen(fingerprint):
-            LOGGER.info(f"[DUP] Skip {symbol} {direction} — déjà envoyé récemment")
+        # Fingerprint stable anti-doublons
+        fp = make_fingerprint(symbol, side, entry, sl, tp1_val, extra=setup, precision=6)
+        if DUP_GUARD.is_duplicate(fp):
+            logger.info("[DUP] skip %s %s (déjà envoyé)", symbol, side)
             return
 
-        # Risk manager : filtre institutionnel global
-        can_trade, reason = RISK_MANAGER.can_trade(direction)
-        if not can_trade:
-            LOGGER.info(f"[RISK] REJECT {symbol} {direction} → {reason}")
-            return
-
-        LOGGER.warning(f"🎯 SIGNAL {symbol} → {side} @ {entry} (RR={rr})")
-
-        # ====== TELEGRAM ======
-        msg = (
-            "🚀 *Signal détecté*\n"
-            f"• **{symbol}**\n"
-            f"• Direction: *{side}*\n"
-            f"• Entrée: `{entry}`\n"
-            f"• SL: `{sl}`\n"
+        # Risk gating (niveau desk)
+        notional = float(MARGIN_USDT) * float(LEVERAGE)
+        allowed, reason = RISK.can_trade(
+            symbol=symbol,
+            side=direction,
+            notional=notional,
+            rr=float(rr) if rr is not None else None,
+            inst_score=int(inst_score) if inst_score is not None else 0,
+            commitment=None,
         )
-        if tp1 is not None or tp2 is not None:
-            msg += f"• TP1: `{tp1}` | TP2: `{tp2}`\n"
-        msg += f"• Qty: `{qty}`\n"
-        if inst_score is not None:
-            msg += f"• Inst Score: `{inst_score}`\n"
-        if rr is not None:
-            msg += f"• RR: `{round(rr, 3)}`\n"
-
-        await send_telegram(msg)
-
-        # ====== EXÉCUTION ORDRES BITGET ======
-        # Entrée
-        entry_res = await trader.place_limit(symbol, side, entry, qty)
-        if not entry_res.get("ok", False):
-            LOGGER.error(f"Entry error {symbol}: {entry_res}")
+        if not allowed:
+            logger.info("[RISK] reject %s %s → %s", symbol, direction, reason)
             return
 
-        # On enregistre la position ouverte dans le RiskManager
-        RISK_MANAGER.register_trade(direction)
+        # Telegram + mark duplicate
+        await send_telegram(_build_signal_message(result))
+        DUP_GUARD.mark(fp)
 
-        # Stop loss
-        sl_res = await trader.place_stop_loss(symbol, side, sl, qty)
-        if not sl_res.get("ok", False):
-            LOGGER.error(f"SL error {symbol}: {sl_res}")
+        if DRY_RUN:
+            return
 
-        # Take profits
-        if tp1 is not None:
-            tp1_res = await trader.place_take_profit(symbol, side, float(tp1), qty * 0.5)
-            if not tp1_res.get("ok", False):
-                LOGGER.error(f"TP1 error {symbol}: {tp1_res}")
+        # Budget ordres par scan (non bloquant)
+        try:
+            await asyncio.wait_for(order_budget.acquire(), timeout=0.01)
+        except asyncio.TimeoutError:
+            logger.info("[BUDGET] max orders per scan atteint → skip %s", symbol)
+            return
 
-        if tp2 is not None:
-            tp2_res = await trader.place_take_profit(symbol, side, float(tp2), qty * 0.5)
-            if not tp2_res.get("ok", False):
-                LOGGER.error(f"TP2 error {symbol}: {tp2_res}")
+        client_oid = f"{symbol}-{int(time.time() * 1000)}"
+
+        # Place LIMIT avec preset SL + preset TP1 (si dispo)
+        entry_res = await trader.place_limit(
+            symbol=symbol,
+            side=side,          # "BUY"/"SELL" accepté (sera lower() dans trader)
+            price=entry,
+            size=None,          # laisse trader calculer via marge*levier (stable)
+            client_oid=client_oid,
+            preset_sl=sl,
+            preset_tp=(tp1_val if tp1_val > 0 else None),
+        )
+
+        if not _is_ok(entry_res):
+            logger.error("[ENTRY] FAILED %s → %s", symbol, entry_res)
+            await send_telegram(
+                f"❌ *ENTRY FAILED* {symbol} {side} @ `{entry}`\n`{entry_res}`"
+            )
+            return
+
+        # Register open (approx)
+        RISK.register_open(
+            symbol=symbol,
+            side=direction,
+            notional=notional,
+            risk=float(RISK_USDT),
+        )
+
+        logger.info("[ENTRY] OK %s %s @ %s (oid=%s)", symbol, side, entry, client_oid)
 
     except Exception as e:
-        LOGGER.error(f"[{symbol}] process_symbol error: {e}")
+        logger.error("[%s] process_symbol error: %s", symbol, e)
 
 
 # =====================================================================
-# MAIN SCAN LOOP
+# Scan loop
 # =====================================================================
 
-async def run_scanner():
+async def scan_once(client, analyzer: SignalAnalyzer, trader: BitgetTrader) -> None:
+    symbols = await retry_async(client.get_contracts_list, retries=3, base_delay=0.6)
+    if not symbols:
+        logger.warning("⚠️ get_contracts_list() vide")
+        return
+
+    symbols = list(symbols)[: int(TOP_N_SYMBOLS)]
+    logger.info("📊 Scan %d symboles (TOP_N_SYMBOLS=%s)", len(symbols), TOP_N_SYMBOLS)
+
+    fetch_sem = asyncio.Semaphore(MAX_CONCURRENT_FETCH)
+    order_budget = asyncio.Semaphore(int(MAX_ORDERS_PER_SCAN))
+
+    async def _worker(sym: str):
+        await process_symbol(sym, client, analyzer, trader, order_budget, fetch_sem)
+
+    await asyncio.gather(*[_worker(sym) for sym in symbols])
+
+
+async def start_scanner() -> None:
     """
-    Boucle principale :
-      - Récupère la liste des contrats USDT-FUTURES
-      - Scan H1/H4 pour chaque symbole avec une concurrence limitée
-      - Pause entre deux scans selon SCAN_INTERVAL_MIN
+    Démarre le scanner en boucle infinie.
     """
+    logging.basicConfig(level=logging.INFO)
+
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
-    trader = BitgetTrader(API_KEY, API_SECRET, API_PASSPHRASE)
-    analyzer = SignalAnalyzer(API_KEY, API_SECRET, API_PASSPHRASE)
+    trader = BitgetTrader(
+        API_KEY,
+        API_SECRET,
+        API_PASSPHRASE,
+        margin_usdt=float(MARGIN_USDT),
+        leverage=float(LEVERAGE),
+    )
+    analyzer = SignalAnalyzer()
 
-    # Limite la pression sur l'API Bitget (429)
-    MAX_CONCURRENT = 8
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    logger.info("🚀 Scanner started | interval=%s min | dry_run=%s", SCAN_INTERVAL_MIN, DRY_RUN)
 
     while True:
+        t0 = time.time()
         try:
-            LOGGER.info("=== START SCAN ===")
-
-            symbols = await client.get_contracts_list()
-            if not symbols:
-                LOGGER.warning("⚠️ Aucun symbole récupéré → pause 60s")
-                await asyncio.sleep(60)
-                continue
-
-            LOGGER.info(f"📊 Nombre de symboles à scanner : {len(symbols)}")
-
-            async def _worker(sym: str):
-                async with semaphore:
-                    await process_symbol(sym, analyzer, trader, client)
-
-            tasks = [_worker(sym) for sym in symbols]
-            await asyncio.gather(*tasks)
-
-            LOGGER.info("=== END SCAN ===")
-
+            await scan_once(client, analyzer, trader)
         except Exception as e:
-            LOGGER.error(f"SCAN ERROR: {e}")
+            logger.error("SCAN ERROR: %s", e)
 
-        # Pause globale entre 2 scans
-        await asyncio.sleep(SCAN_INTERVAL_MIN * 60)
-
-
-# =====================================================================
-# EXPORT MAIN (pour main.py)
-# =====================================================================
-
-async def start_scanner():
-    await run_scanner()
+        dt = time.time() - t0
+        sleep_s = max(1, int(float(SCAN_INTERVAL_MIN) * 60 - dt))
+        await asyncio.sleep(sleep_s)
 
 
 # =====================================================================
-# MODE LOCAL (standalone)
+# MODE LOCAL
 # =====================================================================
 
 if __name__ == "__main__":
     try:
         asyncio.run(start_scanner())
     except RuntimeError:
-        # Compatibilité environnements où un event loop existe déjà
         loop = asyncio.get_event_loop()
         loop.create_task(start_scanner())
         loop.run_forever()
