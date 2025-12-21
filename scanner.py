@@ -1,6 +1,7 @@
 # =====================================================================
 # scanner.py — Bitget Desk Lead Scanner (Institutionnel H1 + Validation H4)
 # + Exec: ENTRY -> (TP1/TP2 + SL) after fill, SL->BE after TP1
+# + Desk-grade logging: trade_id correlation + compact summaries + timings
 # =====================================================================
 
 from __future__ import annotations
@@ -8,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from typing import Any, Dict, Tuple, Optional
 
 import pandas as pd
@@ -58,6 +60,27 @@ WATCH_INTERVAL_S = 3.0 # watcher polling interval
 
 
 # =====================================================================
+# Desk-grade logging
+# =====================================================================
+
+def _new_tid(symbol: str) -> str:
+    # short unique id, easy to grep
+    return f"{symbol.upper()}-{uuid.uuid4().hex[:8]}"
+
+def desk_log(level: int, tag: str, symbol: str, tid: str = "-", **kv: Any) -> None:
+    """
+    Compact log format:
+      [TAG] SYMBOL tid=XXXX key=val key=val ...
+    """
+    parts = [f"[{tag}]", str(symbol).upper(), f"tid={tid}"]
+    for k, v in kv.items():
+        if v is None:
+            continue
+        parts.append(f"{k}={v}")
+    logger.log(level, " ".join(parts))
+
+
+# =====================================================================
 # Telegram
 # =====================================================================
 
@@ -105,7 +128,7 @@ def _close_side(entry_side: str) -> str:
     return "SELL" if (entry_side or "").upper() == "BUY" else "BUY"
 
 
-def _build_signal_message(result: Dict[str, Any]) -> str:
+def _build_signal_message(result: Dict[str, Any], tid: str) -> str:
     symbol = result.get("symbol", "?")
     side = result.get("side", "?")
     entry = result.get("entry")
@@ -123,6 +146,7 @@ def _build_signal_message(result: Dict[str, Any]) -> str:
 
     msg = (
         f"🎯 *SIGNAL {symbol}* → *{side}*\n"
+        f"• ID: `{tid}`\n"
         f"• Entrée: `{entry}`\n"
         f"• SL: `{sl}`\n"
     )
@@ -158,10 +182,6 @@ def _build_signal_message(result: Dict[str, Any]) -> str:
 PENDING: Dict[str, Dict[str, Any]] = {}
 PENDING_LOCK = asyncio.Lock()
 WATCHER_TASK: Optional[asyncio.Task] = None
-
-
-def _trade_id(symbol: str) -> str:
-    return f"{symbol.upper()}:{int(time.time()*1000)}"
 
 
 def _trigger_type_sl() -> str:
@@ -208,25 +228,51 @@ async def process_symbol(
     order_budget: asyncio.Semaphore,
     fetch_sem: asyncio.Semaphore,
 ) -> None:
+    # per-symbol scan correlation id
+    tid = _new_tid(symbol)
+    t_scan0 = time.time()
+
     try:
+        desk_log(logging.INFO, "SCAN", symbol, tid, step="start")
+
         async with fetch_sem:
+            t0 = time.time()
             df_h1, df_h4 = await _fetch_dfs(client, symbol)
+            fetch_ms = int((time.time() - t0) * 1000)
 
         if df_h1 is None or df_h4 is None:
+            desk_log(logging.INFO, "SCAN", symbol, tid, step="skip", reason="no_df", fetch_ms=fetch_ms)
             return
         if getattr(df_h1, "empty", True) or getattr(df_h4, "empty", True):
+            desk_log(logging.INFO, "SCAN", symbol, tid, step="skip", reason="empty_df", fetch_ms=fetch_ms)
             return
         if len(df_h1) < 80 or len(df_h4) < 80:
+            desk_log(logging.INFO, "SCAN", symbol, tid, step="skip", reason="not_enough_candles", n1=len(df_h1), n4=len(df_h4))
             return
 
+        # ANALYZE
+        t1 = time.time()
         macro = {}
         result = await analyzer.analyze(symbol, df_h1, df_h4, macro)
+        analyze_ms = int((time.time() - t1) * 1000)
 
         if not result or not result.get("valid"):
+            # try to extract why (best-effort)
+            reason = None
+            if isinstance(result, dict):
+                reason = result.get("reject_reason") or result.get("reason") or None
+                # fallback common info
+                if not reason and "institutional" in result:
+                    inst = result.get("institutional") or {}
+                    iscore = inst.get("institutional_score")
+                    if iscore is not None:
+                        reason = f"inst_score={iscore}"
+            desk_log(logging.INFO, "SCAN", symbol, tid, step="reject", fetch_ms=fetch_ms, analyze_ms=analyze_ms, reason=reason or "not_valid")
             return
 
         side = str(result.get("side", "")).upper()
         if side not in ("BUY", "SELL"):
+            desk_log(logging.INFO, "SCAN", symbol, tid, step="reject", reason=f"bad_side={side}")
             return
 
         entry = float(result.get("entry", 0.0) or 0.0)
@@ -235,13 +281,13 @@ async def process_symbol(
         tp2 = result.get("tp2")
 
         if entry <= 0 or sl <= 0:
+            desk_log(logging.INFO, "SCAN", symbol, tid, step="reject", reason="bad_entry_sl", entry=entry, sl=sl)
             return
 
         tp1_val = float(tp1) if tp1 is not None else 0.0
         tp2_val = float(tp2) if tp2 is not None else 0.0
         if tp1_val <= 0 or tp2_val <= 0:
-            # si ton analyzer peut renvoyer None, on évite une exec foireuse
-            logger.info("[SKIP] %s no TP1/TP2 computed (tp1=%s tp2=%s)", symbol, tp1, tp2)
+            desk_log(logging.INFO, "SCAN", symbol, tid, step="skip", reason="missing_tp", tp1=tp1, tp2=tp2)
             return
 
         rr = result.get("rr")
@@ -250,6 +296,7 @@ async def process_symbol(
         # anti doublon (signal)
         fp = make_fingerprint(symbol, side, entry, sl, tp1_val, extra=setup, precision=6)
         if DUP_GUARD.is_duplicate(fp):
+            desk_log(logging.INFO, "DUP", symbol, tid, step="skip", reason="duplicate", fp=fp)
             return
 
         # Risk gating
@@ -268,26 +315,42 @@ async def process_symbol(
             commitment=None,
         )
         if not allowed:
-            logger.info("[RISK] reject %s %s → %s", symbol, direction, reason)
+            desk_log(logging.INFO, "RISK", symbol, tid, step="reject", reason=reason, rr=rr, inst_score=inst_score, notional=round(notional, 2))
             return
 
+        # VALID summary line
+        desk_log(
+            logging.INFO,
+            "SCAN",
+            symbol,
+            tid,
+            step="valid",
+            fetch_ms=fetch_ms,
+            analyze_ms=analyze_ms,
+            side=side,
+            setup=setup,
+            rr=(round(float(rr), 3) if rr is not None else None),
+            inst_score=inst_score,
+        )
+
         # Telegram signal + mark duplicate
-        await send_telegram(_build_signal_message(result))
+        await send_telegram(_build_signal_message(result, tid))
         DUP_GUARD.mark(fp)
 
         if DRY_RUN:
+            desk_log(logging.INFO, "EXEC", symbol, tid, step="dry_run")
             return
 
         # budget orders
         try:
             await asyncio.wait_for(order_budget.acquire(), timeout=0.01)
         except asyncio.TimeoutError:
-            logger.info("[BUDGET] max orders per scan atteint → skip %s", symbol)
+            desk_log(logging.INFO, "BUDGET", symbol, tid, step="skip", reason="max_orders_per_scan")
             return
 
-        # 1) PLACE ENTRY
-        oid = f"entry-{symbol.upper()}-{int(time.time()*1000)}"
-        logger.info("[EXEC] place LIMIT %s %s price=%s notional≈%.2f", symbol, side.lower(), entry, notional)
+        # 1) PLACE ENTRY (clientOid includes tid => correlation)
+        oid = f"entry-{tid}"
+        desk_log(logging.INFO, "EXEC", symbol, tid, action="entry_send", entry=entry, notional=round(notional, 2), oid=oid)
 
         entry_resp = await trader.place_limit(
             symbol=symbol,
@@ -300,18 +363,35 @@ async def process_symbol(
         )
 
         if not _is_ok(entry_resp):
-            logger.error("[ENTRY] FAILED %s → %s", symbol, entry_resp)
+            desk_log(
+                logging.ERROR,
+                "EXEC",
+                symbol,
+                tid,
+                action="entry_fail",
+                code=entry_resp.get("code"),
+                msg=entry_resp.get("msg"),
+                http=entry_resp.get("_http_status"),
+            )
             await send_telegram(f"❌ *ENTRY FAILED* {symbol} {side} @ `{entry}`\n`{entry_resp}`")
             return
 
-        # store pending trade for watcher (we set TP/SL AFTER fill)
-        trade_id = _trade_id(symbol)
         entry_order_id = (entry_resp.get("data") or {}).get("orderId") or entry_resp.get("orderId")
-        entry_client_oid = (entry_resp.get("data") or {}).get("clientOid") or oid
         qty_total = float(entry_resp.get("qty") or 0.0)
 
+        desk_log(
+            logging.INFO,
+            "EXEC",
+            symbol,
+            tid,
+            action="entry_ok",
+            orderId=entry_order_id,
+            qty=qty_total if qty_total else None,
+        )
+
+        # store pending trade for watcher (we set TP/SL AFTER fill)
         async with PENDING_LOCK:
-            PENDING[trade_id] = {
+            PENDING[tid] = {
                 "symbol": symbol.upper(),
                 "entry_side": side.upper(),    # BUY/SELL
                 "close_side": _close_side(side),
@@ -323,7 +403,7 @@ async def process_symbol(
                 "qty_tp1": 0.0,
                 "qty_tp2": 0.0,
                 "entry_order_id": str(entry_order_id) if entry_order_id else None,
-                "entry_client_oid": str(entry_client_oid) if entry_client_oid else oid,
+                "entry_client_oid": oid,
                 "tp1_order_id": None,
                 "tp2_order_id": None,
                 "sl_plan_id": None,
@@ -333,11 +413,15 @@ async def process_symbol(
                 "created_ts": time.time(),
             }
 
-        # risk register open only after fill; watcher will do it.
-        logger.info("[ENTRY] SENT %s oid=%s (trade_id=%s)", symbol, oid, trade_id)
+        desk_log(logging.INFO, "EXEC", symbol, tid, step="entry_sent", oid=oid)
 
     except Exception as e:
+        desk_log(logging.ERROR, "ERR", symbol, tid, where="process_symbol", err=str(e))
         logger.exception("[%s] process_symbol error: %s", symbol, e)
+    finally:
+        scan_ms = int((time.time() - t_scan0) * 1000)
+        # don't spam end line for fast rejects (optional)
+        # desk_log(logging.INFO, "SCAN", symbol, tid, step="end", total_ms=scan_ms)
 
 
 # =====================================================================
@@ -379,16 +463,17 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     # entry filled => compute qty
                     qty_total = float(st.get("qty_total") or 0.0)
                     if qty_total <= 0:
-                        # fallback: try reading size from order detail
                         data = (detail.get("data") or {})
                         qty_total = float(data.get("size") or data.get("quantity") or 0.0)
 
                     if qty_total <= 0:
-                        logger.warning("[WATCHER] %s entry filled but qty_total unknown → skip arming", sym)
+                        desk_log(logging.WARNING, "WATCH", sym, tid, step="entry_filled_but_no_qty")
                         continue
 
                     qty_tp1 = qty_total * TP1_CLOSE_PCT
                     qty_tp2 = max(0.0, qty_total - qty_tp1)
+
+                    desk_log(logging.INFO, "WATCH", sym, tid, step="arm_start", qty_total=qty_total)
 
                     # Place TP1 reduce limit
                     tp1_resp = await trader.place_reduce_limit_tp(
@@ -396,14 +481,12 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         close_side=close_side.lower(),
                         price=tp1,
                         qty=qty_tp1,
-                        client_oid=f"tp1-{sym}-{int(time.time()*1000)}",
+                        client_oid=f"tp1-{tid}",
                     )
-
                     if not _is_ok(tp1_resp):
-                        logger.error("[TP1] FAILED %s → %s", sym, tp1_resp)
+                        desk_log(logging.ERROR, "WATCH", sym, tid, step="tp1_fail", code=tp1_resp.get("code"), msg=tp1_resp.get("msg"))
                         await send_telegram(f"❌ *TP1 FAILED* {sym}\n`{tp1_resp}`")
                         continue
-
                     tp1_order_id = (tp1_resp.get("data") or {}).get("orderId") or tp1_resp.get("orderId")
 
                     # Place TP2 reduce limit (runner)
@@ -412,14 +495,12 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         close_side=close_side.lower(),
                         price=tp2,
                         qty=qty_tp2,
-                        client_oid=f"tp2-{sym}-{int(time.time()*1000)}",
+                        client_oid=f"tp2-{tid}",
                     )
-
                     if not _is_ok(tp2_resp):
-                        logger.error("[TP2] FAILED %s → %s", sym, tp2_resp)
+                        desk_log(logging.ERROR, "WATCH", sym, tid, step="tp2_fail", code=tp2_resp.get("code"), msg=tp2_resp.get("msg"))
                         await send_telegram(f"❌ *TP2 FAILED* {sym}\n`{tp2_resp}`")
                         continue
-
                     tp2_order_id = (tp2_resp.get("data") or {}).get("orderId") or tp2_resp.get("orderId")
 
                     # Place SL stop market (trigger)
@@ -428,15 +509,13 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         close_side=close_side.lower(),
                         trigger_price=sl,
                         qty=qty_total,
-                        client_oid=f"sl-{sym}-{int(time.time()*1000)}",
+                        client_oid=f"sl-{tid}",
                         trigger_type=_trigger_type_sl(),
                     )
-
                     if not _is_ok(sl_resp):
-                        logger.error("[SL] FAILED %s → %s", sym, sl_resp)
+                        desk_log(logging.ERROR, "WATCH", sym, tid, step="sl_fail", code=sl_resp.get("code"), msg=sl_resp.get("msg"))
                         await send_telegram(f"❌ *SL FAILED* {sym}\n`{sl_resp}`")
                         continue
-
                     sl_plan_id = (sl_resp.get("data") or {}).get("orderId") or (sl_resp.get("data") or {}).get("planOrderId") or sl_resp.get("orderId")
 
                     # Update state
@@ -459,13 +538,14 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         risk=float(RISK_USDT),
                     )
 
+                    desk_log(logging.INFO, "WATCH", sym, tid, step="armed", tp1=tp1, tp2=tp2, sl=sl, qty_total=qty_total)
                     await send_telegram(
                         f"🛡 *PROTECTION ARMED* {sym}\n"
+                        f"• ID: `{tid}`\n"
                         f"• TP1 `{tp1}` ({int(TP1_CLOSE_PCT*100)}%)\n"
                         f"• TP2 `{tp2}` (runner)\n"
                         f"• SL `{sl}`"
                     )
-                    logger.info("[WATCHER] %s armed TP/SL", sym)
                     continue
 
                 # 1) If armed & TP1 not done: check TP1 filled
@@ -473,6 +553,8 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     tp1_detail = await trader.get_order_detail(sym, order_id=st.get("tp1_order_id"))
                     if not trader.is_filled(tp1_detail):
                         continue
+
+                    desk_log(logging.INFO, "WATCH", sym, tid, step="tp1_filled")
 
                     # TP1 hit => move SL to BE for remaining qty
                     tick = await trader.get_tick(sym)
@@ -485,10 +567,10 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                     remaining = max(0.0, float(st.get("qty_total") or 0.0) - float(st.get("qty_tp1") or 0.0))
                     if remaining <= 0:
-                        # nothing left, close trade state
                         async with PENDING_LOCK:
                             PENDING.pop(tid, None)
-                        await send_telegram(f"✅ *TP1 FILLED* {sym} — position fully closed (no runner)")
+                        desk_log(logging.INFO, "WATCH", sym, tid, step="tp1_closed_all")
+                        await send_telegram(f"✅ *TP1 FILLED* {sym} — position fully closed (no runner)\nID: `{tid}`")
                         continue
 
                     sl_be_resp = await trader.place_stop_market_sl(
@@ -496,13 +578,12 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         close_side=st["close_side"].lower(),
                         trigger_price=new_sl,
                         qty=remaining,
-                        client_oid=f"be-{sym}-{int(time.time()*1000)}",
+                        client_oid=f"be-{tid}",
                         trigger_type=_trigger_type_sl(),
                     )
-
                     if not _is_ok(sl_be_resp):
-                        logger.error("[BE SL] FAILED %s → %s", sym, sl_be_resp)
-                        await send_telegram(f"❌ *SL->BE FAILED* {sym}\n`{sl_be_resp}`")
+                        desk_log(logging.ERROR, "WATCH", sym, tid, step="be_fail", code=sl_be_resp.get("code"), msg=sl_be_resp.get("msg"))
+                        await send_telegram(f"❌ *SL->BE FAILED* {sym}\nID: `{tid}`\n`{sl_be_resp}`")
                         continue
 
                     new_sl_id = (sl_be_resp.get("data") or {}).get("orderId") or (sl_be_resp.get("data") or {}).get("planOrderId") or sl_be_resp.get("orderId")
@@ -513,12 +594,13 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                             PENDING[tid]["be_done"] = True
                             PENDING[tid]["sl_plan_id"] = str(new_sl_id) if new_sl_id else None
 
+                    desk_log(logging.INFO, "WATCH", sym, tid, step="sl_to_be", new_sl=new_sl, remaining=remaining)
                     await send_telegram(
                         f"✅ *TP1 HIT* {sym}\n"
+                        f"• ID: `{tid}`\n"
                         f"🔁 SL déplacé à BE: `{new_sl}`\n"
                         f"🏃 TP2 runner reste actif: `{tp2}`"
                     )
-                    logger.info("[WATCHER] %s TP1 hit -> SL to BE (%s)", sym, new_sl)
                     continue
 
                 # 2) optional cleanup if TP2 filled (trade done)
@@ -527,7 +609,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     if tp2_id:
                         tp2_detail = await trader.get_order_detail(sym, order_id=str(tp2_id))
                         if trader.is_filled(tp2_detail):
-                            # cancel SL to avoid useless trigger
                             sl_id = st.get("sl_plan_id")
                             if sl_id:
                                 _ = await trader.cancel_plan_orders(sym, [str(sl_id)])
@@ -535,8 +616,8 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                             async with PENDING_LOCK:
                                 PENDING.pop(tid, None)
 
-                            await send_telegram(f"🏁 *TP2 FILLED* {sym} — trade terminé.")
-                            logger.info("[WATCHER] %s TP2 filled -> done", sym)
+                            desk_log(logging.INFO, "WATCH", sym, tid, step="tp2_filled_done")
+                            await send_telegram(f"🏁 *TP2 FILLED* {sym} — trade terminé.\nID: `{tid}`")
 
         except Exception:
             logger.exception("[WATCHER] error")
