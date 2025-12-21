@@ -1,7 +1,9 @@
 # =====================================================================
 # scanner.py — Bitget Desk Lead Scanner (Institutionnel H1 + Validation H4)
 # + Exec: ENTRY -> (TP1/TP2 + SL) after fill, SL->BE after TP1
-# + Clean logs: scanner-focused + per-scan summary + optional reject spam
+# + Clean logs: scanner-focused + per-scan summary + sampled reject diagnostics
+# + TP2 auto-synth if missing (runner)
+# + Optional SOFT_ACCEPT: accept "invalid" analyzer outputs if key fields exist + desk rules
 # =====================================================================
 
 from __future__ import annotations
@@ -60,10 +62,20 @@ TP1_CLOSE_PCT = 0.50
 WATCH_INTERVAL_S = 3.0
 
 # Logging controls
-LOG_REJECTS = False          # True = spam reject lines per symbol (pas conseillé en prod)
-LOG_SKIPS = False            # True = log aussi skip (empty df / not enough candles)
-ANALYZER_LOG_LEVEL = logging.WARNING  # coupe le bruit analyze_signal
+ANALYZER_LOG_LEVEL = logging.WARNING       # coupe le bruit analyze_signal
 INSTITUTIONAL_LOG_LEVEL = logging.WARNING  # coupe le spam institutional_data
+
+# Diagnostics: log seulement N rejets par scan (sinon ça flood)
+REJECT_DEBUG_SAMPLES = 25
+
+# TP behavior
+ALLOW_TP2_SYNTH = True  # si TP2 manque mais TP1 existe => on synth un runner
+
+# SOFT mode: si analyze() renvoie valid=False MAIS a quand même entry/sl/tp1 etc.
+# => on peut accepter si desk rules OK (inst_score & rr).
+SOFT_ACCEPT_INVALID = True
+SOFT_MIN_INST_SCORE = 2
+SOFT_MIN_RR = 1.2
 
 
 # =====================================================================
@@ -135,34 +147,79 @@ def _close_side(entry_side: str) -> str:
 
 
 def _extract_reject_reason(result: Any) -> str:
+    """
+    Best-effort: on essaie de sortir qqch d'exploitable même si analyzer ne renvoie pas "reject_reason".
+    """
     if not isinstance(result, dict):
         return "not_valid"
 
-    r = result.get("reject_reason") or result.get("reason")
+    r = result.get("reject_reason") or result.get("reason") or result.get("reject")
     if r:
         return str(r)
 
+    # heuristics
     inst = result.get("institutional") or {}
     iscore = inst.get("institutional_score")
     if iscore is not None:
         return f"inst_score={iscore}"
 
-    st = result.get("setup_type")
-    if st:
-        return f"setup_reject={st}"
+    struct = result.get("structure") or result.get("STRUCT")
+    if isinstance(struct, dict):
+        tr = struct.get("trend")
+        if tr:
+            return f"trend={tr}"
 
     return "not_valid"
 
 
-def _build_signal_message(result: Dict[str, Any], tid: str) -> str:
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def _has_key_fields_for_trade(result: Dict[str, Any]) -> bool:
+    """
+    Champs minimum pour pouvoir exécuter même si analyzer a dit valid=False.
+    """
+    if not isinstance(result, dict):
+        return False
+    side = str(result.get("side", "")).upper()
+    if side not in ("BUY", "SELL"):
+        return False
+    entry = _safe_float(result.get("entry"), 0.0)
+    sl = _safe_float(result.get("sl"), 0.0)
+    tp1 = _safe_float(result.get("tp1"), 0.0)
+    rr = result.get("rr")
+    rr_f = _safe_float(rr, 0.0)
+    return entry > 0 and sl > 0 and tp1 > 0 and rr_f > 0
+
+
+def _synth_tp2(entry: float, tp1: float, side: str) -> float:
+    """
+    Runner simple: même distance que entry->tp1 (donc TP2 = 2x move).
+    Long: tp2 = tp1 + (tp1-entry)
+    Short: tp2 = tp1 - (entry-tp1)
+    """
+    side_u = (side or "").upper()
+    if side_u == "BUY":
+        return float(tp1 + (tp1 - entry))
+    return float(tp1 - (entry - tp1))
+
+
+def _build_signal_message(result: Dict[str, Any], tid: str, soft: bool = False, tp2_synth: bool = False) -> str:
     symbol = result.get("symbol", "?")
-    side = result.get("side", "?")
+    side = str(result.get("side", "?")).upper()
+
     entry = result.get("entry")
     sl = result.get("sl")
     tp1 = result.get("tp1")
     tp2 = result.get("tp2")
     rr = result.get("rr")
-    setup = result.get("setup_type")
+    setup = result.get("setup_type") or result.get("setup") or ("SOFT_OVERRIDE" if soft else None)
 
     inst = result.get("institutional") or {}
     inst_score = inst.get("institutional_score")
@@ -179,11 +236,14 @@ def _build_signal_message(result: Dict[str, Any], tid: str) -> str:
     if tp1 is not None:
         msg += f"• TP1: `{tp1}` (close {int(TP1_CLOSE_PCT*100)}%)\n"
     if tp2 is not None:
-        msg += f"• TP2: `{tp2}` (runner)\n"
+        suffix = " (runner, synth)" if tp2_synth else " (runner)"
+        msg += f"• TP2: `{tp2}`{suffix}\n"
     if rr is not None:
         msg += f"• RR: `{round(float(rr), 3)}`\n"
     if setup:
         msg += f"• Setup: `{setup}`\n"
+    if soft:
+        msg += "\n⚠️ *SOFT_ACCEPT* (valid=False mais champs trade OK + desk rules OK)\n"
 
     if inst_score is not None:
         msg += f"\n🏛 *Institutionnel*\n• Score: `{inst_score}`"
@@ -255,6 +315,7 @@ class ScanStats:
         self.exec_sent = 0
         self.exec_failed = 0
         self.reasons = Counter()
+        self.reject_debug_left = REJECT_DEBUG_SAMPLES
 
     async def inc(self, field: str, n: int = 1) -> None:
         async with self.lock:
@@ -263,6 +324,13 @@ class ScanStats:
     async def add_reason(self, reason: str) -> None:
         async with self.lock:
             self.reasons[reason] += 1
+
+    async def take_reject_debug_slot(self) -> bool:
+        async with self.lock:
+            if self.reject_debug_left <= 0:
+                return False
+            self.reject_debug_left -= 1
+            return True
 
 
 # =====================================================================
@@ -289,20 +357,12 @@ async def process_symbol(
             df_h1, df_h4 = await _fetch_dfs(client, symbol)
             fetch_ms = int((time.time() - t0) * 1000)
 
-        if df_h1 is None or df_h4 is None:
+        if df_h1 is None or df_h4 is None or getattr(df_h1, "empty", True) or getattr(df_h4, "empty", True):
             await stats.inc("skips", 1)
-            if LOG_SKIPS:
-                desk_log(logging.INFO, "SCAN", symbol, tid, step="skip", reason="no_df", fetch_ms=fetch_ms)
             return
-        if getattr(df_h1, "empty", True) or getattr(df_h4, "empty", True):
-            await stats.inc("skips", 1)
-            if LOG_SKIPS:
-                desk_log(logging.INFO, "SCAN", symbol, tid, step="skip", reason="empty_df", fetch_ms=fetch_ms)
-            return
+
         if len(df_h1) < 80 or len(df_h4) < 80:
             await stats.inc("skips", 1)
-            if LOG_SKIPS:
-                desk_log(logging.INFO, "SCAN", symbol, tid, step="skip", reason="not_enough_candles", n1=len(df_h1), n4=len(df_h4))
             return
 
         # ANALYZE
@@ -310,45 +370,86 @@ async def process_symbol(
         result = await analyzer.analyze(symbol, df_h1, df_h4, macro={})
         analyze_ms = int((time.time() - t1) * 1000)
 
-        if not result or not result.get("valid"):
+        # ========== INVALID ==========
+        if not result or not isinstance(result, dict) or not result.get("valid"):
             reason = _extract_reject_reason(result)
+
+            # sampled reject diagnostics (clean + utile)
+            if await stats.take_reject_debug_slot():
+                # on essaye d'afficher les champs clés si présents
+                side = str(result.get("side", "")).upper() if isinstance(result, dict) else None
+                entry = _safe_float(result.get("entry"), 0.0) if isinstance(result, dict) else 0.0
+                sl = _safe_float(result.get("sl"), 0.0) if isinstance(result, dict) else 0.0
+                tp1 = _safe_float(result.get("tp1"), 0.0) if isinstance(result, dict) else 0.0
+                rr = _safe_float(result.get("rr"), 0.0) if isinstance(result, dict) else 0.0
+                inst = (result.get("institutional") or {}) if isinstance(result, dict) else {}
+                inst_score = inst.get("institutional_score") if isinstance(inst, dict) else None
+                setup = result.get("setup_type") if isinstance(result, dict) else None
+                desk_log(
+                    logging.INFO,
+                    "REJ",
+                    symbol,
+                    tid,
+                    fetch_ms=fetch_ms,
+                    analyze_ms=analyze_ms,
+                    reason=reason,
+                    side=side,
+                    rr=rr if rr else None,
+                    inst=inst_score,
+                    setup=setup,
+                    has_fields=("Y" if (isinstance(result, dict) and _has_key_fields_for_trade(result)) else "N"),
+                )
+
             await stats.inc("rejects", 1)
             await stats.add_reason(reason)
-            if LOG_REJECTS:
-                desk_log(logging.INFO, "SCAN", symbol, tid, step="reject", fetch_ms=fetch_ms, analyze_ms=analyze_ms, reason=reason)
-            return
 
+            # SOFT ACCEPT (optionnel)
+            if SOFT_ACCEPT_INVALID and isinstance(result, dict) and _has_key_fields_for_trade(result):
+                side = str(result.get("side", "")).upper()
+                rr_f = _safe_float(result.get("rr"), 0.0)
+                inst = result.get("institutional") or {}
+                inst_score = int(inst.get("institutional_score") or 0)
+
+                if inst_score >= SOFT_MIN_INST_SCORE and rr_f >= SOFT_MIN_RR:
+                    # On continue comme si valid
+                    result = dict(result)  # copy
+                    result["valid"] = True
+                    result["setup_type"] = result.get("setup_type") or "SOFT_OVERRIDE"
+                    desk_log(logging.WARNING, "SOFT", symbol, tid, rr=rr_f, inst=inst_score, reason=reason)
+                else:
+                    return
+            else:
+                return
+
+        # ========== VALID ==========
         side = str(result.get("side", "")).upper()
         if side not in ("BUY", "SELL"):
             await stats.inc("rejects", 1)
             await stats.add_reason("bad_side")
-            if LOG_REJECTS:
-                desk_log(logging.INFO, "SCAN", symbol, tid, step="reject", reason=f"bad_side={side}")
             return
 
-        entry = float(result.get("entry", 0.0) or 0.0)
-        sl = float(result.get("sl", 0.0) or 0.0)
-        tp1 = result.get("tp1")
-        tp2 = result.get("tp2")
+        entry = _safe_float(result.get("entry"), 0.0)
+        sl = _safe_float(result.get("sl"), 0.0)
+        tp1_val = _safe_float(result.get("tp1"), 0.0)
+        tp2_val = _safe_float(result.get("tp2"), 0.0)
+        rr_val = _safe_float(result.get("rr"), 0.0)
+        setup = result.get("setup_type")
 
-        if entry <= 0 or sl <= 0:
+        if entry <= 0 or sl <= 0 or tp1_val <= 0:
             await stats.inc("rejects", 1)
-            await stats.add_reason("bad_entry_sl")
-            if LOG_REJECTS:
-                desk_log(logging.INFO, "SCAN", symbol, tid, step="reject", reason="bad_entry_sl", entry=entry, sl=sl)
+            await stats.add_reason("bad_fields")
             return
 
-        tp1_val = float(tp1) if tp1 is not None else 0.0
-        tp2_val = float(tp2) if tp2 is not None else 0.0
-        if tp1_val <= 0 or tp2_val <= 0:
+        tp2_synth = False
+        if tp2_val <= 0 and ALLOW_TP2_SYNTH:
+            tp2_val = _synth_tp2(entry, tp1_val, side)
+            tp2_synth = True
+            result["tp2"] = tp2_val
+
+        if tp2_val <= 0:
             await stats.inc("skips", 1)
             await stats.add_reason("missing_tp")
-            if LOG_SKIPS:
-                desk_log(logging.INFO, "SCAN", symbol, tid, step="skip", reason="missing_tp", tp1=tp1, tp2=tp2)
             return
-
-        rr = result.get("rr")
-        setup = result.get("setup_type")
 
         # DUP
         fp = make_fingerprint(symbol, side, entry, sl, tp1_val, extra=setup, precision=6)
@@ -367,32 +468,21 @@ async def process_symbol(
             symbol=symbol,
             side=direction,
             notional=notional,
-            rr=float(rr) if rr is not None else None,
+            rr=rr_val if rr_val > 0 else None,
             inst_score=inst_score,
             commitment=None,
         )
         if not allowed:
             await stats.inc("risk_rejects", 1)
             await stats.add_reason(f"risk:{reason}")
-            if LOG_REJECTS:
-                desk_log(logging.INFO, "RISK", symbol, tid, step="reject", reason=reason, rr=rr, inst_score=inst_score)
             return
 
-        # VALID (INFO)
         await stats.inc("valids", 1)
-        desk_log(
-            logging.INFO,
-            "VALID",
-            symbol,
-            tid,
-            side=side,
-            setup=setup,
-            rr=(round(float(rr), 3) if rr is not None else None),
-            inst=inst_score,
-        )
+        desk_log(logging.INFO, "VALID", symbol, tid, side=side, setup=setup, rr=rr_val, inst=inst_score)
 
         # Telegram + mark dup
-        await send_telegram(_build_signal_message(result, tid))
+        soft = (setup == "SOFT_OVERRIDE")
+        await send_telegram(_build_signal_message(result, tid, soft=soft, tp2_synth=tp2_synth))
         DUP_GUARD.mark(fp)
 
         if DRY_RUN:
@@ -427,7 +517,7 @@ async def process_symbol(
             return
 
         entry_order_id = (entry_resp.get("data") or {}).get("orderId") or entry_resp.get("orderId")
-        qty_total = float(entry_resp.get("qty") or 0.0)
+        qty_total = _safe_float(entry_resp.get("qty"), 0.0)
 
         desk_log(logging.INFO, "EXEC", symbol, tid, action="entry_ok", orderId=entry_order_id, qty=(qty_total if qty_total else None))
 
@@ -542,7 +632,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         trigger_price=sl,
                         qty=qty_total,
                         client_oid=f"sl-{tid}",
-                        trigger_type=_trigger_type_sl(),
+                        trigger_type=("mark_price" if (STOP_TRIGGER_TYPE_SL or "MP").upper() == "MP" else "fill_price"),
                     )
                     if not _is_ok(sl_resp):
                         desk_log(logging.ERROR, "WATCH", sym, tid, step="sl_fail", code=sl_resp.get("code"), msg=sl_resp.get("msg"))
@@ -605,7 +695,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         trigger_price=new_sl,
                         qty=remaining,
                         client_oid=f"be-{tid}",
-                        trigger_type=_trigger_type_sl(),
+                        trigger_type=("mark_price" if (STOP_TRIGGER_TYPE_SL or "MP").upper() == "MP" else "fill_price"),
                     )
                     if not _is_ok(sl_be_resp):
                         desk_log(logging.ERROR, "WATCH", sym, tid, step="be_fail", code=sl_be_resp.get("code"), msg=sl_be_resp.get("msg"))
@@ -679,10 +769,8 @@ async def scan_once(client, analyzer: SignalAnalyzer, trader: BitgetTrader) -> N
 
     await asyncio.gather(*[_worker(sym) for sym in symbols])
 
-    # ===== Summary =====
     dt = time.time() - t_scan0
-    # top 8 reasons
-    reasons = stats.reasons.most_common(8)
+    reasons = stats.reasons.most_common(10)
     reasons_str = ", ".join([f"{k}:{v}" for k, v in reasons]) if reasons else "-"
 
     logger.info(
@@ -701,7 +789,6 @@ async def scan_once(client, analyzer: SignalAnalyzer, trader: BitgetTrader) -> N
 
 
 async def start_scanner() -> None:
-    # Root logging
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
