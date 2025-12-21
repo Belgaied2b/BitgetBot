@@ -15,7 +15,6 @@ except Exception:  # fallback si pas défini dans settings.py
 
 logger = logging.getLogger(__name__)
 
-
 PRODUCT_TYPE = "USDT-FUTURES"
 MARGIN_COIN = "USDT"
 MARGIN_MODE = "isolated"
@@ -278,6 +277,10 @@ class BitgetTrader(BitgetClient):
         side = side.lower()  # "buy" ou "sell"
 
         meta = await self._meta_cache.get(symbol)
+        if meta is None:
+            logger.error(f"[TRADER] no meta available for {symbol}, aborting place_limit")
+            return None
+
         q_price = self._quantize_price_from_meta(meta, price)
 
         # notionnel cible ~ marge * levier
@@ -296,23 +299,21 @@ class BitgetTrader(BitgetClient):
         approx_notional = q_size * q_price
         approx_margin = approx_notional / self.TARGET_LEVERAGE
 
+        # clientOid optionnel : si tu veux, tu peux le remettre plus tard, mais
+        # on évite pour l’instant les histoires de format invalid côté serveur.
         if client_oid is None:
             client_oid = f"entry-{symbol}-{int(time.time() * 1000)}"
 
-        # format price/size en string avec les bons décimales
-        if meta:
-            price_str = self._fmt(q_price, meta["price_decimals"])
-            size_str = self._fmt(q_size, meta["size_decimals"])
-        else:
-            price_str = f"{q_price:.10f}"
-            size_str = f"{q_size:.4f}"
+        price_str = self._fmt(q_price, meta["price_decimals"])
+        size_str = self._fmt(q_size, meta["size_decimals"])
 
         logger.info(
             f"[TRADER] place_limit {symbol} {side} price={price_str} size={size_str} "
             f"(notional≈{approx_notional:.2f} USDT, marge≈{approx_margin:.2f} USDT, levier={self.TARGET_LEVERAGE:.1f}x)"
         )
 
-        payload = {
+        # Payload minimal conforme v2
+        params = {
             "productType": self.PRODUCT_TYPE,
             "symbol": symbol,
             "marginMode": self.MARGIN_MODE,
@@ -320,17 +321,18 @@ class BitgetTrader(BitgetClient):
             "size": size_str,
             "price": price_str,
             "orderType": "limit",
-            "side": side,           # "buy" ou "sell"
+            "side": side,      # "buy" ou "sell"
             "tradeSide": "open",
-            "force": "gtc",
-            "reduceOnly": "NO",
-            "clientOid": client_oid,
+            # "force": "gtc",          # optionnel, on évite pour limiter les erreurs
+            # "clientOid": client_oid, # optionnel, mais ton client peut en mettre un
         }
+
+        logger.debug(f"[TRADER_DEBUG] place_limit params={params!r}")
 
         resp = await self._request(
             "POST",
             "/api/v2/mix/order/place-order",
-            params=payload,
+            params=params,
             auth=True,
         )
         return resp
@@ -354,11 +356,13 @@ class BitgetTrader(BitgetClient):
         - fraction : part de cette taille à utiliser (1.0 = 100%)
         """
         meta = await self._meta_cache.get(symbol)
+        if meta is None:
+            logger.error(f"[TRADER] no meta available for {symbol}, aborting SL")
+            return None
 
         open_side_up = open_side.upper()
         trigger_side = "sell" if open_side_up in ("BUY", "LONG") else "buy"
 
-        # Utiliser la taille mémorisée si dispo
         base_size = self._entry_size.get(symbol, float(size))
         eff_size = base_size * float(fraction)
 
@@ -373,39 +377,35 @@ class BitgetTrader(BitgetClient):
         if client_oid is None:
             client_oid = f"sl-{symbol}-{int(time.time() * 1000)}"
 
-        if meta:
-            price_str = self._fmt(q_price, meta["price_decimals"])
-            size_str = self._fmt(q_size, meta["size_decimals"])
-        else:
-            price_str = f"{q_price:.10f}"
-            size_str = f"{q_size:.4f}"
+        price_str = self._fmt(q_price, meta["price_decimals"])
+        size_str = self._fmt(q_size, meta["size_decimals"])
 
         logger.info(
             f"[TRADER] place_stop_loss {symbol} side(open)={open_side_up} "
             f"trigger_side={trigger_side} sl={price_str} size={size_str} (fraction={fraction:.3f})"
         )
 
-        payload = {
+        params = {
             "planType": "normal_plan",
             "productType": self.PRODUCT_TYPE,
             "symbol": symbol,
             "marginMode": self.MARGIN_MODE,
             "marginCoin": self.MARGIN_COIN,
             "size": size_str,
-            "price": price_str,
             "triggerPrice": price_str,
             "triggerType": "mark_price",
             "orderType": "limit",
             "side": trigger_side,
             "tradeSide": "close",
-            "reduceOnly": "YES",
-            "clientOid": client_oid,
+            # "clientOid": client_oid,   # facultatif, on peut le réactiver plus tard
         }
+
+        logger.debug(f"[TRADER_DEBUG] place_stop_loss params={params!r}")
 
         resp = await self._request(
             "POST",
             "/api/v2/mix/order/place-plan-order",
-            params=payload,
+            params=params,
             auth=True,
         )
         return resp
@@ -429,6 +429,9 @@ class BitgetTrader(BitgetClient):
         - fraction : fraction de cette taille pour ce TP (ex : 0.5)
         """
         meta = await self._meta_cache.get(symbol)
+        if meta is None:
+            logger.error(f"[TRADER] no meta available for {symbol}, aborting TP")
+            return None
 
         open_side_up = open_side.upper()
         trigger_side = "sell" if open_side_up in ("BUY", "LONG") else "buy"
@@ -447,39 +450,35 @@ class BitgetTrader(BitgetClient):
         if client_oid is None:
             client_oid = f"tp-{symbol}-{int(time.time() * 1000)}"
 
-        if meta:
-            price_str = self._fmt(q_price, meta["price_decimals"])
-            size_str = self._fmt(q_size, meta["size_decimals"])
-        else:
-            price_str = f"{q_price:.10f}"
-            size_str = f"{q_size:.4f}"
+        price_str = self._fmt(q_price, meta["price_decimals"])
+        size_str = self._fmt(q_size, meta["size_decimals"])
 
         logger.info(
             f"[TRADER] place_take_profit {symbol} side(open)={open_side_up} "
             f"trigger_side={trigger_side} tp={price_str} size={size_str} (fraction={fraction:.3f})"
         )
 
-        payload = {
+        params = {
             "planType": "normal_plan",
             "productType": self.PRODUCT_TYPE,
             "symbol": symbol,
             "marginMode": self.MARGIN_MODE,
             "marginCoin": self.MARGIN_COIN,
             "size": size_str,
-            "price": price_str,
             "triggerPrice": price_str,
             "triggerType": "mark_price",
             "orderType": "limit",
             "side": trigger_side,
             "tradeSide": "close",
-            "reduceOnly": "YES",
-            "clientOid": client_oid,
+            # "clientOid": client_oid,
         }
+
+        logger.debug(f"[TRADER_DEBUG] place_take_profit params={params!r}")
 
         resp = await self._request(
             "POST",
             "/api/v2/mix/order/place-plan-order",
-            params=payload,
+            params=params,
             auth=True,
         )
         return resp
