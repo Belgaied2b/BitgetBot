@@ -11,6 +11,8 @@
 #       * anti-tilt : cooldown après série de pertes
 #   - Fournir une API simple au scanner :
 #       * can_open(symbol, side) -> (bool, reason)
+#       * can_trade(..., symbol=..., side=..., notional=..., rr=..., inst_score=..., commitment=...)
+#           -> (bool, reason)
 #       * register_open(symbol, side, notional, risk)
 #       * register_closed(symbol, side, pnl)
 #       * risk_for_this_trade() -> float
@@ -21,10 +23,12 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Any, Tuple, Optional, List
 
+LOGGER = logging.getLogger(__name__)
 
 # =====================================================================
 # CONFIG — À AJUSTER DANS UN SECOND TEMPS SI BESOIN
@@ -88,18 +92,23 @@ class RiskManager:
 
         rm = RiskManager()
 
-        allowed, reason = rm.can_open(symbol, "LONG")
+        allowed, reason = rm.can_trade(
+            symbol=symbol,
+            side=side,             # "BUY"/"SELL" ou "LONG"/"SHORT"
+            notional=notional_usdt,
+            rr=rr,
+            inst_score=inst_score,
+            commitment=commitment,
+        )
         if not allowed:
-            log / telegram "[RISK] veto ..."
+            logger.info("[RISK] veto %s %s: %s", symbol, side, reason)
             return
 
-        risk_usdt = rm.risk_for_this_trade()
-        # sizing basé sur risk_usdt, si tu veux
-
-        rm.register_open(symbol, "LONG", notional=..., risk=risk_usdt)
+        # le trade est enregistré dans le risk manager
+        # (positions ouvertes, direction, trades/day, etc.)
 
         # plus tard, quand la position est close :
-        rm.register_closed(symbol, "LONG", pnl=+15.0)  # ou -20.0 etc.
+        rm.register_closed(symbol, side, pnl=+15.0)  # ou -20.0 etc.
     """
 
     def __init__(self, config: Optional[RiskConfig] = None):
@@ -163,7 +172,7 @@ class RiskManager:
         return True
 
     # ------------------------------------------------------------------
-    # API principale
+    # API principale — niveau 1 : règles basiques
     # ------------------------------------------------------------------
 
     def can_open(self, symbol: str, side: str) -> Tuple[bool, str]:
@@ -213,6 +222,118 @@ class RiskManager:
                 return False, "position_already_open_same_side"
 
         # OK
+        return True, "OK"
+
+    # ------------------------------------------------------------------
+    # API principale — niveau 2 : desk ultra pour le scanner
+    # ------------------------------------------------------------------
+
+    def can_trade(self, *args: Any, **kwargs: Any) -> Tuple[bool, str]:
+        """
+        API utilisée par scanner.py avant d'envoyer la commande Bitget.
+
+        Signature flexible pour ne pas casser le code existant :
+
+        Exemples d'appel possibles :
+            can_trade(symbol, side, rr, inst_score, commitment, notional)
+            can_trade(symbol=symbol, side=side, notional=notional, rr=rr, ...)
+
+        On essaie d'extraire au minimum :
+          - symbol (str)
+          - side (str)
+          - notional (float, en USDT, si dispo — sinon on approxime)
+        Les autres (rr, inst_score, commitment) peuvent servir plus tard
+        pour moduler l'agressivité, mais ne bloquent pas pour l'instant.
+        """
+        self._ensure_daily_state()
+
+        # ------------------------------
+        # 1) Extraction des arguments
+        # ------------------------------
+        symbol = kwargs.get("symbol")
+        side = kwargs.get("side")
+        notional = (
+            kwargs.get("notional")
+            or kwargs.get("notional_usdt")
+            or kwargs.get("size_notional")
+        )
+        rr = kwargs.get("rr") or kwargs.get("rr_actual")
+        inst_score = kwargs.get("inst_score") or kwargs.get("institutional_score")
+        commitment = kwargs.get("commitment")
+
+        # fallback via *args si pas de kwargs
+        str_args = [a for a in args if isinstance(a, str)]
+        float_args = [a for a in args if isinstance(a, (int, float))]
+
+        if symbol is None and str_args:
+            symbol = str_args[0]
+
+        if side is None and len(str_args) >= 2:
+            side = str_args[1]
+
+        # pour notional, on prend le plus gros float (souvent ~200 USDT vs rr~1.5, inst_score~2)
+        if notional is None and float_args:
+            notional = max(float_args)
+
+        # si rr n'est pas fourni, on prend le plus petit float > 0 et < 10 (ex : 1.5)
+        if rr is None and float_args:
+            candidates = [x for x in float_args if 0 < x < 10]
+            if candidates:
+                rr = min(candidates)
+
+        # Valeurs par défaut safe
+        if symbol is None:
+            symbol = "UNKNOWN"
+
+        if side is None:
+            side = "LONG"
+
+        if notional is None:
+            # fallback si le scanner ne fournit rien : on approxime
+            notional = self.config.risk_per_trade * 10.0  # ex : 20 USDT * 10 = 200 notionnel
+
+        notional = float(notional)
+
+        # ------------------------------
+        # 2) Vérification can_open
+        # ------------------------------
+        allowed, reason = self.can_open(symbol, side)
+        if not allowed:
+            LOGGER.info("[RISK] %s %s refused by can_open: %s", symbol, side, reason)
+            return False, reason
+
+        # ------------------------------
+        # 3) Ici on pourrait ajouter des règles
+        #    supplémentaires basées sur rr / inst_score /
+        #    commitment (desk EV), si tu veux un jour.
+        #
+        #    Exemple (commenté pour l'instant) :
+        #
+        #    if inst_score is not None and inst_score < 0:
+        #        return False, "inst_score_negative"
+        #
+        #    if rr is not None and rr < 1.1:
+        #        return False, "rr_too_low_for_risk"
+        #
+        # Pour l'instant, on laisse l'EV logic dans analyze_signal.
+        # ------------------------------
+
+        # ------------------------------
+        # 4) Enregistrement de la position dans le risk manager
+        #    (compteurs directionnels + trades/jour)
+        # ------------------------------
+        risk_used = self.risk_for_this_trade()
+        self.register_open(symbol, side, notional=notional, risk=risk_used)
+
+        LOGGER.info(
+            "[RISK] %s %s allowed: notional=%.2f, risk_used=%.2f, daily_trades=%d",
+            symbol,
+            side,
+            notional,
+            risk_used,
+            self._daily_trades(),
+        )
+
         return True, "OK"
 
     # ------------------------------------------------------------------
