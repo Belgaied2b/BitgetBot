@@ -72,7 +72,6 @@ class SymbolMetaCache:
                 "GET",
                 "/api/v2/mix/market/contracts",
                 params=params,
-                body=None,
                 auth=False,
             )
         except Exception as e:
@@ -128,7 +127,6 @@ class SymbolMetaCache:
                 "GET",
                 "/api/v2/mix/market/contracts",
                 params=params,
-                body=None,
                 auth=False,
             )
         except Exception as e:
@@ -314,7 +312,7 @@ class BitgetTrader(BitgetClient):
             f"(notional≈{approx_notional:.2f} USDT, marge≈{approx_margin:.2f} USDT, levier={self.TARGET_LEVERAGE:.1f}x)"
         )
 
-        body = {
+        payload = {
             "productType": self.PRODUCT_TYPE,
             "symbol": symbol,
             "marginMode": self.MARGIN_MODE,
@@ -332,8 +330,7 @@ class BitgetTrader(BitgetClient):
         resp = await self._request(
             "POST",
             "/api/v2/mix/order/place-order",
-            params={},
-            body=body,
+            params=payload,
             auth=True,
         )
         return resp
@@ -388,7 +385,7 @@ class BitgetTrader(BitgetClient):
             f"trigger_side={trigger_side} sl={price_str} size={size_str} (fraction={fraction:.3f})"
         )
 
-        body = {
+        payload = {
             "planType": "normal_plan",
             "productType": self.PRODUCT_TYPE,
             "symbol": symbol,
@@ -408,8 +405,7 @@ class BitgetTrader(BitgetClient):
         resp = await self._request(
             "POST",
             "/api/v2/mix/order/place-plan-order",
-            params={},
-            body=body,
+            params=payload,
             auth=True,
         )
         return resp
@@ -463,7 +459,7 @@ class BitgetTrader(BitgetClient):
             f"trigger_side={trigger_side} tp={price_str} size={size_str} (fraction={fraction:.3f})"
         )
 
-        body = {
+        payload = {
             "planType": "normal_plan",
             "productType": self.PRODUCT_TYPE,
             "symbol": symbol,
@@ -483,8 +479,7 @@ class BitgetTrader(BitgetClient):
         resp = await self._request(
             "POST",
             "/api/v2/mix/order/place-plan-order",
-            params={},
-            body=body,
+            params=payload,
             auth=True,
         )
         return resp
