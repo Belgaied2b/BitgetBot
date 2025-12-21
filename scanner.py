@@ -8,6 +8,7 @@ import asyncio
 import inspect
 import logging
 import math
+import os
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -26,14 +27,9 @@ from settings import (
     MARGIN_USDT,
     LEVERAGE,
     RISK_USDT,
+    PRODUCT_TYPE,
+    MARGIN_COIN,
 )
-
-# OPTIONNELS (si présents dans settings)
-try:
-    from settings import PRODUCT_TYPE, MARGIN_COIN
-except Exception:
-    PRODUCT_TYPE = "USDT-FUTURES"
-    MARGIN_COIN = "USDT"
 
 from bitget_client import get_client
 from bitget_trader import BitgetTrader
@@ -57,6 +53,9 @@ TF_H4 = "4H"
 CANDLE_LIMIT = 200
 
 MAX_CONCURRENT_FETCH = 8
+
+# Bitget exige marginMode dans les ordres v2 (sinon 400172)
+MARGIN_MODE = os.getenv("MARGIN_MODE", "isolated")  # "isolated" ou "crossed" selon ton compte
 
 # Cache metas: symbol -> meta
 _META_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -109,8 +108,7 @@ def _side_to_direction(side: str) -> str:
 
 
 def _to_buy_sell(side: str) -> str:
-    s = (side or "").upper()
-    return "buy" if s == "BUY" else "sell"
+    return "buy" if (side or "").upper() == "BUY" else "sell"
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
@@ -202,20 +200,20 @@ def _build_signal_message(result: Dict[str, Any]) -> str:
 
 def _make_trader() -> BitgetTrader:
     """
-    Compat avec tes différentes versions de BitgetTrader :
-    - certaines acceptent margin_usdt/leverage
-    - d’autres target_margin_usdt/leverage
+    Compat avec ta classe BitgetTrader (qui attend target_margin_usdt/leverage).
     """
     sig = inspect.signature(BitgetTrader.__init__)
     kwargs: Dict[str, Any] = {}
 
-    if "margin_usdt" in sig.parameters:
-        kwargs["margin_usdt"] = float(MARGIN_USDT)
     if "target_margin_usdt" in sig.parameters:
         kwargs["target_margin_usdt"] = float(MARGIN_USDT)
-
     if "leverage" in sig.parameters:
         kwargs["leverage"] = float(LEVERAGE)
+
+    if "product_type" in sig.parameters:
+        kwargs["product_type"] = PRODUCT_TYPE
+    if "margin_coin" in sig.parameters:
+        kwargs["margin_coin"] = MARGIN_COIN
 
     return BitgetTrader(API_KEY, API_SECRET, API_PASSPHRASE, **kwargs)
 
@@ -232,12 +230,7 @@ async def _get_contract_meta(client, symbol: str) -> Optional[Dict[str, Any]]:
 
     params = {"productType": PRODUCT_TYPE, "symbol": symbol}
     try:
-        js = await client._request(
-            "GET",
-            "/api/v2/mix/market/contracts",
-            params=params,
-            auth=False,
-        )
+        js = await client._request("GET", "/api/v2/mix/market/contracts", params=params, auth=False)
     except Exception as e:
         logger.error("[META] fetch error %s: %s", symbol, e)
         return None
@@ -255,7 +248,6 @@ async def _get_contract_meta(client, symbol: str) -> Optional[Dict[str, Any]]:
         size_multiplier = float(c.get("sizeMultiplier", 1))
         min_trade_num = float(c.get("minTradeNum", 0))
 
-        # Tick candidat
         tick = price_end_step * (10 ** -max(price_place, 0))
 
         meta = {
@@ -289,7 +281,6 @@ async def _place_limit_direct(
 ) -> Optional[Dict[str, Any]]:
     meta = await _get_contract_meta(client, symbol)
 
-    # tick/step safe
     tick = float(meta["tick"]) if meta and meta.get("tick") else 0.0
     if tick <= 0 or tick >= entry:
         tick = _estimate_tick(entry)
@@ -304,7 +295,6 @@ async def _place_limit_direct(
 
     q_price = _quantize_floor(entry, tick)
     if q_price <= 0:
-        # dernier filet
         q_price = float(entry)
 
     raw_size = float(notional) / float(q_price)
@@ -318,17 +308,18 @@ async def _place_limit_direct(
         "symbol": symbol,
         "productType": PRODUCT_TYPE,
         "marginCoin": MARGIN_COIN,
+        "marginMode": MARGIN_MODE,   # ✅ FIX: obligatoire
         "size": _fmt(q_size, volume_place),
         "price": _fmt(q_price, price_place),
-        "side": side_buy_sell,              # "buy" / "sell"
+        "side": side_buy_sell,       # "buy"/"sell"
         "orderType": "limit",
         "timeInForceValue": "normal",
         "clientOid": str(client_oid),
     }
 
     logger.info(
-        "[EXEC] place LIMIT %s %s price=%s size=%s notional≈%.2f",
-        symbol, side_buy_sell, payload["price"], payload["size"], q_price * q_size
+        "[EXEC] place LIMIT %s %s price=%s size=%s notional≈%.2f (marginMode=%s)",
+        symbol, side_buy_sell, payload["price"], payload["size"], q_price * q_size, MARGIN_MODE
     )
 
     try:
@@ -341,71 +332,6 @@ async def _place_limit_direct(
         return resp if isinstance(resp, dict) else None
     except Exception as e:
         logger.error("[EXEC] place-order HTTP error %s: %s", symbol, e)
-        return None
-
-
-async def _place_plan_direct(
-    trader: BitgetTrader,
-    client,
-    symbol: str,
-    open_side_buy_sell: str,
-    trigger_price: float,
-    size: float,
-    client_oid: str,
-) -> Optional[Dict[str, Any]]:
-    meta = await _get_contract_meta(client, symbol)
-
-    tick = float(meta["tick"]) if meta and meta.get("tick") else 0.0
-    if tick <= 0 or tick >= trigger_price:
-        tick = _estimate_tick(trigger_price)
-
-    step = float(meta["step"]) if meta and meta.get("step") else 0.0
-    if step <= 0:
-        step = 1.0
-
-    price_place = int(meta["price_place"]) if meta else 6
-    volume_place = int(meta["volume_place"]) if meta else 4
-    min_trade = float(meta["min_trade_num"]) if meta else 0.0
-
-    # close side
-    if open_side_buy_sell == "buy":
-        close_side = "sell"
-    else:
-        close_side = "buy"
-
-    q_trigger = _quantize_floor(trigger_price, tick)
-    if q_trigger <= 0:
-        q_trigger = float(trigger_price)
-
-    q_size = _quantize_floor(size, step)
-    if min_trade > 0 and q_size < min_trade:
-        logger.error("[EXEC] %s plan size %.8f < minTradeNum %.8f", symbol, q_size, min_trade)
-        return None
-
-    payload = {
-        "symbol": symbol,
-        "productType": PRODUCT_TYPE,
-        "marginCoin": MARGIN_COIN,
-        "size": _fmt(q_size, volume_place),
-        "side": close_side,
-        "orderType": "limit",
-        "timeInForceValue": "normal",
-        "triggerType": "mark_price",
-        "triggerPrice": _fmt(q_trigger, price_place),
-        "executePrice": _fmt(q_trigger, price_place),
-        "clientOid": str(client_oid),
-    }
-
-    try:
-        resp = await trader._request(
-            "POST",
-            "/api/v2/mix/order/place-plan-order",
-            data=payload,
-            auth=True,
-        )
-        return resp if isinstance(resp, dict) else None
-    except Exception as e:
-        logger.error("[EXEC] place-plan-order HTTP error %s: %s", symbol, e)
         return None
 
 
@@ -464,7 +390,6 @@ async def process_symbol(
         entry = _safe_float(result.get("entry"), 0.0)
         sl = _safe_float(result.get("sl"), 0.0)
         tp1 = _safe_float(result.get("tp1"), 0.0)
-        tp2 = _safe_float(result.get("tp2"), 0.0)
 
         if entry <= 0:
             return
@@ -475,7 +400,6 @@ async def process_symbol(
         inst = result.get("institutional") or {}
         inst_score = inst.get("institutional_score", 0)
 
-        # anti-doublons
         fp = make_fingerprint(symbol, side, entry, sl, tp1, extra=setup, precision=6)
         if DUP_GUARD.is_duplicate(fp):
             logger.info("[DUP] skip %s %s (déjà envoyé)", symbol, side)
@@ -500,7 +424,6 @@ async def process_symbol(
         if DRY_RUN:
             return
 
-        # budget ordres
         try:
             await asyncio.wait_for(order_budget.acquire(), timeout=0.01)
             acquired_budget = True
@@ -524,63 +447,14 @@ async def process_symbol(
         if not _is_ok(entry_res):
             logger.error("[ENTRY] FAILED %s → %s", symbol, entry_res)
             await send_telegram(f"❌ *ENTRY FAILED* {symbol} {side} @ `{entry}`\n`{entry_res}`")
-            if acquired_budget:
-                order_budget.release()
             return
 
-        # register open
         RISK.register_open(symbol=symbol, side=direction, notional=notional, risk=float(RISK_USDT))
         logger.info("[ENTRY] OK %s %s @ %s (oid=%s)", symbol, side, entry, client_oid_entry)
 
-        # SL / TP (optionnels)
-        # On ferme 50% sur TP1 et 50% sur TP2 si dispo (sinon tout sur TP1)
-        # Taille estimée: notional / entry (approx), re-quantifiée au moment de l'ordre plan
-        approx_size = notional / entry
-
-        if sl > 0:
-            client_oid_sl = f"sl-{symbol}-{int(time.time() * 1000)}"
-            sl_res = await _place_plan_direct(
-                trader=trader,
-                client=client,
-                symbol=symbol,
-                open_side_buy_sell=side_bs,
-                trigger_price=sl,
-                size=approx_size,
-                client_oid=client_oid_sl,
-            )
-            if not _is_ok(sl_res):
-                logger.error("[SL] FAILED %s → %s", symbol, sl_res)
-
-        if tp1 > 0:
-            client_oid_tp1 = f"tp1-{symbol}-{int(time.time() * 1000)}"
-            tp1_res = await _place_plan_direct(
-                trader=trader,
-                client=client,
-                symbol=symbol,
-                open_side_buy_sell=side_bs,
-                trigger_price=tp1,
-                size=approx_size * (0.5 if tp2 > 0 else 1.0),
-                client_oid=client_oid_tp1,
-            )
-            if not _is_ok(tp1_res):
-                logger.error("[TP1] FAILED %s → %s", symbol, tp1_res)
-
-        if tp2 > 0:
-            client_oid_tp2 = f"tp2-{symbol}-{int(time.time() * 1000)}"
-            tp2_res = await _place_plan_direct(
-                trader=trader,
-                client=client,
-                symbol=symbol,
-                open_side_buy_sell=side_bs,
-                trigger_price=tp2,
-                size=approx_size * 0.5,
-                client_oid=client_oid_tp2,
-            )
-            if not _is_ok(tp2_res):
-                logger.error("[TP2] FAILED %s → %s", symbol, tp2_res)
-
     except Exception:
         logger.exception("[%s] process_symbol error", symbol)
+    finally:
         if acquired_budget:
             try:
                 order_budget.release()
@@ -619,7 +493,10 @@ async def start_scanner() -> None:
     trader = _make_trader()
     analyzer = SignalAnalyzer()
 
-    logger.info("🚀 Scanner started | interval=%s min | dry_run=%s", SCAN_INTERVAL_MIN, DRY_RUN)
+    logger.info(
+        "🚀 Scanner started | interval=%s min | dry_run=%s | marginMode=%s",
+        SCAN_INTERVAL_MIN, DRY_RUN, MARGIN_MODE
+    )
 
     while True:
         t0 = time.time()
