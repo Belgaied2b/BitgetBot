@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -16,27 +16,8 @@ from settings import PRODUCT_TYPE, MARGIN_COIN
 logger = logging.getLogger(__name__)
 
 
-# =====================================================================
-# Helpers
-# =====================================================================
-
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
-
-def _to_trigger_type(v: str) -> str:
-    """
-    Settings:
-      MP -> mark_price
-      FP -> fill_price
-      TP -> fill_price (fallback)
-    """
-    s = (v or "").strip().upper()
-    if s == "MP":
-        return "mark_price"
-    if s == "FP":
-        return "fill_price"
-    return "fill_price"
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
@@ -54,9 +35,19 @@ def _is_ok(resp: Any) -> bool:
     return str(resp.get("code", "")) == "00000"
 
 
-# =====================================================================
-# Contract meta cache (tick/lot)
-# =====================================================================
+def _round_price(price: float, tick: float, rounding: str) -> float:
+    """
+    rounding: "nearest" | "floor" | "ceil"
+    """
+    if tick <= 0:
+        return float(price)
+    x = price / tick
+    if rounding == "floor":
+        return math.floor(x) * tick
+    if rounding == "ceil":
+        return math.ceil(x) * tick
+    return round(x) * tick
+
 
 @dataclass
 class ContractMeta:
@@ -76,10 +67,6 @@ class ContractMetaCache:
         self._by_symbol: Dict[str, ContractMeta] = {}
 
     async def refresh(self) -> None:
-        """
-        Pull metas from Bitget market contracts v2:
-          GET /api/v2/mix/market/contracts?productType=USDT-FUTURES
-        """
         now = time.time()
         if self._by_symbol and (now - self._ts) < self.ttl_s:
             return
@@ -102,13 +89,11 @@ class ContractMetaCache:
             if not sym:
                 continue
 
-            # Bitget fields vary. We use robust fallbacks:
             price_place = int(_safe_float(c.get("pricePlace"), 6))
             qty_place = int(_safe_float(c.get("volumePlace"), 4))
 
             price_tick = _safe_float(c.get("priceEndStep"), 0.0) or (10 ** (-price_place))
             qty_step = _safe_float(c.get("sizeMultiplier"), 0.0) or _safe_float(c.get("minTradeNum"), 0.0) or (10 ** (-qty_place))
-
             min_qty = _safe_float(c.get("minTradeNum"), 0.0) or qty_step
 
             by_symbol[sym] = ContractMeta(
@@ -130,18 +115,7 @@ class ContractMetaCache:
         return self._by_symbol.get(sym)
 
 
-# =====================================================================
-# Trader
-# =====================================================================
-
 class BitgetTrader:
-    """
-    NOTE:
-    - This trader reuses BitgetClient's auth signing internals via client._sign()
-    - It does NOT rely on BitgetClient._request() for private endpoints because _request()
-      raises on HTTP>=400 (we need to catch bodies & codes).
-    """
-
     BASE = "https://api.bitget.com"
 
     def __init__(
@@ -163,8 +137,6 @@ class BitgetTrader:
 
         self._meta = ContractMetaCache(client)
 
-    # ---------------------------------------------------------------
-
     async def _request_any_status(
         self,
         method: str,
@@ -182,7 +154,8 @@ class BitgetTrader:
 
         query = ""
         if params:
-            query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
+            items = sorted(params.items(), key=lambda kv: kv[0])
+            query = "?" + "&".join(f"{k}={v}" for k, v in items)
 
         url = self.BASE + path + query
         body = json.dumps(data, separators=(",", ":")) if data else ""
@@ -222,42 +195,51 @@ class BitgetTrader:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    # ---------------------------------------------------------------
-
-    async def _quantize(self, symbol: str, price: float, qty: float) -> Tuple[float, float, float]:
-        meta = await self._meta.get(symbol)
-        if not meta:
-            # fallback
-            return float(price), float(qty), 1e-6
-
-        tick = float(meta.price_tick or (10 ** (-meta.price_place)))
-        step = float(meta.qty_step or (10 ** (-meta.qty_place)))
-
-        # Quantize price to tick
-        p = float(round(price / tick) * tick)
-
-        # Quantize qty to step
-        q = float(int(qty / step) * step)
-
-        # ensure min qty
-        if q < meta.min_qty:
-            q = 0.0
-
-        # clamp rounding noise
-        p = float(f"{p:.{max(0, meta.price_place)}f}") if meta.price_place >= 0 else p
-        q = float(f"{q:.{max(0, meta.qty_place)}f}") if meta.qty_place >= 0 else q
-
-        return p, q, tick
-
     async def get_tick(self, symbol: str) -> float:
         meta = await self._meta.get(symbol)
         if not meta:
             return 1e-6
         return float(meta.price_tick or (10 ** (-meta.price_place)))
 
-    # ---------------------------------------------------------------
-    # Orders
-    # ---------------------------------------------------------------
+    async def quantize_price(self, symbol: str, price: float, *, rounding: str = "nearest") -> float:
+        meta = await self._meta.get(symbol)
+        if not meta:
+            return float(price)
+        tick = float(meta.price_tick or (10 ** (-meta.price_place)))
+        p = _round_price(float(price), tick, rounding)
+        if meta.price_place >= 0:
+            p = float(format(p, f".{meta.price_place}f"))
+        return float(p)
+
+    async def _quantize_order(
+        self,
+        symbol: str,
+        price: float,
+        qty: float,
+        *,
+        price_rounding: str = "nearest",
+    ) -> Tuple[float, float, float]:
+        meta = await self._meta.get(symbol)
+        if not meta:
+            return float(price), float(qty), 1e-6
+
+        tick = float(meta.price_tick or (10 ** (-meta.price_place)))
+        step = float(meta.qty_step or (10 ** (-meta.qty_place)))
+
+        # price
+        p = _round_price(float(price), tick, price_rounding)
+        if meta.price_place >= 0:
+            p = float(format(p, f".{meta.price_place}f"))
+
+        # qty (always floor to step)
+        q = float(int(float(qty) / step) * step)
+        if meta.qty_place >= 0:
+            q = float(format(q, f".{meta.qty_place}f"))
+
+        if q < float(meta.min_qty):
+            q = 0.0
+
+        return float(p), float(q), float(tick)
 
     async def place_limit(
         self,
@@ -268,6 +250,8 @@ class BitgetTrader:
         client_oid: Optional[str] = None,
         trade_side: str = "open",
         reduce_only: bool = False,
+        *,
+        price_rounding: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Standard LIMIT order on v2:
@@ -276,14 +260,20 @@ class BitgetTrader:
         sym = (symbol or "").upper()
         s = (side or "").lower()  # buy/sell
 
-        # auto compute size from margin*lev if missing
         if size is None:
             notional = self.margin_usdt * self.leverage
             raw_qty = notional / max(1e-12, float(price))
         else:
             raw_qty = float(size)
 
-        q_price, q_qty, _tick = await self._quantize(sym, float(price), float(raw_qty))
+        # safer default rounding:
+        # - buy: floor (avoid "too high" + band)
+        # - sell: ceil (avoid too low)
+        pr = price_rounding
+        if pr is None:
+            pr = "floor" if s == "buy" else "ceil"
+
+        q_price, q_qty, _tick = await self._quantize_order(sym, float(price), float(raw_qty), price_rounding=pr)
         if q_qty <= 0:
             return {"ok": False, "code": "QTY0", "msg": "quantized qty is 0"}
 
@@ -298,7 +288,6 @@ class BitgetTrader:
             "orderType": "limit",
             "timeInForceValue": "normal",
             "clientOid": client_oid or f"oid-{sym}-{_now_ms()}",
-            # v2 position open/close
             "tradeSide": (trade_side or "open").lower(),
         }
 
@@ -306,6 +295,20 @@ class BitgetTrader:
             payload["reduceOnly"] = "YES"
 
         resp = await self._request_any_status("POST", "/api/v2/mix/order/place-order", data=payload, auth=True)
+
+        # retry once if price error (try safer rounding floor)
+        if (not resp.get("ok")) and str(resp.get("code")) in {"40020"}:
+            q_price2, q_qty2, _ = await self._quantize_order(sym, float(price), float(raw_qty), price_rounding="floor")
+            if q_qty2 > 0 and (q_price2 != q_price or q_qty2 != q_qty):
+                payload["price"] = str(q_price2)
+                payload["size"] = str(q_qty2)
+                payload["clientOid"] = client_oid or f"oid-{sym}-{_now_ms()}"
+                resp = await self._request_any_status("POST", "/api/v2/mix/order/place-order", data=payload, auth=True)
+                if resp.get("ok"):
+                    resp["qty"] = q_qty2
+                    resp["price"] = q_price2
+                    return resp
+
         if resp.get("ok") is True:
             resp["qty"] = q_qty
             resp["price"] = q_price
@@ -318,10 +321,9 @@ class BitgetTrader:
         price: float,
         qty: float,
         client_oid: Optional[str] = None,
+        *,
+        price_rounding: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        TP as a reduce-only limit order (tradeSide=close).
-        """
         return await self.place_limit(
             symbol=symbol,
             side=close_side,
@@ -330,6 +332,7 @@ class BitgetTrader:
             client_oid=client_oid,
             trade_side="close",
             reduce_only=True,
+            price_rounding=price_rounding,
         )
 
     async def place_stop_market_sl(
@@ -341,6 +344,7 @@ class BitgetTrader:
         *,
         client_oid: Optional[str] = None,
         trigger_type: str = "mark_price",
+        trigger_rounding: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         SL as trigger order:
@@ -349,8 +353,14 @@ class BitgetTrader:
         sym = (symbol or "").upper()
         close_s = (close_side or "").lower()
 
-        # plan orders still need size quantized
-        _, q_qty, _tick = await self._quantize(sym, float(trigger_price), float(qty))
+        # quantize qty + trigger price (IMPORTANT)
+        tr = trigger_rounding
+        if tr is None:
+            # if close_side is sell => SL trigger is below -> floor is safer
+            tr = "floor" if close_s == "sell" else "ceil"
+
+        q_trigger = await self.quantize_price(sym, float(trigger_price), rounding=tr)
+        _, q_qty, _tick = await self._quantize_order(sym, float(q_trigger), float(qty), price_rounding="nearest")
         if q_qty <= 0:
             return {"ok": False, "code": "QTY0", "msg": "quantized qty is 0"}
 
@@ -362,29 +372,22 @@ class BitgetTrader:
             "size": str(q_qty),
             "side": close_s,
             "orderType": "market",
-            "triggerPrice": str(trigger_price),
+            "triggerPrice": str(q_trigger),
             "triggerType": trigger_type,
             "planType": "normal_plan",
             "tradeSide": "close",
             "reduceOnly": "YES",
             "clientOid": client_oid or f"sl-{sym}-{_now_ms()}",
-            "executePrice": "0",  # market
+            "executePrice": "0",
         }
 
         resp = await self._request_any_status("POST", "/api/v2/mix/order/place-plan-order", data=payload, auth=True)
         if resp.get("ok") is True:
             resp["qty"] = q_qty
+            resp["triggerPrice"] = q_trigger
         return resp
 
-    async def cancel_plan_orders(
-        self,
-        symbol: str,
-        order_ids: list[str],
-    ) -> Dict[str, Any]:
-        """
-        Cancel trigger orders:
-          POST /api/v2/mix/order/cancel-plan-order
-        """
+    async def cancel_plan_orders(self, symbol: str, order_ids: list[str]) -> Dict[str, Any]:
         sym = (symbol or "").upper()
         payload = {
             "symbol": sym,
@@ -401,35 +404,22 @@ class BitgetTrader:
         order_id: Optional[str] = None,
         client_oid: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Order detail:
-          GET /api/v2/mix/order/detail?symbol=...&productType=...&orderId=...&clientOid=...
-        """
         sym = (symbol or "").upper()
-        params: Dict[str, Any] = {
-            "symbol": sym,
-            "productType": self.product_type,
-        }
+        params: Dict[str, Any] = {"symbol": sym, "productType": self.product_type}
         if order_id:
             params["orderId"] = order_id
         if client_oid:
             params["clientOid"] = client_oid
-
         return await self._request_any_status("GET", "/api/v2/mix/order/detail", params=params, auth=True)
-
-    # ---------------------------------------------------------------
 
     @staticmethod
     def is_filled(order_detail_resp: Dict[str, Any]) -> bool:
         if not _is_ok(order_detail_resp):
             return False
         data = order_detail_resp.get("data") or {}
-        # Common state fields on Bitget:
         state = str(data.get("state") or data.get("status") or "").lower()
         if state in {"filled", "full_fill", "fullfill", "completed", "success"}:
             return True
-
-        # Fallback: check filled size vs size
         filled = _safe_float(data.get("baseVolume") or data.get("filledQty") or data.get("filledSize"), 0.0)
         size = _safe_float(data.get("size") or data.get("quantity") or data.get("qty"), 0.0)
         return (size > 0) and (filled >= size * 0.999)
