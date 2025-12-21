@@ -5,12 +5,9 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
-import math
-import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import pandas as pd
 
@@ -27,8 +24,6 @@ from settings import (
     MARGIN_USDT,
     LEVERAGE,
     RISK_USDT,
-    PRODUCT_TYPE,
-    MARGIN_COIN,
 )
 
 from bitget_client import get_client
@@ -52,26 +47,22 @@ TF_H1 = "1H"
 TF_H4 = "4H"
 CANDLE_LIMIT = 200
 
+# Concurrency scan (évite de spammer l’API)
 MAX_CONCURRENT_FETCH = 8
-
-# Bitget exige marginMode dans les ordres v2 (sinon 400172)
-MARGIN_MODE = os.getenv("MARGIN_MODE", "isolated")  # "isolated" ou "crossed" selon ton compte
-
-# Cache metas: symbol -> meta
-_META_CACHE: Dict[str, Dict[str, Any]] = {}
-_META_TS: Dict[str, float] = {}
-_META_TTL = 300  # 5 min
 
 
 # =====================================================================
-# Telegram
+# Telegram (async-safe via to_thread)
 # =====================================================================
 
 async def send_telegram(msg: str) -> None:
+    """
+    Envoi Telegram sans bloquer l'event loop.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    import requests  # local import
+    import requests  # local import pour éviter overhead si telegram désactivé
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -95,6 +86,10 @@ async def send_telegram(msg: str) -> None:
 # =====================================================================
 
 def _is_ok(resp: Any) -> bool:
+    """
+    Bitget success: code == "00000"
+    BitgetTrader ajoute resp["ok"].
+    """
     if not isinstance(resp, dict):
         return False
     if resp.get("ok") is True:
@@ -105,49 +100,6 @@ def _is_ok(resp: Any) -> bool:
 def _side_to_direction(side: str) -> str:
     s = (side or "").upper()
     return "LONG" if s == "BUY" else "SHORT"
-
-
-def _to_buy_sell(side: str) -> str:
-    return "buy" if (side or "").upper() == "BUY" else "sell"
-
-
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-
-def _estimate_tick(price: float) -> float:
-    p = abs(float(price))
-    if p >= 10000:
-        return 1.0
-    if p >= 1000:
-        return 0.1
-    if p >= 100:
-        return 0.01
-    if p >= 10:
-        return 0.001
-    if p >= 1:
-        return 0.0001
-    if p >= 0.1:
-        return 0.00001
-    if p >= 0.01:
-        return 0.000001
-    return 0.0000001
-
-
-def _quantize_floor(value: float, step: float) -> float:
-    if step <= 0:
-        return float(value)
-    return math.floor(float(value) / step) * step
-
-
-def _fmt(v: float, decimals: int) -> str:
-    decimals = max(0, int(decimals))
-    return f"{float(v):.{decimals}f}"
 
 
 def _build_signal_message(result: Dict[str, Any]) -> str:
@@ -176,10 +128,7 @@ def _build_signal_message(result: Dict[str, Any]) -> str:
     if tp2 is not None:
         msg += f"• TP2: `{tp2}`\n"
     if rr is not None:
-        try:
-            msg += f"• RR: `{round(float(rr), 3)}`\n"
-        except Exception:
-            msg += f"• RR: `{rr}`\n"
+        msg += f"• RR: `{round(float(rr), 3)}`\n"
     if setup:
         msg += f"• Setup: `{setup}`\n"
 
@@ -198,145 +147,8 @@ def _build_signal_message(result: Dict[str, Any]) -> str:
     return msg
 
 
-def _make_trader() -> BitgetTrader:
-    """
-    Compat avec ta classe BitgetTrader (qui attend target_margin_usdt/leverage).
-    """
-    sig = inspect.signature(BitgetTrader.__init__)
-    kwargs: Dict[str, Any] = {}
-
-    if "target_margin_usdt" in sig.parameters:
-        kwargs["target_margin_usdt"] = float(MARGIN_USDT)
-    if "leverage" in sig.parameters:
-        kwargs["leverage"] = float(LEVERAGE)
-
-    if "product_type" in sig.parameters:
-        kwargs["product_type"] = PRODUCT_TYPE
-    if "margin_coin" in sig.parameters:
-        kwargs["margin_coin"] = MARGIN_COIN
-
-    return BitgetTrader(API_KEY, API_SECRET, API_PASSPHRASE, **kwargs)
-
-
 # =====================================================================
-# Meta fetch (safe)
-# =====================================================================
-
-async def _get_contract_meta(client, symbol: str) -> Optional[Dict[str, Any]]:
-    now = time.time()
-    ts = _META_TS.get(symbol, 0.0)
-    if symbol in _META_CACHE and (now - ts) < _META_TTL:
-        return _META_CACHE[symbol]
-
-    params = {"productType": PRODUCT_TYPE, "symbol": symbol}
-    try:
-        js = await client._request("GET", "/api/v2/mix/market/contracts", params=params, auth=False)
-    except Exception as e:
-        logger.error("[META] fetch error %s: %s", symbol, e)
-        return None
-
-    data = js.get("data") if isinstance(js, dict) else None
-    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
-        logger.error("[META] empty/unexpected for %s: %s", symbol, js)
-        return None
-
-    c = data[0]
-    try:
-        price_place = int(c.get("pricePlace", 0))
-        price_end_step = float(c.get("priceEndStep", 1))
-        volume_place = int(c.get("volumePlace", 0))
-        size_multiplier = float(c.get("sizeMultiplier", 1))
-        min_trade_num = float(c.get("minTradeNum", 0))
-
-        tick = price_end_step * (10 ** -max(price_place, 0))
-
-        meta = {
-            "price_place": price_place,
-            "volume_place": volume_place,
-            "tick": float(tick),
-            "step": float(size_multiplier),
-            "min_trade_num": float(min_trade_num),
-        }
-
-        _META_CACHE[symbol] = meta
-        _META_TS[symbol] = now
-        return meta
-    except Exception as e:
-        logger.error("[META] parse error %s: %s | raw=%s", symbol, e, c)
-        return None
-
-
-# =====================================================================
-# Execution (direct via _request keyword-only)
-# =====================================================================
-
-async def _place_limit_direct(
-    trader: BitgetTrader,
-    client,
-    symbol: str,
-    side_buy_sell: str,
-    entry: float,
-    notional: float,
-    client_oid: str,
-) -> Optional[Dict[str, Any]]:
-    meta = await _get_contract_meta(client, symbol)
-
-    tick = float(meta["tick"]) if meta and meta.get("tick") else 0.0
-    if tick <= 0 or tick >= entry:
-        tick = _estimate_tick(entry)
-
-    step = float(meta["step"]) if meta and meta.get("step") else 0.0
-    if step <= 0:
-        step = 1.0
-
-    price_place = int(meta["price_place"]) if meta else 6
-    volume_place = int(meta["volume_place"]) if meta else 4
-    min_trade = float(meta["min_trade_num"]) if meta else 0.0
-
-    q_price = _quantize_floor(entry, tick)
-    if q_price <= 0:
-        q_price = float(entry)
-
-    raw_size = float(notional) / float(q_price)
-    q_size = _quantize_floor(raw_size, step)
-
-    if min_trade > 0 and q_size < min_trade:
-        logger.error("[EXEC] %s size %.8f < minTradeNum %.8f", symbol, q_size, min_trade)
-        return None
-
-    payload = {
-        "symbol": symbol,
-        "productType": PRODUCT_TYPE,
-        "marginCoin": MARGIN_COIN,
-        "marginMode": MARGIN_MODE,   # ✅ FIX: obligatoire
-        "size": _fmt(q_size, volume_place),
-        "price": _fmt(q_price, price_place),
-        "side": side_buy_sell,       # "buy"/"sell"
-        "orderType": "limit",
-        "timeInForceValue": "normal",
-        "clientOid": str(client_oid),
-    }
-
-    logger.info(
-        "[EXEC] place LIMIT %s %s price=%s size=%s notional≈%.2f (marginMode=%s)",
-        symbol, side_buy_sell, payload["price"], payload["size"], q_price * q_size, MARGIN_MODE
-    )
-
-    try:
-        resp = await trader._request(
-            "POST",
-            "/api/v2/mix/order/place-order",
-            data=payload,
-            auth=True,
-        )
-        return resp if isinstance(resp, dict) else None
-    except Exception as e:
-        logger.error("[EXEC] place-order HTTP error %s: %s", symbol, e)
-        return None
-
-
-# =====================================================================
-# Market data
+# Core processing
 # =====================================================================
 
 async def _fetch_dfs(client, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -351,10 +163,6 @@ async def _fetch_dfs(client, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return df_h1, df_h4
 
 
-# =====================================================================
-# Core processing
-# =====================================================================
-
 async def process_symbol(
     symbol: str,
     client,
@@ -363,7 +171,15 @@ async def process_symbol(
     order_budget: asyncio.Semaphore,
     fetch_sem: asyncio.Semaphore,
 ) -> None:
-    acquired_budget = False
+    """
+    Pipeline complet :
+    - fetch H1/H4
+    - analyze
+    - duplicate guard
+    - risk checks
+    - telegram
+    - place limit
+    """
     try:
         async with fetch_sem:
             df_h1, df_h4 = await _fetch_dfs(client, symbol)
@@ -375,7 +191,9 @@ async def process_symbol(
         if len(df_h1) < 80 or len(df_h4) < 80:
             return
 
-        macro = {}
+        logger.info("[SCAN] %s analyzing...", symbol)
+
+        macro = {}  # placeholder si tu ajoutes macro plus tard
         result = await analyzer.analyze(symbol, df_h1, df_h4, macro)
 
         if not result or not result.get("valid"):
@@ -387,30 +205,34 @@ async def process_symbol(
 
         direction = _side_to_direction(side)
 
-        entry = _safe_float(result.get("entry"), 0.0)
-        sl = _safe_float(result.get("sl"), 0.0)
-        tp1 = _safe_float(result.get("tp1"), 0.0)
-
-        if entry <= 0:
+        # Données trade
+        entry = float(result.get("entry", 0.0) or 0.0)
+        sl = float(result.get("sl", 0.0) or 0.0)
+        if entry <= 0 or sl <= 0 or abs(entry - sl) < 1e-12:
+            logger.warning("[SKIP] %s invalid entry/sl entry=%s sl=%s", symbol, entry, sl)
             return
+
+        tp1 = result.get("tp1")
+        tp1_val = float(tp1) if tp1 is not None else 0.0
 
         rr = result.get("rr")
         setup = result.get("setup_type")
-
         inst = result.get("institutional") or {}
         inst_score = inst.get("institutional_score", 0)
 
-        fp = make_fingerprint(symbol, side, entry, sl, tp1, extra=setup, precision=6)
+        # Fingerprint stable anti-doublons
+        fp = make_fingerprint(symbol, side, entry, sl, tp1_val, extra=setup, precision=6)
         if DUP_GUARD.is_duplicate(fp):
             logger.info("[DUP] skip %s %s (déjà envoyé)", symbol, side)
             return
 
+        # Risk gating (niveau desk)
         notional = float(MARGIN_USDT) * float(LEVERAGE)
         allowed, reason = RISK.can_trade(
             symbol=symbol,
             side=direction,
             notional=notional,
-            rr=_safe_float(rr, 0.0) if rr is not None else None,
+            rr=float(rr) if rr is not None else None,
             inst_score=int(inst_score) if inst_score is not None else 0,
             commitment=None,
         )
@@ -418,48 +240,52 @@ async def process_symbol(
             logger.info("[RISK] reject %s %s → %s", symbol, direction, reason)
             return
 
+        # Telegram + mark duplicate
         await send_telegram(_build_signal_message(result))
         DUP_GUARD.mark(fp)
 
         if DRY_RUN:
             return
 
+        # Budget ordres par scan (non bloquant)
         try:
             await asyncio.wait_for(order_budget.acquire(), timeout=0.01)
-            acquired_budget = True
         except asyncio.TimeoutError:
             logger.info("[BUDGET] max orders per scan atteint → skip %s", symbol)
             return
 
-        side_bs = _to_buy_sell(side)
-        client_oid_entry = f"entry-{symbol}-{int(time.time() * 1000)}"
+        client_oid = f"{symbol}-{int(time.time() * 1000)}"
 
-        entry_res = await _place_limit_direct(
-            trader=trader,
-            client=client,
+        # Place LIMIT (BitgetTrader gère marginMode + fallback tradeSide si besoin)
+        entry_res = await trader.place_limit(
             symbol=symbol,
-            side_buy_sell=side_bs,
-            entry=entry,
-            notional=notional,
-            client_oid=client_oid_entry,
+            side=side,
+            price=entry,
+            size=None,                # sizing auto via marge*levier
+            client_oid=client_oid,
+            preset_sl=sl,             # ignoré volontairement dans trader (stabilité)
+            preset_tp=(tp1_val if tp1_val > 0 else None),
         )
 
         if not _is_ok(entry_res):
             logger.error("[ENTRY] FAILED %s → %s", symbol, entry_res)
-            await send_telegram(f"❌ *ENTRY FAILED* {symbol} {side} @ `{entry}`\n`{entry_res}`")
+            await send_telegram(
+                f"❌ *ENTRY FAILED* {symbol} {side} @ `{entry}`\n`{entry_res}`"
+            )
             return
 
-        RISK.register_open(symbol=symbol, side=direction, notional=notional, risk=float(RISK_USDT))
-        logger.info("[ENTRY] OK %s %s @ %s (oid=%s)", symbol, side, entry, client_oid_entry)
+        # Register open (approx)
+        RISK.register_open(
+            symbol=symbol,
+            side=direction,
+            notional=notional,
+            risk=float(RISK_USDT),
+        )
 
-    except Exception:
-        logger.exception("[%s] process_symbol error", symbol)
-    finally:
-        if acquired_budget:
-            try:
-                order_budget.release()
-            except Exception:
-                pass
+        logger.info("[ENTRY] OK %s %s @ %s (oid=%s)", symbol, side, entry, client_oid)
+
+    except Exception as e:
+        logger.exception("[%s] process_symbol error: %s", symbol, e)
 
 
 # =====================================================================
@@ -472,8 +298,11 @@ async def scan_once(client, analyzer: SignalAnalyzer, trader: BitgetTrader) -> N
         logger.warning("⚠️ get_contracts_list() vide")
         return
 
-    symbols = list(symbols)[: int(TOP_N_SYMBOLS)]
-    logger.info("=== START SCAN (%d symbols) ===", len(symbols))
+    # Dedup (évite d'analyser 2-3 fois le même symbole)
+    symbols = sorted(set(map(str.upper, symbols)))
+    symbols = symbols[: int(TOP_N_SYMBOLS)]
+
+    logger.info("📊 Scan %d symboles (TOP_N_SYMBOLS=%s)", len(symbols), TOP_N_SYMBOLS)
 
     fetch_sem = asyncio.Semaphore(MAX_CONCURRENT_FETCH)
     order_budget = asyncio.Semaphore(int(MAX_ORDERS_PER_SCAN))
@@ -483,32 +312,42 @@ async def scan_once(client, analyzer: SignalAnalyzer, trader: BitgetTrader) -> N
 
     await asyncio.gather(*[_worker(sym) for sym in symbols])
 
-    logger.info("=== END SCAN ===")
-
 
 async def start_scanner() -> None:
+    """
+    Démarre le scanner en boucle infinie.
+    """
     logging.basicConfig(level=logging.INFO)
 
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
-    trader = _make_trader()
+
+    # IMPORTANT: on passe le client, et on utilise margin_usdt/leverage de settings
+    trader = BitgetTrader(
+        client,
+        margin_usdt=float(MARGIN_USDT),
+        leverage=float(LEVERAGE),
+        margin_mode="isolated",
+    )
+
     analyzer = SignalAnalyzer()
 
-    logger.info(
-        "🚀 Scanner started | interval=%s min | dry_run=%s | marginMode=%s",
-        SCAN_INTERVAL_MIN, DRY_RUN, MARGIN_MODE
-    )
+    logger.info("🚀 Scanner started | interval=%s min | dry_run=%s", SCAN_INTERVAL_MIN, DRY_RUN)
 
     while True:
         t0 = time.time()
         try:
             await scan_once(client, analyzer, trader)
-        except Exception:
-            logger.exception("SCAN ERROR")
+        except Exception as e:
+            logger.exception("SCAN ERROR: %s", e)
 
         dt = time.time() - t0
         sleep_s = max(1, int(float(SCAN_INTERVAL_MIN) * 60 - dt))
         await asyncio.sleep(sleep_s)
 
+
+# =====================================================================
+# MODE LOCAL
+# =====================================================================
 
 if __name__ == "__main__":
     try:
