@@ -1,9 +1,12 @@
 # =====================================================================
 # scanner.py — Bitget Desk Lead Scanner (Institutionnel H1 + Validation H4)
 # + Exec: ENTRY -> (TP1/TP2 + SL) after fill, SL->BE after TP1
-# FIXES:
-#   - SL rounding direction fixed (prevents wrong SL placement)
-#   - unique clientOid per retry (prevents 40786 Duplicate clientOid)
+# + Exchange guards:
+#   - tick fallback smart (fix entry=0/1 -> 40020 Parameter price error)
+#   - price quantization to tickSize
+#   - TP clamp/retry on price band (fix 22047 max/min price limit)
+#   - IMPORTANT: place SL first and persist it even if TP fails (never naked)
+#   - avoid duplicate clientOid in watcher retries (fix 40786 Duplicate clientOid)
 # =====================================================================
 
 from __future__ import annotations
@@ -60,12 +63,14 @@ MAX_CONCURRENT_FETCH = 8
 TP1_CLOSE_PCT = 0.50
 WATCH_INTERVAL_S = 3.0
 
-# reduce noisy modules (tu peux remettre INFO si tu veux)
+# reduce noisy modules
 logging.getLogger("analyze_signal").setLevel(logging.WARNING)
 logging.getLogger("institutional_data").setLevel(logging.WARNING)
 
+# sampled rejects (avoid flood)
 REJECT_DEBUG_SAMPLES = 25
 
+# watcher retry control
 ARM_MAX_ATTEMPTS = 10
 ARM_COOLDOWN_S = 10.0
 
@@ -88,8 +93,8 @@ def desk_log(level: int, tag: str, symbol: str, tid: str = "-", **kv: Any) -> No
     logger.log(level, " ".join(parts))
 
 def _oid(prefix: str, tid: str, attempt: int) -> str:
-    # Bitget rejects duplicates => include uuid + ms
-    return f"{prefix}-{tid}-{attempt}-{uuid.uuid4().hex[:6]}-{int(time.time()*1000)}"
+    # unique clientOid per attempt (Bitget rejects duplicates)
+    return f"{prefix}-{tid}-{attempt}-{int(time.time()*1000)}"
 
 # =====================================================================
 # Telegram
@@ -150,6 +155,42 @@ def _be_price(entry: float, tick: float, side: str) -> float:
         return float(entry + buf * tick)
     return float(entry - buf * tick)
 
+def _estimate_tick_from_price(price: float) -> float:
+    p = abs(float(price))
+    if p >= 10000:
+        return 1.0
+    elif p >= 1000:
+        return 0.1
+    elif p >= 100:
+        return 0.01
+    elif p >= 10:
+        return 0.001
+    elif p >= 1:
+        return 0.0001
+    elif p >= 0.1:
+        return 0.00001
+    elif p >= 0.01:
+        return 0.000001
+    else:
+        return 0.0000001
+
+def _sanitize_tick(symbol: str, entry: float, tick: float, tid: str) -> float:
+    """
+    Fix 40020:
+    - If tick meta is wrong (often 1.0), entry quantization becomes 0 or 1.
+    - We fallback to an estimated tick based on entry price when tick looks suspicious.
+    """
+    est = _estimate_tick_from_price(entry)
+    t = float(tick or 0.0)
+
+    # suspicious if: tick is 0 OR tick is huge vs estimated tick
+    # ex: est=1e-6 for price=0.002 ; meta tick=1.0 => 1.0 > 1e-3 (est*1000) => fallback
+    if t <= 0 or t > est * 1000:
+        desk_log(logging.WARNING, "TICK", symbol, tid, tick_meta=t, tick_est=est, entry=entry, action="fallback")
+        return est
+
+    return t
+
 # --- Quantize strict ---
 def _q_floor(price: float, tick: float) -> float:
     if tick <= 0:
@@ -162,6 +203,8 @@ def _q_ceil(price: float, tick: float) -> float:
     return float(math.ceil(price / tick) * tick)
 
 def _q_entry(price: float, tick: float, side: str) -> float:
+    # BUY entry: floor (avoid rounding up)
+    # SELL entry: ceil (avoid rounding down)
     if tick <= 0:
         return float(price)
     if (side or "").upper() == "BUY":
@@ -182,6 +225,11 @@ def _parse_band(msg: str) -> Tuple[Optional[float], Optional[float]]:
     return mn, mx
 
 def _clamp_and_quantize(price: float, tick: float, mn: Optional[float], mx: Optional[float]) -> Optional[float]:
+    """
+    Critical: DO NOT use round here.
+    - if mx exists -> clamp then FLOOR
+    - if mn exists -> clamp then CEIL
+    """
     p = float(price)
     if tick <= 0:
         if mx is not None:
@@ -190,6 +238,7 @@ def _clamp_and_quantize(price: float, tick: float, mn: Optional[float], mx: Opti
             p = max(p, float(mn))
         return p if p > 0 else None
 
+    # keep a small safety buffer inside band
     if mx is not None:
         p = min(p, float(mx) - 2.0 * tick)
         p = _q_floor(p, tick)
@@ -223,8 +272,9 @@ def _has_key_fields_for_trade(result: Dict[str, Any]) -> bool:
     entry = _safe_float(result.get("entry"), 0.0)
     sl = _safe_float(result.get("sl"), 0.0)
     tp1 = _safe_float(result.get("tp1"), 0.0)
+    tp2 = _safe_float(result.get("tp2"), 0.0)
     rr = _safe_float(result.get("rr"), 0.0)
-    return entry > 0 and sl > 0 and tp1 > 0 and rr > 0
+    return entry > 0 and sl > 0 and tp1 > 0 and tp2 > 0 and rr > 0
 
 def _build_signal_message(result: Dict[str, Any], tid: str) -> str:
     symbol = result.get("symbol", "?")
@@ -241,6 +291,7 @@ def _build_signal_message(result: Dict[str, Any], tid: str) -> str:
     flow_regime = inst.get("flow_regime")
     funding = inst.get("funding_rate")
     crowd = inst.get("crowding_regime")
+    bypass = inst.get("bypass_min_inst")
 
     msg = (
         f"🎯 *SIGNAL {symbol}* → *{side}*\n"
@@ -259,6 +310,8 @@ def _build_signal_message(result: Dict[str, Any], tid: str) -> str:
 
     if inst_score is not None:
         msg += f"\n🏛 *Institutionnel*\n• Score: `{inst_score}`"
+        if bypass:
+            msg += "\n• Mode: `OPTION2 (unmapped bypass)`"
         if flow_regime:
             msg += f"\n• Flow: `{flow_regime}`"
         if crowd:
@@ -434,8 +487,25 @@ async def process_symbol(
             await stats.add_reason("budget:max_orders_per_scan")
             return
 
-        tick = await _get_tick_cached(trader, symbol)
+        tick_meta = await _get_tick_cached(trader, symbol)
+        tick = _sanitize_tick(symbol, entry, tick_meta, tid)
+
         q_entry = _q_entry(entry, tick, side)
+        if q_entry <= 0:
+            # last-resort fallback
+            est = _estimate_tick_from_price(entry)
+            tick2 = est
+            q_entry = _q_entry(entry, tick2, side)
+            desk_log(logging.WARNING, "EXEC", symbol, tid, action="entry_q_fallback", entry_raw=entry, q_entry=q_entry, tick=tick2)
+
+        if q_entry <= 0:
+            await stats.inc("exec_failed", 1)
+            await stats.add_reason("entry_q_zero")
+            try:
+                order_budget.release()
+            except Exception:
+                pass
+            return
 
         await stats.inc("exec_sent", 1)
         desk_log(logging.INFO, "EXEC", symbol, tid, action="entry_send", entry=q_entry, notional=round(notional, 2), oid=f"entry-{tid}")
@@ -479,6 +549,7 @@ async def process_symbol(
                 "qty_tp2": 0.0,
                 "entry_order_id": str(entry_order_id) if entry_order_id else None,
                 "entry_client_oid": f"entry-{tid}",
+                # arming state (idempotent)
                 "sl_plan_id": None,
                 "tp1_order_id": None,
                 "tp2_order_id": None,
@@ -520,8 +591,9 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                 tp1 = float(st["tp1"])
                 tp2 = float(st["tp2"])
 
-                # ---- not armed: fill -> SL -> TP1 -> TP2 ----
+                # ---- not armed: fill -> SL (once) -> TP1 -> TP2 ----
                 if not st["armed"]:
+                    # cooldown
                     last_fail = float(st.get("last_arm_fail_ts") or 0.0)
                     if last_fail > 0 and (time.time() - last_fail) < ARM_COOLDOWN_S:
                         continue
@@ -553,7 +625,8 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         desk_log(logging.WARNING, "WATCH", sym, tid, step="entry_filled_no_qty")
                         continue
 
-                    tick = await _get_tick_cached(trader, sym)
+                    tick_meta = await _get_tick_cached(trader, sym)
+                    tick = _sanitize_tick(sym, entry, tick_meta, tid)
                     if tick <= 0:
                         st["arm_attempts"] = attempts + 1
                         st["last_arm_fail_ts"] = time.time()
@@ -565,13 +638,9 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                     desk_log(logging.INFO, "WATCH", sym, tid, step="arm_start", qty_total=qty_total)
 
-                    # 1) SL: place ONCE
+                    # 1) SL: place ONCE (if not already placed)
                     if not st.get("sl_plan_id"):
-                        # FIX SL rounding:
-                        # close long => SELL stop => FLOOR
-                        # close short => BUY stop => CEIL
-                        q_sl = _q_floor(sl, tick) if close_side == "SELL" else _q_ceil(sl, tick)
-
+                        q_sl = _q_ceil(sl, tick) if close_side == "SELL" else _q_floor(sl, tick)  # conservative
                         sl_resp = await trader.place_stop_market_sl(
                             symbol=sym,
                             close_side=close_side.lower(),
@@ -595,7 +664,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                         desk_log(logging.INFO, "WATCH", sym, tid, step="sl_ok", sl=q_sl)
 
-                    # 2) TP1
+                    # 2) TP1: place if missing
                     if not st.get("tp1_order_id"):
                         q_tp1 = _q_floor(tp1, tick) if close_side == "SELL" else _q_ceil(tp1, tick)
 
@@ -607,6 +676,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                             client_oid=_oid("tp1", tid, attempts),
                         )
 
+                        # retry on band error 22047
                         if (not _is_ok(tp1_resp)) and str(tp1_resp.get("code")) == "22047":
                             mn, mx = _parse_band(str(tp1_resp.get("msg") or ""))
                             clamped = _clamp_and_quantize(q_tp1, tick, mn, mx)
@@ -638,7 +708,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                         desk_log(logging.INFO, "WATCH", sym, tid, step="tp1_ok", tp1=q_tp1)
 
-                    # 3) TP2
+                    # 3) TP2: place if missing
                     if not st.get("tp2_order_id"):
                         q_tp2 = _q_floor(tp2, tick) if close_side == "SELL" else _q_ceil(tp2, tick)
 
@@ -681,6 +751,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                         desk_log(logging.INFO, "WATCH", sym, tid, step="tp2_ok", tp2=q_tp2)
 
+                    # All protections are set => armed
                     async with PENDING_LOCK:
                         if tid in PENDING:
                             PENDING[tid]["armed"] = True
@@ -709,12 +780,11 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     if not trader.is_filled(tp1_detail):
                         continue
 
-                    tick = await _get_tick_cached(trader, sym)
-                    new_sl = _be_price(entry, tick, entry_side)
+                    tick_meta = await _get_tick_cached(trader, sym)
+                    tick = _sanitize_tick(sym, entry, tick_meta, tid)
 
-                    # FIX BE rounding:
-                    # close long => SELL => FLOOR, close short => BUY => CEIL
-                    new_sl = _q_floor(new_sl, tick) if close_side == "SELL" else _q_ceil(new_sl, tick)
+                    new_sl = _be_price(entry, tick, entry_side)
+                    new_sl = _q_ceil(new_sl, tick) if close_side == "SELL" else _q_floor(new_sl, tick)
 
                     old_sl_id = st.get("sl_plan_id")
                     if old_sl_id and old_sl_id not in ("ok", None):
