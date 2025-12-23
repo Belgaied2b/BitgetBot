@@ -1,12 +1,9 @@
 # =====================================================================
 # scanner.py — Bitget Desk Lead Scanner (Institutionnel H1 + Validation H4)
 # + Exec: ENTRY -> (TP1/TP2 + SL) after fill, SL->BE after TP1
-# + Exchange guards:
-#   - price quantization to tickSize (fix 40020 Parameter price error)
-#   - TP clamp/retry on price band (fix 22047 max/min price limit)
-#   - IMPORTANT: place SL first and persist it even if TP fails (never naked)
-#   - avoid duplicate clientOid in watcher retries (fix 40786 Duplicate clientOid)
-# + DEBUG: re-enable analyze_signal / institutional_data logs (rate-limited)
+# FIXES:
+#   - SL rounding direction fixed (prevents wrong SL placement)
+#   - unique clientOid per retry (prevents 40786 Duplicate clientOid)
 # =====================================================================
 
 from __future__ import annotations
@@ -63,72 +60,14 @@ MAX_CONCURRENT_FETCH = 8
 TP1_CLOSE_PCT = 0.50
 WATCH_INTERVAL_S = 3.0
 
-# sampled logs (avoid flood)
-REJECT_DEBUG_SAMPLES = 40
-SKIP_DEBUG_SAMPLES = 25
+# reduce noisy modules (tu peux remettre INFO si tu veux)
+logging.getLogger("analyze_signal").setLevel(logging.WARNING)
+logging.getLogger("institutional_data").setLevel(logging.WARNING)
 
-# watcher retry control
+REJECT_DEBUG_SAMPLES = 25
+
 ARM_MAX_ATTEMPTS = 10
 ARM_COOLDOWN_S = 10.0
-
-# =====================================================================
-# 🔥 Detailed logs from analyze_signal (rate-limited)
-# =====================================================================
-
-ANALYZE_MAX_LINES_PER_SCAN = 220  # monte à 500 si tu veux très verbeux
-
-class _RateGateFilter(logging.Filter):
-    """
-    Let pass:
-      - WARNING/ERROR always
-      - INFO only if message contains key tags (EVAL_REJECT / INST_RAW / EVAL_PRE / EVAL)
-    And limit total lines per scan to avoid 5000+ logs.
-    """
-    def __init__(self, max_lines: int):
-        super().__init__()
-        self.max_lines = int(max_lines)
-        self.left = int(max_lines)
-
-    def reset(self):
-        self.left = int(self.max_lines)
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        # always allow warnings/errors
-        if record.levelno >= logging.WARNING:
-            return True
-
-        msg = record.getMessage()
-
-        # keep important analysis lines (these show the REAL reasons)
-        keep = (
-            "[EVAL_REJECT]" in msg
-            or "[INST_RAW]" in msg
-            or "[EVAL_PRE]" in msg
-            or "[EVAL]" in msg
-        )
-        if not keep:
-            return False
-
-        if self.left <= 0:
-            return False
-        self.left -= 1
-        return True
-
-ANALYZE_GATE = _RateGateFilter(ANALYZE_MAX_LINES_PER_SCAN)
-
-def _enable_detail_logs() -> None:
-    # analyze_signal detailed
-    an = logging.getLogger("analyze_signal")
-    an.setLevel(logging.INFO)
-    an.propagate = True
-    # avoid stacking multiple filters if hot-reload
-    an.filters = [f for f in an.filters if not isinstance(f, _RateGateFilter)]
-    an.addFilter(ANALYZE_GATE)
-
-    # institutional_data detailed (useful for symbol mapping)
-    inst = logging.getLogger("institutional_data")
-    inst.setLevel(logging.INFO)
-    inst.propagate = True
 
 # =====================================================================
 # Desk logging
@@ -149,7 +88,8 @@ def desk_log(level: int, tag: str, symbol: str, tid: str = "-", **kv: Any) -> No
     logger.log(level, " ".join(parts))
 
 def _oid(prefix: str, tid: str, attempt: int) -> str:
-    return f"{prefix}-{tid}-{attempt}-{int(time.time()*1000)}"
+    # Bitget rejects duplicates => include uuid + ms
+    return f"{prefix}-{tid}-{attempt}-{uuid.uuid4().hex[:6]}-{int(time.time()*1000)}"
 
 # =====================================================================
 # Telegram
@@ -380,7 +320,6 @@ class ScanStats:
         self.exec_failed = 0
         self.reasons = Counter()
         self.reject_debug_left = REJECT_DEBUG_SAMPLES
-        self.skip_debug_left = SKIP_DEBUG_SAMPLES
 
     async def inc(self, field: str, n: int = 1) -> None:
         async with self.lock:
@@ -395,13 +334,6 @@ class ScanStats:
             if self.reject_debug_left <= 0:
                 return False
             self.reject_debug_left -= 1
-            return True
-
-    async def take_skip_debug_slot(self) -> bool:
-        async with self.lock:
-            if self.skip_debug_left <= 0:
-                return False
-            self.skip_debug_left -= 1
             return True
 
 # =====================================================================
@@ -428,11 +360,9 @@ async def process_symbol(
 
         if df_h1 is None or df_h4 is None or getattr(df_h1, "empty", True) or getattr(df_h4, "empty", True):
             await stats.inc("skips", 1)
-            await stats.add_reason("skip:empty_df")
             return
         if len(df_h1) < 80 or len(df_h4) < 80:
             await stats.inc("skips", 1)
-            await stats.add_reason("skip:not_enough_candles")
             return
 
         t1 = time.time()
@@ -464,29 +394,11 @@ async def process_symbol(
         if entry <= 0 or sl <= 0 or tp1 <= 0 or tp2 <= 0:
             await stats.inc("skips", 1)
             await stats.add_reason("missing_tp")
-            if await stats.take_skip_debug_slot():
-                desk_log(
-                    logging.INFO,
-                    "SKIP",
-                    symbol,
-                    tid,
-                    fetch_ms=fetch_ms,
-                    analyze_ms=analyze_ms,
-                    why="missing_tp_or_sl",
-                    side=side,
-                    entry=entry,
-                    sl=sl,
-                    tp1=tp1,
-                    tp2=tp2,
-                    rr=rr,
-                    setup=setup,
-                )
             return
 
         fp = make_fingerprint(symbol, side, entry, sl, tp1, extra=setup, precision=6)
         if DUP_GUARD.is_duplicate(fp):
             await stats.inc("duplicates", 1)
-            await stats.add_reason("dup")
             return
 
         direction = _side_to_direction(side)
@@ -608,6 +520,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                 tp1 = float(st["tp1"])
                 tp2 = float(st["tp2"])
 
+                # ---- not armed: fill -> SL -> TP1 -> TP2 ----
                 if not st["armed"]:
                     last_fail = float(st.get("last_arm_fail_ts") or 0.0)
                     if last_fail > 0 and (time.time() - last_fail) < ARM_COOLDOWN_S:
@@ -652,9 +565,13 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                     desk_log(logging.INFO, "WATCH", sym, tid, step="arm_start", qty_total=qty_total)
 
-                    # 1) SL first (never naked)
+                    # 1) SL: place ONCE
                     if not st.get("sl_plan_id"):
-                        q_sl = _q_ceil(sl, tick) if close_side == "SELL" else _q_floor(sl, tick)
+                        # FIX SL rounding:
+                        # close long => SELL stop => FLOOR
+                        # close short => BUY stop => CEIL
+                        q_sl = _q_floor(sl, tick) if close_side == "SELL" else _q_ceil(sl, tick)
+
                         sl_resp = await trader.place_stop_market_sl(
                             symbol=sym,
                             close_side=close_side.lower(),
@@ -786,6 +703,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     )
                     continue
 
+                # ---- TP1 filled -> SL to BE ----
                 if st["armed"] and not st["tp1_done"]:
                     tp1_detail = await trader.get_order_detail(sym, order_id=st.get("tp1_order_id"))
                     if not trader.is_filled(tp1_detail):
@@ -793,7 +711,10 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                     tick = await _get_tick_cached(trader, sym)
                     new_sl = _be_price(entry, tick, entry_side)
-                    new_sl = _q_ceil(new_sl, tick) if close_side == "SELL" else _q_floor(new_sl, tick)
+
+                    # FIX BE rounding:
+                    # close long => SELL => FLOOR, close short => BUY => CEIL
+                    new_sl = _q_floor(new_sl, tick) if close_side == "SELL" else _q_ceil(new_sl, tick)
 
                     old_sl_id = st.get("sl_plan_id")
                     if old_sl_id and old_sl_id not in ("ok", None):
@@ -835,6 +756,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     )
                     continue
 
+                # ---- TP2 filled -> cleanup ----
                 if st["armed"]:
                     tp2_id = st.get("tp2_order_id")
                     if tp2_id:
@@ -865,9 +787,6 @@ async def scan_once(client, analyzer: SignalAnalyzer, trader: BitgetTrader) -> N
     stats = ScanStats()
     t_scan0 = time.time()
 
-    # reset analyze gate each scan so you see fresh EVAL_REJECT lines
-    ANALYZE_GATE.reset()
-
     symbols = await client.get_contracts_list()
     if not symbols:
         logger.warning("⚠️ get_contracts_list() vide")
@@ -885,7 +804,7 @@ async def scan_once(client, analyzer: SignalAnalyzer, trader: BitgetTrader) -> N
     await asyncio.gather(*[_worker(sym) for sym in symbols])
 
     dt = time.time() - t_scan0
-    reasons = stats.reasons.most_common(12)
+    reasons = stats.reasons.most_common(10)
     reasons_str = ", ".join([f"{k}:{v}" for k, v in reasons]) if reasons else "-"
 
     logger.info(
@@ -907,8 +826,6 @@ async def start_scanner() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
     )
-
-    _enable_detail_logs()
 
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
 
