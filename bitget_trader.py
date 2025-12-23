@@ -1,20 +1,29 @@
 # =====================================================================
 # bitget_trader.py — Bitget Execution (Entry + TP1/TP2 + SL->BE)
+# FIXES:
+# - strict tick quantization using Decimal (prevents 40020 price errors)
+# - direction-aware rounding
+# - quantize triggerPrice for plan SL
 # =====================================================================
 
 from __future__ import annotations
 
 import json
 import logging
-import math
 import time
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, getcontext
 from typing import Any, Dict, Optional, Tuple
 
 from settings import PRODUCT_TYPE, MARGIN_COIN
 
 logger = logging.getLogger(__name__)
+getcontext().prec = 28
 
+
+# =====================================================================
+# Helpers
+# =====================================================================
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -35,19 +44,48 @@ def _is_ok(resp: Any) -> bool:
     return str(resp.get("code", "")) == "00000"
 
 
-def _round_price(price: float, tick: float, rounding: str) -> float:
+def _d(x: Any) -> Decimal:
+    return Decimal(str(x))
+
+
+def _fmt_decimal(val: Decimal, places: int) -> str:
+    if places < 0:
+        return format(val, "f")
+    q = Decimal(1).scaleb(-places)  # 10^-places
+    return format(val.quantize(q), "f")
+
+
+def _quant_price(price: float, tick: float, *, mode: str) -> Decimal:
     """
-    rounding: "nearest" | "floor" | "ceil"
+    mode: 'floor' or 'ceil'
     """
     if tick <= 0:
-        return float(price)
-    x = price / tick
-    if rounding == "floor":
-        return math.floor(x) * tick
-    if rounding == "ceil":
-        return math.ceil(x) * tick
-    return round(x) * tick
+        return _d(price)
 
+    p = _d(price)
+    t = _d(tick)
+    steps = (p / t)
+
+    if mode == "ceil":
+        k = steps.to_integral_value(rounding=ROUND_CEILING)
+    else:
+        k = steps.to_integral_value(rounding=ROUND_FLOOR)
+
+    return k * t
+
+
+def _quant_qty(qty: float, step: float) -> Decimal:
+    if step <= 0:
+        return _d(qty)
+    q = _d(qty)
+    s = _d(step)
+    k = (q / s).to_integral_value(rounding=ROUND_FLOOR)
+    return k * s
+
+
+# =====================================================================
+# Contract meta cache (tick/lot)
+# =====================================================================
 
 @dataclass
 class ContractMeta:
@@ -93,7 +131,12 @@ class ContractMetaCache:
             qty_place = int(_safe_float(c.get("volumePlace"), 4))
 
             price_tick = _safe_float(c.get("priceEndStep"), 0.0) or (10 ** (-price_place))
-            qty_step = _safe_float(c.get("sizeMultiplier"), 0.0) or _safe_float(c.get("minTradeNum"), 0.0) or (10 ** (-qty_place))
+            qty_step = (
+                _safe_float(c.get("sizeMultiplier"), 0.0)
+                or _safe_float(c.get("minTradeNum"), 0.0)
+                or (10 ** (-qty_place))
+            )
+
             min_qty = _safe_float(c.get("minTradeNum"), 0.0) or qty_step
 
             by_symbol[sym] = ContractMeta(
@@ -115,6 +158,10 @@ class ContractMetaCache:
         return self._by_symbol.get(sym)
 
 
+# =====================================================================
+# Trader
+# =====================================================================
+
 class BitgetTrader:
     BASE = "https://api.bitget.com"
 
@@ -126,7 +173,7 @@ class BitgetTrader:
         margin_mode: str = "isolated",
         product_type: str = PRODUCT_TYPE,
         margin_coin: str = MARGIN_COIN,
-        target_margin_usdt: Optional[float] = None,  # alias compat
+        target_margin_usdt: Optional[float] = None,
     ):
         self.client = client
         self.margin_usdt = float(target_margin_usdt if target_margin_usdt is not None else margin_usdt)
@@ -154,8 +201,7 @@ class BitgetTrader:
 
         query = ""
         if params:
-            items = sorted(params.items(), key=lambda kv: kv[0])
-            query = "?" + "&".join(f"{k}={v}" for k, v in items)
+            query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
 
         url = self.BASE + path + query
         body = json.dumps(data, separators=(",", ":")) if data else ""
@@ -180,7 +226,6 @@ class BitgetTrader:
             ) as resp:
                 txt = await resp.text()
                 status = resp.status
-
                 try:
                     js = json.loads(txt) if txt else {}
                 except Exception:
@@ -195,51 +240,84 @@ class BitgetTrader:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    async def _get_meta(self, symbol: str) -> Optional[ContractMeta]:
+        return await self._meta.get(symbol)
+
     async def get_tick(self, symbol: str) -> float:
-        meta = await self._meta.get(symbol)
+        meta = await self._get_meta(symbol)
         if not meta:
             return 1e-6
         return float(meta.price_tick or (10 ** (-meta.price_place)))
 
-    async def quantize_price(self, symbol: str, price: float, *, rounding: str = "nearest") -> float:
-        meta = await self._meta.get(symbol)
-        if not meta:
-            return float(price)
-        tick = float(meta.price_tick or (10 ** (-meta.price_place)))
-        p = _round_price(float(price), tick, rounding)
-        if meta.price_place >= 0:
-            p = float(format(p, f".{meta.price_place}f"))
-        return float(p)
-
-    async def _quantize_order(
+    async def _quantize_for_limit(
         self,
         symbol: str,
+        *,
         price: float,
         qty: float,
-        *,
-        price_rounding: str = "nearest",
-    ) -> Tuple[float, float, float]:
-        meta = await self._meta.get(symbol)
+        side: str,
+        trade_side: str,
+    ) -> Tuple[str, str, float, float]:
+        meta = await self._get_meta(symbol)
         if not meta:
-            return float(price), float(qty), 1e-6
+            return str(price), str(qty), float(price), float(qty)
 
         tick = float(meta.price_tick or (10 ** (-meta.price_place)))
         step = float(meta.qty_step or (10 ** (-meta.qty_place)))
 
-        # price
-        p = _round_price(float(price), tick, price_rounding)
-        if meta.price_place >= 0:
-            p = float(format(p, f".{meta.price_place}f"))
+        s = (side or "").lower()
+        ts = (trade_side or "open").lower()
 
-        # qty (always floor to step)
-        q = float(int(float(qty) / step) * step)
-        if meta.qty_place >= 0:
-            q = float(format(q, f".{meta.qty_place}f"))
+        # open: BUY floor, SELL ceil
+        # close: SELL floor, BUY ceil
+        if ts == "open":
+            mode = "floor" if s == "buy" else "ceil"
+        else:
+            mode = "floor" if s == "sell" else "ceil"
 
-        if q < float(meta.min_qty):
-            q = 0.0
+        qp = _quant_price(price, tick, mode=mode)
+        qq = _quant_qty(qty, step)
 
-        return float(p), float(q), float(tick)
+        if float(qq) < float(meta.min_qty):
+            return "0", "0", 0.0, 0.0
+
+        p_str = _fmt_decimal(qp, meta.price_place)
+        q_str = _fmt_decimal(qq, meta.qty_place)
+        return p_str, q_str, float(qp), float(qq)
+
+    async def _quantize_for_plan_sl(
+        self,
+        symbol: str,
+        *,
+        trigger_price: float,
+        qty: float,
+        close_side: str,
+    ) -> Tuple[str, str, float, float]:
+        meta = await self._get_meta(symbol)
+        if not meta:
+            return str(trigger_price), str(qty), float(trigger_price), float(qty)
+
+        tick = float(meta.price_tick or (10 ** (-meta.price_place)))
+        step = float(meta.qty_step or (10 ** (-meta.qty_place)))
+
+        cs = (close_side or "").lower()
+        # close long => SELL stop => FLOOR trigger
+        # close short => BUY stop => CEIL trigger
+        mode = "floor" if cs == "sell" else "ceil"
+
+        qp = _quant_price(trigger_price, tick, mode=mode)
+        qq = _quant_qty(qty, step)
+
+        if float(qq) < float(meta.min_qty):
+            return "0", "0", 0.0, 0.0
+
+        p_str = _fmt_decimal(qp, meta.price_place)
+        q_str = _fmt_decimal(qq, meta.qty_place)
+        return p_str, q_str, float(qp), float(qq)
+
+    # ---------------------------------------------------------------
+    # Orders
+    # ---------------------------------------------------------------
 
     async def place_limit(
         self,
@@ -250,13 +328,7 @@ class BitgetTrader:
         client_oid: Optional[str] = None,
         trade_side: str = "open",
         reduce_only: bool = False,
-        *,
-        price_rounding: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Standard LIMIT order on v2:
-          POST /api/v2/mix/order/place-order
-        """
         sym = (symbol or "").upper()
         s = (side or "").lower()  # buy/sell
 
@@ -266,24 +338,19 @@ class BitgetTrader:
         else:
             raw_qty = float(size)
 
-        # safer default rounding:
-        # - buy: floor (avoid "too high" + band)
-        # - sell: ceil (avoid too low)
-        pr = price_rounding
-        if pr is None:
-            pr = "floor" if s == "buy" else "ceil"
-
-        q_price, q_qty, _tick = await self._quantize_order(sym, float(price), float(raw_qty), price_rounding=pr)
-        if q_qty <= 0:
+        p_str, q_str, p_f, q_f = await self._quantize_for_limit(
+            sym, price=float(price), qty=float(raw_qty), side=s, trade_side=trade_side
+        )
+        if q_f <= 0:
             return {"ok": False, "code": "QTY0", "msg": "quantized qty is 0"}
 
-        payload = {
+        payload: Dict[str, Any] = {
             "symbol": sym,
             "productType": self.product_type,
             "marginCoin": self.margin_coin,
             "marginMode": self.margin_mode,
-            "size": str(q_qty),
-            "price": str(q_price),
+            "size": q_str,
+            "price": p_str,
             "side": s,
             "orderType": "limit",
             "timeInForceValue": "normal",
@@ -295,23 +362,9 @@ class BitgetTrader:
             payload["reduceOnly"] = "YES"
 
         resp = await self._request_any_status("POST", "/api/v2/mix/order/place-order", data=payload, auth=True)
-
-        # retry once if price error (try safer rounding floor)
-        if (not resp.get("ok")) and str(resp.get("code")) in {"40020"}:
-            q_price2, q_qty2, _ = await self._quantize_order(sym, float(price), float(raw_qty), price_rounding="floor")
-            if q_qty2 > 0 and (q_price2 != q_price or q_qty2 != q_qty):
-                payload["price"] = str(q_price2)
-                payload["size"] = str(q_qty2)
-                payload["clientOid"] = client_oid or f"oid-{sym}-{_now_ms()}"
-                resp = await self._request_any_status("POST", "/api/v2/mix/order/place-order", data=payload, auth=True)
-                if resp.get("ok"):
-                    resp["qty"] = q_qty2
-                    resp["price"] = q_price2
-                    return resp
-
         if resp.get("ok") is True:
-            resp["qty"] = q_qty
-            resp["price"] = q_price
+            resp["qty"] = q_f
+            resp["price"] = p_f
         return resp
 
     async def place_reduce_limit_tp(
@@ -321,8 +374,6 @@ class BitgetTrader:
         price: float,
         qty: float,
         client_oid: Optional[str] = None,
-        *,
-        price_rounding: Optional[str] = None,
     ) -> Dict[str, Any]:
         return await self.place_limit(
             symbol=symbol,
@@ -332,7 +383,6 @@ class BitgetTrader:
             client_oid=client_oid,
             trade_side="close",
             reduce_only=True,
-            price_rounding=price_rounding,
         )
 
     async def place_stop_market_sl(
@@ -344,24 +394,14 @@ class BitgetTrader:
         *,
         client_oid: Optional[str] = None,
         trigger_type: str = "mark_price",
-        trigger_rounding: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        SL as trigger order:
-          POST /api/v2/mix/order/place-plan-order
-        """
         sym = (symbol or "").upper()
         close_s = (close_side or "").lower()
 
-        # quantize qty + trigger price (IMPORTANT)
-        tr = trigger_rounding
-        if tr is None:
-            # if close_side is sell => SL trigger is below -> floor is safer
-            tr = "floor" if close_s == "sell" else "ceil"
-
-        q_trigger = await self.quantize_price(sym, float(trigger_price), rounding=tr)
-        _, q_qty, _tick = await self._quantize_order(sym, float(q_trigger), float(qty), price_rounding="nearest")
-        if q_qty <= 0:
+        tp_str, q_str, tp_f, q_f = await self._quantize_for_plan_sl(
+            sym, trigger_price=float(trigger_price), qty=float(qty), close_side=close_s
+        )
+        if q_f <= 0:
             return {"ok": False, "code": "QTY0", "msg": "quantized qty is 0"}
 
         payload = {
@@ -369,10 +409,10 @@ class BitgetTrader:
             "productType": self.product_type,
             "marginCoin": self.margin_coin,
             "marginMode": self.margin_mode,
-            "size": str(q_qty),
+            "size": q_str,
             "side": close_s,
             "orderType": "market",
-            "triggerPrice": str(q_trigger),
+            "triggerPrice": tp_str,
             "triggerType": trigger_type,
             "planType": "normal_plan",
             "tradeSide": "close",
@@ -383,8 +423,8 @@ class BitgetTrader:
 
         resp = await self._request_any_status("POST", "/api/v2/mix/order/place-plan-order", data=payload, auth=True)
         if resp.get("ok") is True:
-            resp["qty"] = q_qty
-            resp["triggerPrice"] = q_trigger
+            resp["qty"] = q_f
+            resp["triggerPrice"] = tp_f
         return resp
 
     async def cancel_plan_orders(self, symbol: str, order_ids: list[str]) -> Dict[str, Any]:
