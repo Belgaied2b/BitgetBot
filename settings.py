@@ -171,6 +171,9 @@ RETRY_BACKOFF_JITTER_MAX = _get_int("RETRY_BACKOFF_JITTER_MAX", 200)
 # =====================================================================
 # EXECUTION (prix / slippage)
 # =====================================================================
+# Bitget position mode: "hedge" (recommandé vu tes erreurs) ou "oneway"
+
+POSITION_MODE = "hedge"
 
 PRICE_NUDGE_TICKS_MIN = _get_int("PRICE_NUDGE_TICKS_MIN", 0)
 PRICE_NUDGE_TICKS_MAX = _get_int("PRICE_NUDGE_TICKS_MAX", 2)
