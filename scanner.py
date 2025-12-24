@@ -1,5 +1,7 @@
 # =====================================================================
-# scanner.py — TP2 removed (runner) + BE after TP1 + Telegram ON
+# scanner.py — TP2 OFF (runner) + BE after TP1 + Telegram ON
+# Fix Bitget 22002 "No position to close" by adapting tradeSide to pos_mode
+# + anti spam inflight flags
 # =====================================================================
 
 from __future__ import annotations
@@ -53,7 +55,7 @@ WATCH_INTERVAL_S = 3.0
 
 REJECT_DEBUG_SAMPLES = 25
 
-ARM_MAX_ATTEMPTS = 30
+ARM_MAX_ATTEMPTS = 40
 ARM_COOLDOWN_S = 8.0
 
 # ===== PRICE BAND =====
@@ -142,11 +144,11 @@ def _fmt_num(x: float) -> str:
     except Exception:
         return str(x)
 
-def _mk_signal_msg(symbol: str, tid: str, side: str, setup: str, entry: float, sl: float, tp1: float, rr: float, inst: int, entry_type: str) -> str:
+def _mk_signal_msg(symbol: str, tid: str, side: str, setup: str, entry: float, sl: float, tp1: float, rr: float, inst: int, entry_type: str, pos_mode: str) -> str:
     return (
         f"*📌 SIGNAL*\n"
         f"*{symbol}* — {_fmt_side(side)}\n"
-        f"setup: `{setup}` | inst: `{inst}` | entry_type: `{entry_type}`\n"
+        f"setup: `{setup}` | inst: `{inst}` | entry_type: `{entry_type}` | pos_mode: `{pos_mode}`\n"
         f"entry: `{_fmt_num(entry)}`\n"
         f"SL: `{_fmt_num(sl)}`\n"
         f"TP1: `{_fmt_num(tp1)}` (runner ensuite)\n"
@@ -189,7 +191,6 @@ def _direction_from_side(side: str) -> str:
     return "LONG" if (side or "").upper() == "BUY" else "SHORT"
 
 def _close_side_from_direction(direction: str) -> str:
-    # direction = position direction; close side is opposite
     return "SELL" if direction == "LONG" else "BUY"
 
 def _trigger_type_sl() -> str:
@@ -234,19 +235,16 @@ def _q_ceil(price: float, tick: float) -> float:
     return float(math.ceil(price / tick) * tick)
 
 def _q_entry(price: float, tick: float, side: str) -> float:
-    # BUY entry: better to floor, SELL entry: better to ceil
     if tick <= 0:
         return float(price)
     return _q_floor(price, tick) if (side or "").upper() == "BUY" else _q_ceil(price, tick)
 
 def _q_sl(sl: float, tick: float, direction: str) -> float:
-    # LONG stop below -> floor. SHORT stop above -> ceil.
     if direction == "LONG":
         return _q_floor(sl, tick)
     return _q_ceil(sl, tick)
 
 def _q_tp_limit(tp: float, tick: float, direction: str) -> float:
-    # LONG TP above -> floor to fill earlier, SHORT TP below -> ceil to fill earlier
     if direction == "LONG":
         return _q_floor(tp, tick)
     return _q_ceil(tp, tick)
@@ -274,6 +272,24 @@ def _has_key_fields_for_trade(result: Dict[str, Any]) -> bool:
     tp1 = _safe_float(result.get("tp1"), 0.0)
     rr = _safe_float(result.get("rr"), 0.0)
     return entry > 0 and sl > 0 and tp1 > 0 and rr > 0
+
+async def _detect_pos_mode(trader: BitgetTrader) -> str:
+    """
+    Best-effort : hedge/one_way. If trader exposes a method, use it; else default one_way.
+    """
+    try:
+        if hasattr(trader, "get_position_mode"):
+            pm = await trader.get_position_mode()
+            if pm:
+                return str(pm)
+    except Exception:
+        pass
+    return "one_way"
+
+def _tp_trade_side(pos_mode: str) -> str:
+    # Bitget quirk: in one_way, close is usually reduceOnly with tradeSide=open (or none).
+    pm = (pos_mode or "").lower()
+    return "close" if "hedge" in pm else "open"
 
 # =====================================================================
 # Watcher state + tick cache
@@ -395,7 +411,6 @@ async def process_symbol(
         setup = str(result.get("setup_type") or "-")
         entry_type = str(result.get("entry_type") or "MARKET")
 
-        # EXIT DEBUG (raw)
         desk_log(logging.INFO, "EXITS", symbol, tid, side=side, entry=entry, sl=sl, tp1=tp1, rr=rr, setup=setup, entry_type=entry_type)
 
         if entry <= 0 or sl <= 0 or tp1 <= 0:
@@ -409,6 +424,7 @@ async def process_symbol(
             return
 
         direction = _direction_from_side(side)
+        close_side = _close_side_from_direction(direction)
         notional = float(MARGIN_USDT) * float(LEVERAGE)
 
         inst = result.get("institutional") or {}
@@ -427,11 +443,12 @@ async def process_symbol(
             await stats.add_reason(f"risk:{reason}")
             return
 
-        await stats.inc("valids", 1)
-        desk_log(logging.INFO, "VALID", symbol, tid, side=side, setup=setup, rr=rr, inst=inst_score, entry_type=entry_type)
+        pos_mode = await _detect_pos_mode(trader)
 
-        # Telegram signal
-        await send_telegram(_mk_signal_msg(str(symbol).upper(), tid, side, setup, entry, sl, tp1, rr, inst_score, entry_type))
+        await stats.inc("valids", 1)
+        desk_log(logging.INFO, "VALID", symbol, tid, side=side, setup=setup, rr=rr, inst=inst_score, entry_type=entry_type, pos_mode=pos_mode)
+
+        await send_telegram(_mk_signal_msg(str(symbol).upper(), tid, side, setup, entry, sl, tp1, rr, inst_score, entry_type, pos_mode))
 
         DUP_GUARD.mark(fp)
 
@@ -456,6 +473,7 @@ async def process_symbol(
             tick_used=tick_used,
             q_entry=q_entry,
             direction=direction,
+            pos_mode=pos_mode,
             meta_pricePlace=meta_dbg.get("pricePlace"),
             meta_priceTick=meta_dbg.get("priceTick"),
             meta_raw=meta_dbg.get("raw"),
@@ -492,7 +510,6 @@ async def process_symbol(
             desk_log(logging.ERROR, "ENTRY_FAIL", symbol, tid, code=entry_resp.get("code"), msg=entry_resp.get("msg"), http=entry_resp.get("_http_status"), dbg=dbg)
             desk_log(logging.ERROR, "META_DUMP", symbol, tid, meta=await trader.debug_meta(symbol))
             await send_telegram(_mk_exec_msg("ENTRY_FAIL", str(symbol).upper(), tid, code=entry_resp.get("code"), msg=entry_resp.get("msg")))
-
             try:
                 order_budget.release()
             except Exception:
@@ -505,13 +522,13 @@ async def process_symbol(
         desk_log(logging.INFO, "ENTRY_OK", symbol, tid, orderId=entry_order_id, qty=qty_total)
         await send_telegram(_mk_exec_msg("ENTRY_OK", str(symbol).upper(), tid, orderId=entry_order_id, qty=qty_total))
 
-        # pending watcher: SL + TP1 + BE after TP1
         async with PENDING_LOCK:
             PENDING[tid] = {
                 "symbol": str(symbol).upper(),
                 "entry_side": side.upper(),
                 "direction": direction,
-                "close_side": _close_side_from_direction(direction),  # FIX (always correct)
+                "close_side": close_side,             # correct
+                "pos_mode": pos_mode,                 # used for TP tradeSide
                 "entry": q_entry,
                 "sl": sl,
                 "tp1": tp1,
@@ -521,15 +538,17 @@ async def process_symbol(
                 "entry_client_oid": f"entry-{tid}",
                 "sl_plan_id": None,
                 "tp1_order_id": None,
-                "tp1_client_oid": None,
                 "armed": False,
                 "tp1_done": False,
                 "be_done": False,
                 "created_ts": time.time(),
                 "arm_attempts": 0,
                 "last_arm_fail_ts": 0.0,
+                "sl_inflight": False,
+                "tp1_inflight": False,
             }
-        desk_log(logging.INFO, "PENDING_NEW", symbol, tid, entry_side=side.upper(), close_side=_close_side_from_direction(direction), direction=direction)
+
+        desk_log(logging.INFO, "PENDING_NEW", symbol, tid, entry_side=side.upper(), close_side=close_side, direction=direction, pos_mode=pos_mode)
 
     except Exception as e:
         desk_log(logging.ERROR, "ERR", symbol, tid, where="process_symbol", err=str(e))
@@ -555,12 +574,13 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                 sym = st["symbol"]
                 direction = st["direction"]
                 close_side = st["close_side"]
+                pos_mode = st.get("pos_mode") or "one_way"
                 entry = float(st["entry"])
                 sl = float(st["sl"])
                 tp1 = float(st["tp1"])
 
                 # ---------------------------------------------------------
-                # ARMING PHASE: wait fill -> place SL -> place TP1
+                # ARM: wait fill -> SL -> TP1
                 # ---------------------------------------------------------
                 if not st["armed"]:
                     last_fail = float(st.get("last_arm_fail_ts") or 0.0)
@@ -598,7 +618,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     tick_used = _sanitize_tick(sym, entry, tick_meta, tid)
 
                     qty_tp1 = qty_total * TP1_CLOSE_PCT
-
                     q_sl = _q_sl(sl, tick_used, direction)
                     q_tp1 = _q_tp_limit(tp1, tick_used, direction)
 
@@ -610,11 +629,13 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         tp1_raw=tp1, tp1_q=q_tp1,
                         close_side=close_side,
                         direction=direction,
+                        pos_mode=pos_mode,
                     )
 
-                    # 1) SL first
-                    if not st.get("sl_plan_id"):
-                        desk_log(logging.INFO, "SL_SEND", sym, tid, close_side=close_side, trigger_type=_trigger_type_sl(), trigger_raw=sl, trigger_q=q_sl, qty=qty_total, tick=tick_used)
+                    # 1) SL
+                    if not st.get("sl_plan_id") and (not st.get("sl_inflight", False)):
+                        st["sl_inflight"] = True
+                        desk_log(logging.INFO, "SL_SEND", sym, tid, close_side=close_side, trigger_type=_trigger_type_sl(), trigger_q=q_sl, qty=qty_total, tick=tick_used)
 
                         sl_resp = await trader.place_stop_market_sl(
                             symbol=sym,
@@ -626,6 +647,8 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                             tick_hint=tick_used,
                             debug_tag="SL",
                         )
+                        st["sl_inflight"] = False
+
                         if not _is_ok(sl_resp):
                             st["arm_attempts"] = attempts + 1
                             st["last_arm_fail_ts"] = time.time()
@@ -639,33 +662,38 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                             if tid in PENDING:
                                 PENDING[tid]["sl_plan_id"] = str(sl_plan_id) if sl_plan_id else "ok"
                                 PENDING[tid]["qty_total"] = qty_total
-                        desk_log(logging.INFO, "SL_OK", sym, tid, sl=q_sl, planId=sl_plan_id, dbg=sl_resp.get("_debug"))
+                        desk_log(logging.INFO, "SL_OK", sym, tid, sl=q_sl, planId=sl_plan_id)
                         await send_telegram(_mk_exec_msg("SL_OK", sym, tid, sl=q_sl, planId=sl_plan_id))
 
-                    # 2) TP1 (WAIT if 22002)
-                    if not st.get("tp1_order_id"):
-                        desk_log(logging.INFO, "TP1_SEND", sym, tid, close_side=close_side, price_raw=tp1, price_q=q_tp1, qty=qty_tp1, tick=tick_used)
+                    # 2) TP1 (tradeSide depends on pos_mode)
+                    if not st.get("tp1_order_id") and (not st.get("tp1_inflight", False)):
+                        st["tp1_inflight"] = True
+                        tp_trade_side = _tp_trade_side(pos_mode)
 
-                        tp1_resp = await trader.place_reduce_limit_tp(
+                        desk_log(logging.INFO, "TP1_SEND", sym, tid, close_side=close_side, price_q=q_tp1, qty=qty_tp1, tick=tick_used, trade_side=tp_trade_side, reduceOnly=True)
+
+                        tp1_resp = await trader.place_limit(
                             symbol=sym,
-                            close_side=close_side.lower(),
+                            side=close_side.lower(),
                             price=q_tp1,
-                            qty=qty_tp1,
+                            size=qty_tp1,                 # IMPORTANT: real qty
                             client_oid=_oid("tp1", tid, attempts),
+                            trade_side=tp_trade_side,     # FIX
+                            reduce_only=True,             # FIX
                             tick_hint=tick_used,
                             debug_tag="TP1",
                         )
+                        st["tp1_inflight"] = False
 
                         code = str(tp1_resp.get("code", ""))
 
-                        # Position pas encore reconnue -> on attend (desk behavior)
+                        # still no position -> wait
                         if (not _is_ok(tp1_resp)) and code == "22002":
-                            desk_log(logging.WARNING, "TP1_WAIT_POS", sym, tid, code=tp1_resp.get("code"), msg=tp1_resp.get("msg"))
+                            desk_log(logging.WARNING, "TP1_WAIT_POS", sym, tid, code=tp1_resp.get("code"), msg=tp1_resp.get("msg"), pos_mode=pos_mode, trade_side=tp_trade_side)
                             st["last_arm_fail_ts"] = time.time()
-                            # IMPORTANT: ne pas incrémenter attempts agressivement ici
                             continue
 
-                        # Band clamp
+                        # price band clamp
                         if (not _is_ok(tp1_resp)) and code == "22047":
                             mn, mx = _parse_band(str(tp1_resp.get("msg") or ""))
                             clamped = _clamp_and_quantize(q_tp1, tick_used, mn, mx)
@@ -674,12 +702,14 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                                 st["arm_attempts"] = attempts + 1
                                 st["last_arm_fail_ts"] = time.time()
                                 continue
-                            tp1_resp = await trader.place_reduce_limit_tp(
+                            tp1_resp = await trader.place_limit(
                                 symbol=sym,
-                                close_side=close_side.lower(),
+                                side=close_side.lower(),
                                 price=clamped,
-                                qty=qty_tp1,
+                                size=qty_tp1,
                                 client_oid=_oid("tp1", tid, attempts + 1),
+                                trade_side=tp_trade_side,
+                                reduce_only=True,
                                 tick_hint=tick_used,
                                 debug_tag="TP1",
                             )
@@ -696,37 +726,33 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         async with PENDING_LOCK:
                             if tid in PENDING:
                                 PENDING[tid]["tp1_order_id"] = str(tp1_order_id) if tp1_order_id else "ok"
-                                PENDING[tid]["tp1_client_oid"] = tp1_resp.get("_client_oid") or None
                                 PENDING[tid]["qty_tp1"] = float(tp1_resp.get("qty") or qty_tp1)
 
-                        desk_log(logging.INFO, "TP1_OK", sym, tid, tp1=q_tp1, orderId=tp1_order_id, dbg=tp1_resp.get("_debug"))
+                        desk_log(logging.INFO, "TP1_OK", sym, tid, tp1=q_tp1, orderId=tp1_order_id, pos_mode=pos_mode, trade_side=tp_trade_side)
                         await send_telegram(_mk_exec_msg("TP1_OK", sym, tid, tp1=q_tp1, orderId=tp1_order_id))
 
-                    # Armed now
+                    # ARMED
                     async with PENDING_LOCK:
                         if tid in PENDING:
                             PENDING[tid]["armed"] = True
                             PENDING[tid]["qty_total"] = qty_total
                             PENDING[tid]["qty_tp1"] = float(PENDING[tid].get("qty_tp1") or qty_tp1)
 
-                    desk_log(logging.INFO, "ARMED", sym, tid, qty_total=qty_total, close_side=close_side, direction=direction)
-                    await send_telegram(_mk_exec_msg("ARMED", sym, tid, qty_total=qty_total, runner="ON", be_after_tp1="ON"))
+                    desk_log(logging.INFO, "ARMED", sym, tid, qty_total=qty_total, close_side=close_side, direction=direction, pos_mode=pos_mode)
+                    await send_telegram(_mk_exec_msg("ARMED", sym, tid, qty_total=qty_total, runner="ON", be_after_tp1="ON", pos_mode=pos_mode))
                     continue
 
                 # ---------------------------------------------------------
-                # POST-ARM PHASE: Move SL -> BE after TP1 fill
+                # BE after TP1 filled
                 # ---------------------------------------------------------
                 if st["armed"] and (not st.get("be_done", False)):
                     tp1_order_id = st.get("tp1_order_id")
                     if not tp1_order_id:
                         continue
 
-                    tp1_detail = await trader.get_order_detail(sym, order_id=tp1_order_id, client_oid=st.get("tp1_client_oid"))
+                    tp1_detail = await trader.get_order_detail(sym, order_id=tp1_order_id)
                     if not trader.is_filled(tp1_detail):
                         continue
-
-                    # TP1 filled
-                    st["tp1_done"] = True
 
                     tick_meta = await _get_tick_cached(trader, sym)
                     tick_used = _sanitize_tick(sym, entry, tick_meta, tid)
@@ -734,16 +760,11 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     be_ticks = int(BE_FEE_BUFFER_TICKS or 0)
                     be_delta = float(be_ticks) * float(tick_used)
 
-                    # Desk BE+ logic:
-                    # LONG -> BE = entry + delta
-                    # SHORT -> BE = entry - delta
                     be_raw = (entry + be_delta) if direction == "LONG" else (entry - be_delta)
-
                     be_q = _q_sl(be_raw, tick_used, direction)
 
                     desk_log(logging.INFO, "BE_SEND", sym, tid, be_raw=be_raw, be_q=be_q, tick=tick_used, be_ticks=be_ticks)
 
-                    # Cancel old SL if tool exists
                     old_plan = st.get("sl_plan_id")
                     if old_plan and hasattr(trader, "cancel_plan_order"):
                         try:
@@ -766,7 +787,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     if not _is_ok(sl_be_resp):
                         desk_log(logging.ERROR, "BE_FAIL", sym, tid, code=sl_be_resp.get("code"), msg=sl_be_resp.get("msg"))
                         await send_telegram(_mk_exec_msg("BE_FAIL", sym, tid, code=sl_be_resp.get("code"), msg=sl_be_resp.get("msg")))
-                        # retry later
                         st["last_arm_fail_ts"] = time.time()
                         continue
 
@@ -780,8 +800,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     desk_log(logging.INFO, "BE_OK", sym, tid, be=be_q, planId=new_plan)
                     await send_telegram(_mk_exec_msg("BE_OK", sym, tid, be=be_q, planId=new_plan, runner="ACTIVE"))
 
-                    # On peut garder en pending pour un futur trailing, mais pour l’instant on sort:
-                    # remove after BE if you want no more watcher work
+                    # remove from watcher (runner managed manually)
                     async with PENDING_LOCK:
                         PENDING.pop(tid, None)
                     continue
