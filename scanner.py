@@ -215,8 +215,17 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 def _direction_from_side(side: str) -> str:
     return "LONG" if (side or "").upper() == "BUY" else "SHORT"
 
-def _close_side_from_direction(direction: str) -> str:
-    return "SELL" if direction == "LONG" else "BUY"
+def _close_side_from_direction(direction: str, pos_mode: str = "one_way") -> str:
+    """Return Bitget API 'side' field used for CLOSE orders.
+
+    - one-way: side is order direction -> close LONG with SELL, close SHORT with BUY
+    - hedge:   side encodes position direction -> close LONG with BUY, close SHORT with SELL
+    """
+    d = (direction or "").upper()
+    pm = (pos_mode or "").lower()
+    if "hedge" in pm:
+        return "BUY" if d == "LONG" else "SELL"
+    return "SELL" if d == "LONG" else "BUY"
 
 def _trigger_type_sl() -> str:
     s = (STOP_TRIGGER_TYPE_SL or "MP").upper()
@@ -326,6 +335,50 @@ async def _detect_pos_mode(trader: BitgetTrader, symbol_hint: str = "BTCUSDT") -
 def _tp_trade_side(pos_mode: str) -> str:
     pm = (pos_mode or "").lower()
     return "close" if "hedge" in pm else "open"
+
+
+def _reduce_only_for_close(pos_mode: str) -> bool:
+    """Bitget reduceOnly is only applicable in one-way position mode (not hedge)."""
+    return "hedge" not in (pos_mode or "").lower()
+
+async def _get_position_total(
+    trader: BitgetTrader,
+    symbol: str,
+    direction: str,
+    pos_mode: str,
+) -> float:
+    """Return current position 'total' size for given symbol & direction.
+
+    Uses: GET /api/v2/mix/position/all-position
+    - hedge: filters by holdSide (long/short)
+    - one-way: returns total for the symbol (no holdSide filter)
+    """
+    try:
+        params = {
+            "productType": getattr(trader, "product_type", "USDT-FUTURES"),
+            "marginCoin": str(getattr(trader, "margin_coin", "USDT")).upper(),
+        }
+        js = await trader.client._request("GET", "/api/v2/mix/position/all-position", params=params, auth=True)
+        data = js.get("data") if isinstance(js, dict) else None
+        if not isinstance(data, list):
+            return 0.0
+
+        sym_u = (symbol or "").upper()
+        pm = (pos_mode or "").lower()
+        want_hold = "long" if (direction or "").upper() == "LONG" else "short"
+
+        for p in data:
+            if not isinstance(p, dict):
+                continue
+            if str(p.get("symbol") or "").upper() != sym_u:
+                continue
+            if "hedge" in pm:
+                if str(p.get("holdSide") or "").lower() != want_hold:
+                    continue
+            return _safe_float(p.get("total"), 0.0)
+    except Exception:
+        return 0.0
+    return 0.0
 
 # =====================================================================
 # Watcher state + tick cache
@@ -541,6 +594,9 @@ async def process_symbol(
 
         pos_mode = await _detect_pos_mode(trader, symbol)
 
+        # close-side mapping depends on posMode (one-way vs hedge)
+        close_side = _close_side_from_direction(direction, pos_mode)
+
         await stats.inc("valids", 1)
         desk_log(logging.INFO, "VALID", symbol, tid, side=side, setup=setup, rr=rr, inst=inst_score, entry_type=entry_type, pos_mode=pos_mode)
 
@@ -684,8 +740,9 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
             for tid, st in items:
                 sym = st["symbol"]
                 direction = st["direction"]
-                close_side = st["close_side"]
                 pos_mode = st.get("pos_mode") or "one_way"
+                close_side = _close_side_from_direction(direction, pos_mode)
+                st["close_side"] = close_side
                 entry = float(st["entry"])
                 sl = float(st["sl"])
                 tp1 = float(st["tp1"])
@@ -723,6 +780,16 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         st["arm_attempts"] = attempts + 1
                         st["last_arm_fail_ts"] = time.time()
                         desk_log(logging.WARNING, "ARM", sym, tid, step="no_qty_from_fill")
+                        continue
+
+                    
+                    # Gate: Bitget sometimes returns "No position to close" right after an entry fill.
+                    # We only arm SL/TP when the position is visible on /position/all-position.
+                    pos_total = await _get_position_total(trader, sym, direction, pos_mode)
+                    if pos_total <= 0:
+                        st["arm_attempts"] = attempts + 1
+                        st["last_arm_fail_ts"] = time.time()
+                        desk_log(logging.WARNING, "ARM", sym, tid, step="pos_not_visible", pos_total=pos_total)
                         continue
 
                     tick_meta = await _get_tick_cached(trader, sym)
@@ -785,6 +852,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                             close_side=close_side.lower(),
                             trigger_price=q_sl,
                             qty=qty_total,
+                            reduce_only=_reduce_only_for_close(pos_mode),
                             client_oid=_oid("sl", tid, attempts),
                             trigger_type=_trigger_type_sl(),
                             tick_hint=tick_used,
@@ -810,7 +878,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     # 2) TP1
                     if not st.get("tp1_order_id") and (not st.get("tp1_inflight", False)):
                         st["tp1_inflight"] = True
-                        desk_log(logging.INFO, "TP1_SEND", sym, tid, close_side=close_side, price_q=q_tp1, qty=qty_tp1, tick=tick_used, trade_side=tp_trade_side, reduceOnly=True)
+                        desk_log(logging.INFO, "TP1_SEND", sym, tid, close_side=close_side, price_q=q_tp1, qty=qty_tp1, tick=tick_used, trade_side=tp_trade_side, reduceOnly=_reduce_only_for_close(pos_mode))
 
                         tp1_resp = await trader.place_limit(
                             symbol=sym,
@@ -819,7 +887,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                             size=qty_tp1,
                             client_oid=_oid("tp1", tid, attempts),
                             trade_side=tp_trade_side,
-                            reduce_only=True,
+                            reduce_only=_reduce_only_for_close(pos_mode),
                             tick_hint=tick_used,
                             debug_tag="TP1",
                         )
