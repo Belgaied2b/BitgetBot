@@ -127,178 +127,240 @@ def _compute_exits(df: pd.DataFrame, entry: float, bias: str, tick: float) -> Di
 
 def _pick_fvg_entry(struct: Dict[str, Any], entry_mkt: float, bias: str, atr: float) -> Tuple[Optional[float], str]:
     """
-    Retourne (entry_price, note). None si pas exploitable.
+    FVG zones (from structure_utils) are like:
+      {type: bullish/bearish, start/end, low/high, mid}
 
-    Les zones FVG peuvent venir de plusieurs implémentations, on supporte :
-      - {start, end, type} (structure_utils.py)
-      - {low, high} / {bottom, top} (fallback)
+    Desk rule:
+      - LONG: use bullish FVG, prefer low boundary on first touch (price above zone),
+              else midpoint if price inside.
+      - SHORT: use bearish FVG, prefer high boundary on first touch (price below zone),
+               else midpoint if price inside.
+
+    Reject if too far (dist > 1.5 ATR) when ATR is available.
     """
     zones = struct.get("fvg_zones") or []
     if not zones:
         return None, "no_fvg"
 
     bias = (bias or "").upper()
-    want_bull = bias == "LONG"
-    max_dist_atr = 1.8  # desk default (free) ; assez strict pour éviter les ordres trop loin
-
-    best_mid = None
+    best_price = None
     best_dist = 1e18
-    best_note = "no_candidate"
+    best_note = "no_fvg_candidate"
 
     for z in zones:
         try:
-            # --- parse zone bounds ---
-            candidates = []
-            for k in ("start", "end", "low", "high", "bottom", "top"):
-                v = z.get(k)
-                if v is not None:
-                    candidates.append(float(v))
-            if len(candidates) < 2:
+            ztype = str(z.get("type") or z.get("direction") or "").lower()
+
+            # bounds
+            low_b = z.get("low")
+            high_b = z.get("high")
+            if low_b is None or high_b is None:
+                s0 = z.get("start")
+                e0 = z.get("end")
+                if s0 is None or e0 is None:
+                    continue
+                low_b = float(min(float(s0), float(e0)))
+                high_b = float(max(float(s0), float(e0)))
+
+            low_b = float(low_b)
+            high_b = float(high_b)
+            if high_b <= low_b:
                 continue
-            zmin, zmax = float(min(candidates)), float(max(candidates))
-            mid = (zmin + zmax) / 2.0
 
-            # --- optional type filter ---
-            zt = str(z.get("type", "")).lower()
-            if zt:
-                is_bull = any(s in zt for s in ("bull", "up", "long"))
-                is_bear = any(s in zt for s in ("bear", "down", "short"))
-                if want_bull and is_bear:
-                    continue
-                if (not want_bull) and is_bull:
-                    continue
+            # directional filter
+            if bias == "LONG" and "bull" not in ztype:
+                continue
+            if bias == "SHORT" and "bear" not in ztype:
+                continue
 
-            # --- directional preference ---
-            # Long: FVG en dessous (ou prix dans la zone). Short: au dessus (ou prix dans la zone).
-            if want_bull:
-                if entry_mkt < zmin and (atr > 0 and (zmin - entry_mkt) > 0.35 * atr):
-                    # prix trop bas par rapport à une FVG au-dessus -> pas logique
-                    continue
+            in_zone = low_b <= entry_mkt <= high_b
+
+            if bias == "LONG":
+                cand = float((low_b + high_b) / 2.0) if in_zone else float(low_b)
             else:
-                if entry_mkt > zmax and (atr > 0 and (entry_mkt - zmax) > 0.35 * atr):
-                    continue
+                cand = float((low_b + high_b) / 2.0) if in_zone else float(high_b)
 
-            dist = abs(entry_mkt - mid)
-
-            # taille de zone anormale vs ATR (évite les "fvg" gigantesques)
-            width = abs(zmax - zmin)
-            if atr > 0 and width > 3.0 * atr:
-                continue
+            dist = abs(entry_mkt - cand)
 
             if dist < best_dist:
                 best_dist = dist
-                # si déjà DANS la zone, on prend le prix marché -> fill quasi immédiat
-                if zmin <= entry_mkt <= zmax:
-                    best_mid = float(entry_mkt)
-                    best_note = f"fvg_in_zone z=[{zmin:.6g},{zmax:.6g}]"
-                else:
-                    best_mid = float(mid)
-                    best_note = f"fvg_ok z=[{zmin:.6g},{zmax:.6g}]"
+                best_price = cand
+                best_note = f"fvg_ok z=[{low_b:.6g},{high_b:.6g}] in_zone={in_zone} dist={dist:.6g} atr={atr:.6g}"
+
         except Exception:
             continue
 
-    if best_mid is None:
+    if best_price is None:
         return None, "no_fvg_parse"
 
-    if atr > 0 and best_dist > max_dist_atr * atr:
+    if atr > 0 and best_dist > 1.5 * atr:
         return None, f"fvg_too_far dist={best_dist:.6g} atr={atr:.6g}"
 
-    return float(best_mid), f"{best_note} dist={best_dist:.6g} atr={atr:.6g}"
+    return float(best_price), best_note
+
 
 
 def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[str, Any]:
     """
-    Logique desk (compatible LIMIT-only côté scanner) :
+    Desk entry selection.
 
-    1) On calcule une zone OTE (golden zone). Même si le prix n'est pas dedans,
-       on peut placer un LIMIT dans la zone *si elle est raisonnablement proche*.
-    2) Sinon, on tente une entrée via FVG la plus proche.
-    3) Sinon, fallback "MARKET" (limit au prix spot) = à réserver aux setups très forts.
+    Priority:
+      1) OTE (LIMIT) if in zone OR close to zone (distance <= OTE_NEAR_ATR_MULT * ATR)
+      2) FVG (LIMIT) if valid & close
+      3) EMA pullback (LIMIT) if close (distance <= EMA_PB_ATR_MULT * ATR)
+      4) MARKET fallback only if ALLOW_MARKET_FALLBACK=1
 
-    IMPORTANT: le scanner actuel envoie une entrée LIMIT. Donc "MARKET" ici signifie :
-    "pas de zone exploitable, on rentre au prix actuel".
+    Returns:
+      entry_used, entry_type, order_type, in_zone, note, entry_mkt, atr
     """
+    import os
+
     entry_mkt = float(df_h1["close"].iloc[-1])
     atr = _atr(df_h1, 14)
+    bias = (bias or "").upper()
 
-    bias_u = (bias or "").upper()
-    max_zone_dist_atr = 1.20  # au-delà, on évite de placer un ordre trop loin (desk filter)
-
-    # -------------------------------------------------------
-    # 1) OTE (compute_ote retourne: in_ote, ote_low, ote_high)
-    # -------------------------------------------------------
-    ote = {}
-    ote_low = ote_high = None
-    ote_in_zone = False
-    ote_note = "ote_unavailable"
-    ote_mid = None
-    ote_dist = None
-
+    # OTE
     try:
-        ote = compute_ote(df_h1, bias_u) or {}
-        ote_in_zone = bool(ote.get("in_ote", False))
-        if ote.get("ote_low") is not None and ote.get("ote_high") is not None:
-            ote_low = float(ote["ote_low"])
-            ote_high = float(ote["ote_high"])
-            # sécurité
-            zl, zh = min(ote_low, ote_high), max(ote_low, ote_high)
-            ote_mid = (zl + zh) / 2.0
-            ote_dist = abs(entry_mkt - ote_mid)
-            ote_note = f"ote z=[{zl:.6g},{zh:.6g}] in_ote={ote_in_zone}"
-    except Exception as e:
-        ote_note = f"ote_error {e}"
+        ote = compute_ote(df_h1, bias=bias, lookback=50) or {}
+    except Exception:
+        ote = {}
+    in_ote = bool(ote.get("in_ote", False))
+    ote_low = ote.get("ote_low")
+    ote_high = ote.get("ote_high")
 
-    # -------------------------------------------------------
-    # 2) FVG candidate
-    # -------------------------------------------------------
-    fvg_entry, fvg_note = _pick_fvg_entry(struct, entry_mkt, bias_u, atr)
+    OTE_NEAR_ATR_MULT = float(os.getenv("OTE_NEAR_ATR_MULT", "0.35"))
 
-    # -------------------------------------------------------
-    # 3) Choix final (priorité au plus proche, tie -> OTE)
-    # -------------------------------------------------------
-    candidates = []
+    if ote_low is not None and ote_high is not None:
+        ote_low = float(ote_low)
+        ote_high = float(ote_high)
 
-    if ote_mid is not None and ote_dist is not None:
-        if (atr <= 0) or (ote_dist <= max_zone_dist_atr * atr) or ote_in_zone:
-            # si dans la zone -> on prend prix marché (fill rapide), sinon milieu de zone
-            entry_used = entry_mkt if ote_in_zone else float(ote_mid)
-            candidates.append(("OTE", entry_used, ote_note, ote_dist))
+        if in_ote:
+            return {
+                "entry_used": entry_mkt,
+                "entry_type": "OTE",
+                "order_type": "LIMIT",
+                "in_zone": True,
+                "note": f"ote in_ote=True zone=[{ote_low:.6g},{ote_high:.6g}] atr={atr:.6g}",
+                "entry_mkt": entry_mkt,
+                "atr": atr,
+                "ote_low": ote_low,
+                "ote_high": ote_high,
+            }
 
+        if atr > 0:
+            if bias == "LONG" and entry_mkt > ote_high:
+                dist = entry_mkt - ote_high
+                if dist <= OTE_NEAR_ATR_MULT * atr:
+                    return {
+                        "entry_used": float(ote_high),
+                        "entry_type": "OTE",
+                        "order_type": "LIMIT",
+                        "in_zone": False,
+                        "note": f"ote near dist={dist:.6g} mult={OTE_NEAR_ATR_MULT} zone=[{ote_low:.6g},{ote_high:.6g}] atr={atr:.6g}",
+                        "entry_mkt": entry_mkt,
+                        "atr": atr,
+                        "ote_low": ote_low,
+                        "ote_high": ote_high,
+                    }
+
+            if bias == "SHORT" and entry_mkt < ote_low:
+                dist = ote_low - entry_mkt
+                if dist <= OTE_NEAR_ATR_MULT * atr:
+                    return {
+                        "entry_used": float(ote_low),
+                        "entry_type": "OTE",
+                        "order_type": "LIMIT",
+                        "in_zone": False,
+                        "note": f"ote near dist={dist:.6g} mult={OTE_NEAR_ATR_MULT} zone=[{ote_low:.6g},{ote_high:.6g}] atr={atr:.6g}",
+                        "entry_mkt": entry_mkt,
+                        "atr": atr,
+                        "ote_low": ote_low,
+                        "ote_high": ote_high,
+                    }
+
+    # FVG
+    fvg_entry, fvg_note = _pick_fvg_entry(struct, entry_mkt, bias, atr)
     if fvg_entry is not None:
-        dist = abs(entry_mkt - float(fvg_entry))
-        if (atr <= 0) or (dist <= max_zone_dist_atr * atr):
-            candidates.append(("FVG", float(fvg_entry), fvg_note, dist))
-
-    if candidates:
-        # pick closest
-        candidates.sort(key=lambda x: (x[3], 0 if x[0] == "OTE" else 1))
-        etype, entry_used, note, dist = candidates[0]
         return {
-            "entry_used": float(entry_used),
-            "entry_type": etype,
+            "entry_used": float(fvg_entry),
+            "entry_type": "FVG",
             "order_type": "LIMIT",
-            "in_zone": bool(etype == "OTE" and ote_in_zone) or ("in_zone" in note),
-            "note": note,
+            "in_zone": False,
+            "note": fvg_note,
             "entry_mkt": entry_mkt,
             "atr": atr,
-            "dist": float(dist),
-            "dist_atr": float(dist / atr) if atr and atr > 0 else None,
-            "ote": ote if isinstance(ote, dict) else {},
+            "ote_low": ote_low,
+            "ote_high": ote_high,
         }
 
-    # fallback: pas de zone exploitable
+    # EMA pullback
+    try:
+        close = df_h1["close"].astype(float)
+        ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+
+        EMA_PB_ATR_MULT = float(os.getenv("EMA_PB_ATR_MULT", "0.50"))
+
+        if bias == "LONG":
+            pb = min(ema20, ema50)
+            dist = abs(entry_mkt - pb)
+            if atr > 0 and dist <= EMA_PB_ATR_MULT * atr and pb < entry_mkt:
+                return {
+                    "entry_used": float(pb),
+                    "entry_type": "EMA_PB",
+                    "order_type": "LIMIT",
+                    "in_zone": False,
+                    "note": f"ema_pb long pb={pb:.6g} dist={dist:.6g} atr={atr:.6g}",
+                    "entry_mkt": entry_mkt,
+                    "atr": atr,
+                    "ote_low": ote_low,
+                    "ote_high": ote_high,
+                }
+        else:
+            pb = max(ema20, ema50)
+            dist = abs(entry_mkt - pb)
+            if atr > 0 and dist <= EMA_PB_ATR_MULT * atr and pb > entry_mkt:
+                return {
+                    "entry_used": float(pb),
+                    "entry_type": "EMA_PB",
+                    "order_type": "LIMIT",
+                    "in_zone": False,
+                    "note": f"ema_pb short pb={pb:.6g} dist={dist:.6g} atr={atr:.6g}",
+                    "entry_mkt": entry_mkt,
+                    "atr": atr,
+                    "ote_low": ote_low,
+                    "ote_high": ote_high,
+                }
+    except Exception:
+        pass
+
+    allow_market = os.getenv("ALLOW_MARKET_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
+    if allow_market:
+        return {
+            "entry_used": float(entry_mkt),
+            "entry_type": "MARKET",
+            "order_type": "LIMIT",
+            "in_zone": False,
+            "note": "fallback_market",
+            "entry_mkt": entry_mkt,
+            "atr": atr,
+            "ote_low": ote_low,
+            "ote_high": ote_high,
+        }
+
     return {
-        "entry_used": entry_mkt,
-        "entry_type": "MARKET",
-        "order_type": "LIMIT",
+        "entry_used": float(entry_mkt),
+        "entry_type": "NO_ENTRY",
+        "order_type": "NONE",
         "in_zone": False,
-        "note": f"no_zone_entry (atr={atr:.6g})",
+        "note": "no_zone_no_market_fallback",
         "entry_mkt": entry_mkt,
         "atr": atr,
-        "dist": 0.0,
-        "dist_atr": 0.0,
-        "ote": ote if isinstance(ote, dict) else {},
+        "ote_low": ote_low,
+        "ote_high": ote_high,
     }
+
+
 
 
 # =====================================================================
@@ -335,6 +397,17 @@ class SignalAnalyzer:
         # ------------------------------------------------------------------
         struct = analyze_structure(df_h1)
         bias = str(struct.get("trend", "")).upper()
+
+        # Data sanity (desk): avoid dead markets / broken OHLCV
+        try:
+            sub = df_h1.tail(40)
+            rng_med = float((sub["high"].astype(float) - sub["low"].astype(float)).median())
+            vol_med = float(sub["volume"].astype(float).median())
+            if (not pd.isfinite(rng_med)) or rng_med <= 0 or (not pd.isfinite(vol_med)) or vol_med <= 0:
+                LOGGER.info("[EVAL_REJECT] bad_ohlcv_data rng_med=%s vol_med=%s", rng_med, vol_med)
+                return {"valid": False, "reject_reason": "bad_ohlcv_data", "structure": struct}
+        except Exception:
+            pass
         LOGGER.info(f"[EVAL_PRE] STRUCT={struct}")
 
         oi_series = struct.get("oi_series", None)
@@ -380,6 +453,22 @@ class SignalAnalyzer:
         # 4 — INSTITUTIONNEL (Binance)
         # ------------------------------------------------------------------
         inst = await compute_full_institutional_analysis(symbol, bias)
+
+        # If structure did not provide an OI series, reuse institutional OI slope to enrich BOS quality scoring.
+        try:
+            if oi_series is None and isinstance(inst, dict) and inst.get("available", False):
+                bos_q = bos_quality_details(
+                    df_h1,
+                    oi_series=None,
+                    df_liq=df_h1,
+                    price=entry_mkt,
+                    direction=bos_dir,
+                    oi_slope_override=inst.get("oi_slope"),
+                )
+                bos_quality_ok = bool(bos_q.get("ok", True))
+                LOGGER.info(f"[EVAL_PRE] BOS_QUALITY(inst_oi_override)={bos_q} bos_flag={bos_flag} bos_type={bos_type}")
+        except Exception:
+            pass
         inst_score = int(inst.get("institutional_score") or 0)
 
         binance_symbol = inst.get("binance_symbol")
@@ -468,7 +557,52 @@ class SignalAnalyzer:
             LOGGER.info("[EVAL_REJECT] rr_invalid")
             return {"valid": False, "reject_reason": "rr_invalid", "institutional": inst, "structure": struct}
 
+        
         # ------------------------------------------------------------------
+        # Desk setup scoring (filter noise without paid data)
+        # ------------------------------------------------------------------
+        setup_score = None
+        try:
+            import os
+            bos_score = float(bos_q.get("score", 0.0)) if isinstance(bos_q, dict) else 0.0
+            inst_s = float(inst_score)
+            comp_s = float(comp_score)
+
+            # premium/discount alignment (cheap proxy)
+            pd_bonus = 0.5 if ((premium and bias == "SHORT") or (discount and bias == "LONG")) else 0.0
+
+            # entry quality
+            if entry_type in ("OTE", "FVG"):
+                entry_bonus = 1.0
+            elif entry_type == "EMA_PB":
+                entry_bonus = 0.5
+            elif entry_type == "MARKET":
+                entry_bonus = -0.5
+            else:
+                entry_bonus = 0.0
+
+            mom_bonus = 0.5 if comp_s >= 70.0 else 0.0
+
+            setup_score = inst_s + bos_score + entry_bonus + pd_bonus + mom_bonus
+
+            min_setup_score = float(os.getenv("MIN_SETUP_SCORE", "2.0"))
+            if setup_score < min_setup_score:
+                LOGGER.info(
+                    "[EVAL_REJECT] setup_score_low score=%s < %s (inst=%s bos=%s entry=%s pd=%s mom=%s)",
+                    setup_score, min_setup_score, inst_s, bos_score, entry_bonus, pd_bonus, mom_bonus,
+                )
+                return {
+                    "valid": False,
+                    "reject_reason": "setup_score_low",
+                    "setup_score": setup_score,
+                    "institutional": inst,
+                    "structure": struct,
+                    "bos_quality": bos_q,
+                }
+        except Exception:
+            setup_score = None
+
+# ------------------------------------------------------------------
         # 9 — PATH 1 : BOS_STRICT
         # ------------------------------------------------------------------
         bos_strict_ok = False
@@ -503,6 +637,7 @@ class SignalAnalyzer:
                 "rr": rr,
                 "qty": 1,
                 "setup_type": "BOS_STRICT",
+                "setup_score": setup_score,
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
@@ -554,6 +689,7 @@ class SignalAnalyzer:
                 "rr": rr,
                 "qty": 1,
                 "setup_type": "INST_CONTINUATION",
+                "setup_score": setup_score,
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
