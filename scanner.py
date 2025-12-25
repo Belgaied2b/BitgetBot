@@ -64,8 +64,8 @@ _MIN_USDT_RE = re.compile(r"minimum amount\s*([0-9]*\.?[0-9]+)\s*USDT", re.IGNOR
 
 # ===== DESK GOVERNANCE (microstructure + cooldown) =====
 DESK_MICROSTRUCTURE = os.getenv("DESK_MICROSTRUCTURE", "1").strip() not in ("0", "false", "False")
-DESK_MAX_SPREAD_PCT = float(os.getenv("DESK_MAX_SPREAD_PCT", "0.0009"))  # 0.09% default
-DESK_MIN_USDT_VOL_24H = float(os.getenv("DESK_MIN_USDT_VOL_24H", "1500000"))
+DESK_MAX_SPREAD_PCT = float(os.getenv("DESK_MAX_SPREAD_PCT", "0.006"))  # 0.6% default  # 0.09% default
+DESK_MIN_USDT_VOL_24H = float(os.getenv("DESK_MIN_USDT_VOL_24H", "250000"))  # $250k default
 SYMBOL_COOLDOWN_S = float(os.getenv("SYMBOL_COOLDOWN_S", "1800"))  # 30 min
 POSMODE_CACHE_TTL_S = float(os.getenv("POSMODE_CACHE_TTL_S", "60"))
 
@@ -600,15 +600,16 @@ async def process_symbol(
         await stats.inc("valids", 1)
         desk_log(logging.INFO, "VALID", symbol, tid, side=side, setup=setup, rr=rr, inst=inst_score, entry_type=entry_type, pos_mode=pos_mode)
 
-        await send_telegram(_mk_signal_msg(str(symbol).upper(), tid, side, setup, entry, sl, tp1, rr, inst_score, entry_type, pos_mode))
-
-        DUP_GUARD.mark(fp)
+        if TELEGRAM_SIGNAL_ON_VALID:
+            await send_telegram(_mk_signal_msg(str(symbol).upper(), tid, side, setup, entry, sl, tp1, rr, inst_score, entry_type, pos_mode))
 
         if DRY_RUN:
             return
 
         try:
-            await asyncio.wait_for(order_budget.acquire(), timeout=0.01)
+            if getattr(order_budget, "_value", 0) <= 0:
+                raise asyncio.TimeoutError()
+            await order_budget.acquire()
         except asyncio.TimeoutError:
             await stats.add_reason("budget:max_orders_per_scan")
             return
@@ -645,29 +646,48 @@ async def process_symbol(
 
         # Desk microstructure veto (spread/liquidity)
         ok_ms, ms_note = await _microstructure_ok(trader, symbol)
+        # Always log; before it was often silent -> Telegram said OK but no Bitget order.
+        desk_log(logging.INFO if ok_ms else logging.WARNING, "MICRO", symbol, tid, ok=ok_ms, note=ms_note, entry_type=entry_type)
+
+        # Maker entries can tolerate wider spread (we still keep the warning)
+        if (not ok_ms) and str(entry_type).upper() == "LIMIT":
+            desk_log(logging.WARNING, "MICRO", symbol, tid, ok=True, note=str(ms_note) + " | limit_override", entry_type=entry_type)
+            ok_ms = True
+
         if not ok_ms:
-            if await stats.take_reject_debug_slot():
-                desk_log(logging.INFO, "REJ", symbol, tid, reason=f"microstructure_veto: {ms_note}")
+            desk_log(logging.WARNING, "REJ", symbol, tid, reason=f"microstructure_veto: {ms_note}")
             await stats.inc("rejects", 1)
             try:
                 order_budget.release()
             except Exception:
                 pass
             return
-        desk_log(logging.INFO, "EXEC", symbol, tid, action="entry_send", entry=q_entry, notional=round(notional, 2))
-        await send_telegram(_mk_exec_msg("ENTRY_SEND", str(symbol).upper(), tid, entry=q_entry, notional=round(notional, 2)))
 
-        entry_resp = await trader.place_limit(
-            symbol=symbol,
-            side=side.lower(),
-            price=q_entry,
-            size=None,
-            client_oid=f"entry-{tid}",
-            trade_side="open",
-            reduce_only=False,
-            tick_hint=tick_used,
-            debug_tag="ENTRY",
-        )
+        desk_log(logging.INFO, "EXEC", symbol, tid, action="entry_send", entry=q_entry, notional=round(notional, 2))
+
+        if str(entry_type).upper() == "MARKET" and hasattr(trader, "place_market"):
+            entry_resp = await trader.place_market(
+                symbol=symbol,
+                side=side.lower(),
+                price_ref=q_entry,
+                size=None,
+                client_oid=f"entry-{tid}",
+                trade_side="open",
+                tick_hint=tick_used,
+                debug_tag="ENTRY",
+            )
+        else:
+            entry_resp = await trader.place_limit(
+                symbol=symbol,
+                side=side.lower(),
+                price=q_entry,
+                size=None,
+                client_oid=f"entry-{tid}",
+                trade_side="open",
+                reduce_only=False,
+                tick_hint=tick_used,
+                debug_tag="ENTRY",
+            )
 
         if not _is_ok(entry_resp):
             await stats.inc("exec_failed", 1)
@@ -684,6 +704,11 @@ async def process_symbol(
         qty_total = _safe_float(entry_resp.get("qty"), 0.0)
 
         desk_log(logging.INFO, "ENTRY_OK", symbol, tid, orderId=entry_order_id, qty=qty_total)
+        # Mark duplicate only after Bitget accepted the entry (prevents "signal sent but no order")
+        DUP_GUARD.mark(fp)
+        # Send main Telegram message only after ENTRY_OK so Telegram == "order exists"
+        await send_telegram(_mk_signal_msg(str(symbol).upper(), tid, side, setup, entry, sl, tp1, rr, inst_score, entry_type, pos_mode)
+                          + f"\norderId: `{entry_order_id}`")
 
         async with PENDING_LOCK:
             PENDING[tid] = {
@@ -770,6 +795,19 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     )
                     if not trader.is_filled(detail):
                         continue
+
+                    # Wait until the position is visible before arming SL/TP1.
+                    pos_total = await _get_position_total(trader, sym, direction, pos_mode)
+                    if pos_total <= 0:
+                        st.setdefault("pos_wait_since", time.time())
+                        if (time.time() - float(st.get("pos_wait_since") or time.time())) < 12.0:
+                            continue
+                        desk_log(logging.WARNING, "POS_LAG", sym, tid, pos_total=pos_total)
+                    else:
+                        st.pop("pos_wait_since", None)
+                        # Clamp qty_total to visible position (handles partial fills)
+                        if float(st.get("qty_total") or 0.0) > 0:
+                            st["qty_total"] = min(float(st["qty_total"]), float(pos_total))
 
                     qty_total = float(st.get("qty_total") or 0.0)
                     if qty_total <= 0:
