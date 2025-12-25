@@ -336,6 +336,7 @@ def bos_quality_details(
     oi_min_trend: float = 0.003,
     oi_min_squeeze: float = -0.005,
     df_liq: Optional[pd.DataFrame] = None,
+    oi_slope_override: Optional[float] = None,
     price: Optional[float] = None,
     tick: float = 0.1,
     direction: Optional[str] = None,  # "UP" / "DOWN"
@@ -404,7 +405,15 @@ def bos_quality_details(
         except Exception:
             oi_slope = 0.0
 
-    # Liquidity sweep ?
+    
+    # OI slope override (ex: from institutional feed) — used when oi_series is not available.
+    if oi_series is None and oi_slope_override is not None:
+        try:
+            oi_slope = float(oi_slope_override)
+        except Exception:
+            oi_slope = 0.0
+
+# Liquidity sweep ?
     liquidity_sweep = False
     if df_liq is None:
         df_liq = df
@@ -551,11 +560,63 @@ def _detect_order_blocks(df: pd.DataFrame, lookback: int = 80) -> Dict[str, Any]
 
 
 def _detect_fvg(df: pd.DataFrame, lookback: int = 80) -> List[Dict[str, Any]]:
-    """Detects simple Fair Value Gaps (FVG) on last `lookback` bars."""
+    """Detects simple Fair Value Gaps (FVG) on last `lookback` bars.
+
+    Returns a list of zones with normalized bounds:
+      - low/high: numeric bounds (low <= high)
+      - start/end: original bounds (kept for backward compatibility)
+      - type: "bullish" or "bearish"
+      - direction: "BULLISH" / "BEARISH"
+      - mid: midpoint of the zone
+      - index: candle index in the original df
+    """
     zones: List[Dict[str, Any]] = []
 
     if df is None or len(df) < 5:
         return zones
+
+    sub = df.tail(lookback)
+    h = sub["high"].astype(float).to_numpy()
+    l = sub["low"].astype(float).to_numpy()
+
+    idx_offset = len(df) - len(sub)
+
+    for i in range(1, len(sub) - 1):
+        # bullish gap
+        if l[i] > h[i - 1] and l[i] > h[i + 1]:
+            start = float(h[i - 1])
+            end = float(l[i])
+            low_b = float(min(start, end))
+            high_b = float(max(start, end))
+            zones.append({
+                "type": "bullish",
+                "direction": "BULLISH",
+                "start": start,
+                "end": end,
+                "low": low_b,
+                "high": high_b,
+                "mid": float((low_b + high_b) / 2.0),
+                "index": int(idx_offset + i),
+            })
+
+        # bearish gap
+        if h[i] < l[i - 1] and h[i] < l[i + 1]:
+            start = float(h[i])
+            end = float(l[i - 1])
+            low_b = float(min(start, end))
+            high_b = float(max(start, end))
+            zones.append({
+                "type": "bearish",
+                "direction": "BEARISH",
+                "start": start,
+                "end": end,
+                "low": low_b,
+                "high": high_b,
+                "mid": float((low_b + high_b) / 2.0),
+                "index": int(idx_offset + i),
+            })
+
+    return zones
 
     sub = df.tail(lookback)
     h = sub["high"].astype(float).to_numpy()
