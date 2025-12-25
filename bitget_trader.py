@@ -109,20 +109,35 @@ class ContractMetaCache:
             qty_place = int(_safe_float(c.get("volumePlace"), 4))
 
             # Robust tick extraction (Bitget fields vary)
-            price_tick = (
-                _safe_float(c.get("priceEndStep"), 0.0)
-                or _safe_float(c.get("priceStep"), 0.0)
-                or _safe_float(c.get("tickSize"), 0.0)
-                or _safe_float(c.get("priceTick"), 0.0)
-                or (10 ** (-price_place))
-            )
+            # Most contracts use:
+            #   tick = priceEndStep / (10 ** pricePlace)
+            # Example: pricePlace=1, priceEndStep=5 => tick=0.5
+            pe = _safe_float(c.get("priceEndStep"), 0.0)
+            if pe > 0:
+                # If priceEndStep looks like an integer step, scale it by decimals.
+                if price_place >= 0 and abs(pe - round(pe)) < 1e-9 and pe >= 1:
+                    price_tick = float(pe) / float(10 ** price_place)
+                else:
+                    # Some symbols return the tick already as a decimal.
+                    price_tick = float(pe)
+            else:
+                price_tick = (
+                    _safe_float(c.get("priceStep"), 0.0)
+                    or _safe_float(c.get("tickSize"), 0.0)
+                    or _safe_float(c.get("priceTick"), 0.0)
+                    or (10 ** (-price_place))
+                )
 
-            qty_step = (
-                _safe_float(c.get("sizeMultiplier"), 0.0)
-                or _safe_float(c.get("volumeStep"), 0.0)
-                or _safe_float(c.get("minTradeNum"), 0.0)
-                or (10 ** (-qty_place))
-            )
+            vs = _safe_float(c.get("volumeStep"), 0.0)
+            if vs > 0 and qty_place >= 0 and abs(vs - round(vs)) < 1e-9 and vs >= 1 and qty_place > 0:
+                qty_step = float(vs) / float(10 ** qty_place)
+            else:
+                qty_step = (
+                    _safe_float(c.get("sizeMultiplier"), 0.0)
+                    or float(vs)
+                    or _safe_float(c.get("minTradeNum"), 0.0)
+                    or (10 ** (-qty_place))
+                )
 
             min_qty = _safe_float(c.get("minTradeNum"), 0.0) or qty_step
 
@@ -399,6 +414,9 @@ class BitgetTrader:
         price: float,
         qty: float,
         client_oid: Optional[str] = None,
+        *,
+        trade_side: str = "close",
+        reduce_only: bool = True,
         tick_hint: Optional[float] = None,
         debug_tag: str = "TP",
     ) -> Dict[str, Any]:
@@ -408,8 +426,8 @@ class BitgetTrader:
             price=price,
             size=qty,
             client_oid=client_oid,
-            trade_side="close",
-            reduce_only=True,
+            trade_side=trade_side,
+            reduce_only=reduce_only,
             tick_hint=tick_hint,
             debug_tag=debug_tag,
         )
@@ -421,6 +439,7 @@ class BitgetTrader:
         trigger_price: float,
         qty: float,
         *,
+        reduce_only: bool = True,
         client_oid: Optional[str] = None,
         trigger_type: str = "mark_price",
         tick_hint: Optional[float] = None,
@@ -448,10 +467,12 @@ class BitgetTrader:
             "triggerType": trigger_type,
             "planType": "normal_plan",
             "tradeSide": "close",
-            "reduceOnly": "YES",
             "clientOid": client_oid or f"sl-{sym}-{_now_ms()}",
             "executePrice": "0",
         }
+        if reduce_only:
+            payload["reduceOnly"] = "YES"
+
 
         logger.info(
             "[ORDER_%s] sym=%s close_side=%s trigger_type=%s trigger_raw=%s trigger_str=%s qty=%s tick_used=%s",
