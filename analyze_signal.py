@@ -128,191 +128,176 @@ def _compute_exits(df: pd.DataFrame, entry: float, bias: str, tick: float) -> Di
 def _pick_fvg_entry(struct: Dict[str, Any], entry_mkt: float, bias: str, atr: float) -> Tuple[Optional[float], str]:
     """
     Retourne (entry_price, note). None si pas exploitable.
-    On prend une FVG proche (<= 1.5 ATR) et alignée directionnellement.
+
+    Les zones FVG peuvent venir de plusieurs implémentations, on supporte :
+      - {start, end, type} (structure_utils.py)
+      - {low, high} / {bottom, top} (fallback)
     """
     zones = struct.get("fvg_zones") or []
     if not zones:
         return None, "no_fvg"
 
-    best = None
+    bias = (bias or "").upper()
+    want_bull = bias == "LONG"
+    max_dist_atr = 1.8  # desk default (free) ; assez strict pour éviter les ordres trop loin
+
+    best_mid = None
     best_dist = 1e18
+    best_note = "no_candidate"
 
     for z in zones:
         try:
-            zl = float(z.get("low") if z.get("low") is not None else z.get("bottom"))
-            zh = float(z.get("high") if z.get("high") is not None else z.get("top"))
-            if zh <= zl:
+            # --- parse zone bounds ---
+            candidates = []
+            for k in ("start", "end", "low", "high", "bottom", "top"):
+                v = z.get(k)
+                if v is not None:
+                    candidates.append(float(v))
+            if len(candidates) < 2:
                 continue
+            zmin, zmax = float(min(candidates)), float(max(candidates))
+            mid = (zmin + zmax) / 2.0
 
-            # direction (si présent)
-            zdir = (z.get("direction") or z.get("dir") or "").lower()
-            if bias == "LONG" and zdir and "bear" in zdir:
-                continue
-            if bias == "SHORT" and zdir and "bull" in zdir:
-                continue
+            # --- optional type filter ---
+            zt = str(z.get("type", "")).lower()
+            if zt:
+                is_bull = any(s in zt for s in ("bull", "up", "long"))
+                is_bear = any(s in zt for s in ("bear", "down", "short"))
+                if want_bull and is_bear:
+                    continue
+                if (not want_bull) and is_bull:
+                    continue
 
-            mid = (zl + zh) / 2.0
+            # --- directional preference ---
+            # Long: FVG en dessous (ou prix dans la zone). Short: au dessus (ou prix dans la zone).
+            if want_bull:
+                if entry_mkt < zmin and (atr > 0 and (zmin - entry_mkt) > 0.35 * atr):
+                    # prix trop bas par rapport à une FVG au-dessus -> pas logique
+                    continue
+            else:
+                if entry_mkt > zmax and (atr > 0 and (entry_mkt - zmax) > 0.35 * atr):
+                    continue
+
             dist = abs(entry_mkt - mid)
 
-            # on accepte si proche d'une zone (ou dedans)
-            in_zone = zl <= entry_mkt <= zh
-            if in_zone:
-                dist = 0.0
+            # taille de zone anormale vs ATR (évite les "fvg" gigantesques)
+            width = abs(zmax - zmin)
+            if atr > 0 and width > 3.0 * atr:
+                continue
 
             if dist < best_dist:
                 best_dist = dist
-                best = mid
-
+                # si déjà DANS la zone, on prend le prix marché -> fill quasi immédiat
+                if zmin <= entry_mkt <= zmax:
+                    best_mid = float(entry_mkt)
+                    best_note = f"fvg_in_zone z=[{zmin:.6g},{zmax:.6g}]"
+                else:
+                    best_mid = float(mid)
+                    best_note = f"fvg_ok z=[{zmin:.6g},{zmax:.6g}]"
         except Exception:
             continue
 
-    if best is None:
+    if best_mid is None:
         return None, "no_fvg_parse"
 
-    if atr > 0 and best_dist > 1.5 * atr:
+    if atr > 0 and best_dist > max_dist_atr * atr:
         return None, f"fvg_too_far dist={best_dist:.6g} atr={atr:.6g}"
 
-    return float(best), f"fvg_ok dist={best_dist:.6g} atr={atr:.6g}"
+    return float(best_mid), f"{best_note} dist={best_dist:.6g} atr={atr:.6g}"
 
 
 def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[str, Any]:
     """
-    Logique desk (2025-12):
+    Logique desk (compatible LIMIT-only côté scanner) :
 
-    Priorité :
-      1) OTE (LIMIT) si on est dans la zone OU si la zone est *proche* (distance en ATR)
-      2) FVG (LIMIT) si une zone est exploitable et pas trop loin
-      3) fallback MARKET (en pratique: limit au prix spot pour exécution agressive)
+    1) On calcule une zone OTE (golden zone). Même si le prix n'est pas dedans,
+       on peut placer un LIMIT dans la zone *si elle est raisonnablement proche*.
+    2) Sinon, on tente une entrée via FVG la plus proche.
+    3) Sinon, fallback "MARKET" (limit au prix spot) = à réserver aux setups très forts.
 
-    Note importante :
-      - indicators.compute_ote() retourne {in_ote, ote_low, ote_high} (pas 'entry'/'in_zone').
-      - Ici on reconstruit une entry "desk" :
-          * in_ote => entry = prix actuel (limit au spot)
-          * near_ote => entry = bord de zone le plus logique (retrace pending)
+    IMPORTANT: le scanner actuel envoie une entrée LIMIT. Donc "MARKET" ici signifie :
+    "pas de zone exploitable, on rentre au prix actuel".
     """
     entry_mkt = float(df_h1["close"].iloc[-1])
     atr = _atr(df_h1, 14)
-    bias = (bias or "").upper()
 
-    # --- OTE zone (directionnel) ---
-    ote_low = None
-    ote_high = None
-    in_ote = False
+    bias_u = (bias or "").upper()
+    max_zone_dist_atr = 1.20  # au-delà, on évite de placer un ordre trop loin (desk filter)
+
+    # -------------------------------------------------------
+    # 1) OTE (compute_ote retourne: in_ote, ote_low, ote_high)
+    # -------------------------------------------------------
+    ote = {}
+    ote_low = ote_high = None
+    ote_in_zone = False
     ote_note = "ote_unavailable"
+    ote_mid = None
+    ote_dist = None
 
     try:
-        # On calcule un OTE directionnel stable (ICT golden zone)
-        lookback = 50
-        sub = df_h1.tail(lookback)
-        hi = float(sub["high"].max())
-        lo = float(sub["low"].min())
-        if hi > lo:
-            diff = hi - lo
-
-            if bias == "LONG":
-                # retracement down depuis le high
-                lvl1 = hi - 0.62 * diff
-                lvl2 = hi - 0.705 * diff
-            else:
-                # SHORT: retracement up depuis le low
-                lvl1 = lo + 0.62 * diff
-                lvl2 = lo + 0.705 * diff
-
-            ote_low = float(min(lvl1, lvl2))
-            ote_high = float(max(lvl1, lvl2))
-            in_ote = bool(ote_low <= entry_mkt <= ote_high)
-
-            # distance au bord le plus proche (0 si dedans)
-            if in_ote:
-                dist = 0.0
-            else:
-                if entry_mkt > ote_high:
-                    dist = entry_mkt - ote_high
-                else:
-                    dist = ote_low - entry_mkt
-
-            ote_note = f"ote bias={bias} in_ote={in_ote} zone=[{ote_low:.6g},{ote_high:.6g}] dist={dist:.6g} atr={atr:.6g}"
-        else:
-            ote_note = "ote_bad_swing"
+        ote = compute_ote(df_h1, bias_u) or {}
+        ote_in_zone = bool(ote.get("in_ote", False))
+        if ote.get("ote_low") is not None and ote.get("ote_high") is not None:
+            ote_low = float(ote["ote_low"])
+            ote_high = float(ote["ote_high"])
+            # sécurité
+            zl, zh = min(ote_low, ote_high), max(ote_low, ote_high)
+            ote_mid = (zl + zh) / 2.0
+            ote_dist = abs(entry_mkt - ote_mid)
+            ote_note = f"ote z=[{zl:.6g},{zh:.6g}] in_ote={ote_in_zone}"
     except Exception as e:
         ote_note = f"ote_error {e}"
 
-    # Règle desk: on accepte OTE si dedans, ou si zone proche (par ATR)
-    OTE_NEAR_ATR_MULT = 0.35  # assez strict, évite de 'chasser' une zone trop loin
-    if ote_low is not None and ote_high is not None:
-        if in_ote:
-            return {
-                "entry_used": float(entry_mkt),
-                "entry_type": "OTE",
-                "order_type": "LIMIT",
-                "in_zone": True,
-                "note": ote_note,
-                "entry_mkt": entry_mkt,
-                "atr": atr,
-                "ote_low": ote_low,
-                "ote_high": ote_high,
-            }
+    # -------------------------------------------------------
+    # 2) FVG candidate
+    # -------------------------------------------------------
+    fvg_entry, fvg_note = _pick_fvg_entry(struct, entry_mkt, bias_u, atr)
 
-        # near-zone: seulement si la zone est du bon côté (retrace pas encore fait)
-        if atr > 0:
-            # LONG: prix au-dessus de la zone -> on attend un pullback dans la zone
-            if bias == "LONG" and entry_mkt > ote_high:
-                dist = entry_mkt - ote_high
-                if dist <= OTE_NEAR_ATR_MULT * atr:
-                    return {
-                        "entry_used": float(ote_high),  # bord supérieur = first touch
-                        "entry_type": "OTE",
-                        "order_type": "LIMIT",
-                        "in_zone": False,
-                        "note": ote_note + f" | near(mult={OTE_NEAR_ATR_MULT})",
-                        "entry_mkt": entry_mkt,
-                        "atr": atr,
-                        "ote_low": ote_low,
-                        "ote_high": ote_high,
-                    }
+    # -------------------------------------------------------
+    # 3) Choix final (priorité au plus proche, tie -> OTE)
+    # -------------------------------------------------------
+    candidates = []
 
-            # SHORT: prix en-dessous de la zone -> on attend un pullback dans la zone
-            if bias == "SHORT" and entry_mkt < ote_low:
-                dist = ote_low - entry_mkt
-                if dist <= OTE_NEAR_ATR_MULT * atr:
-                    return {
-                        "entry_used": float(ote_low),  # bord inférieur = first touch
-                        "entry_type": "OTE",
-                        "order_type": "LIMIT",
-                        "in_zone": False,
-                        "note": ote_note + f" | near(mult={OTE_NEAR_ATR_MULT})",
-                        "entry_mkt": entry_mkt,
-                        "atr": atr,
-                        "ote_low": ote_low,
-                        "ote_high": ote_high,
-                    }
+    if ote_mid is not None and ote_dist is not None:
+        if (atr <= 0) or (ote_dist <= max_zone_dist_atr * atr) or ote_in_zone:
+            # si dans la zone -> on prend prix marché (fill rapide), sinon milieu de zone
+            entry_used = entry_mkt if ote_in_zone else float(ote_mid)
+            candidates.append(("OTE", entry_used, ote_note, ote_dist))
 
-    # --- FVG ---
-    fvg_entry, fvg_note = _pick_fvg_entry(struct, entry_mkt, bias, atr)
     if fvg_entry is not None:
+        dist = abs(entry_mkt - float(fvg_entry))
+        if (atr <= 0) or (dist <= max_zone_dist_atr * atr):
+            candidates.append(("FVG", float(fvg_entry), fvg_note, dist))
+
+    if candidates:
+        # pick closest
+        candidates.sort(key=lambda x: (x[3], 0 if x[0] == "OTE" else 1))
+        etype, entry_used, note, dist = candidates[0]
         return {
-            "entry_used": float(fvg_entry),
-            "entry_type": "FVG",
+            "entry_used": float(entry_used),
+            "entry_type": etype,
             "order_type": "LIMIT",
-            "in_zone": False,
-            "note": fvg_note,
+            "in_zone": bool(etype == "OTE" and ote_in_zone) or ("in_zone" in note),
+            "note": note,
             "entry_mkt": entry_mkt,
             "atr": atr,
-            "ote_low": ote_low,
-            "ote_high": ote_high,
+            "dist": float(dist),
+            "dist_atr": float(dist / atr) if atr and atr > 0 else None,
+            "ote": ote if isinstance(ote, dict) else {},
         }
 
-    # --- MARKET fallback (limit au spot) ---
+    # fallback: pas de zone exploitable
     return {
         "entry_used": entry_mkt,
         "entry_type": "MARKET",
         "order_type": "LIMIT",
         "in_zone": False,
-        "note": "no_zone_entry",
+        "note": f"no_zone_entry (atr={atr:.6g})",
         "entry_mkt": entry_mkt,
         "atr": atr,
-        "ote_low": ote_low,
-        "ote_high": ote_high,
+        "dist": 0.0,
+        "dist_atr": 0.0,
+        "ote": ote if isinstance(ote, dict) else {},
     }
 
 
@@ -429,19 +414,11 @@ class SignalAnalyzer:
 
         if REQUIRE_MOMENTUM:
             if bias == "LONG" and mom not in ("BULLISH", "STRONG_BULLISH"):
-                # Desk override (réduit les rejets) : si composite momentum est franchement bullish, on laisse passer
-                if DESK_EV_MODE and comp_score >= 70.0 and comp_label in ("BULLISH", "SLIGHT_BULLISH"):
-                    LOGGER.info("[EVAL_WARN] momentum_not_bullish but composite_override")
-                else:
-                    LOGGER.info("[EVAL_REJECT] momentum_not_bullish")
-                    return {"valid": False, "reject_reason": "momentum_not_bullish", "institutional": inst, "structure": struct}
-
+                LOGGER.info("[EVAL_REJECT] momentum_not_bullish")
+                return {"valid": False, "reject_reason": "momentum_not_bullish", "institutional": inst, "structure": struct}
             if bias == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
-                if DESK_EV_MODE and comp_score >= 70.0 and comp_label in ("BEARISH", "SLIGHT_BEARISH"):
-                    LOGGER.info("[EVAL_WARN] momentum_not_bearish but composite_override")
-                else:
-                    LOGGER.info("[EVAL_REJECT] momentum_not_bearish")
-                    return {"valid": False, "reject_reason": "momentum_not_bearish", "institutional": inst, "structure": struct}
+                LOGGER.info("[EVAL_REJECT] momentum_not_bearish")
+                return {"valid": False, "reject_reason": "momentum_not_bearish", "institutional": inst, "structure": struct}
 
         if ext_sig == "OVEREXTENDED_LONG" and bias == "LONG":
             LOGGER.info("[EVAL_REJECT] overextended_long")
@@ -469,6 +446,11 @@ class SignalAnalyzer:
             f"entry_used={entry} in_zone={entry_pick.get('in_zone')} note={note} atr={entry_pick.get('atr')}"
         )
 
+        # Desk rule : si entry_type = OTE/FVG, on refuse si le setup n'est PAS "zone compatible".
+        # Ici, on autorise OTE/FVG uniquement sur BOS_STRICT (retest) ou continuation,
+        # MAIS on ne force pas : c'est déjà choisi uniquement si exploitable.
+        # Donc pas besoin de reject ici.
+
         # ------------------------------------------------------------------
         # 8 — SL / TP1 / RR (TP2 supprimé)
         # ------------------------------------------------------------------
@@ -492,7 +474,7 @@ class SignalAnalyzer:
         bos_strict_ok = False
         if bos_flag:
             if (not REQUIRE_BOS_QUALITY) or bos_quality_ok:
-                # si bypass inst, on ne valide que du BOS_STRICT A+ avec RR strict
+                # si bypass inst, on ne valide que du BOS_STRICT (A+) avec RR strict
                 if bypass_inst:
                     if rr >= RR_MIN_STRICT:
                         bos_strict_ok = True
@@ -526,8 +508,6 @@ class SignalAnalyzer:
                 "institutional": inst,
                 "momentum": mom,
                 "composite": comp,
-                "vol_regime": vol_regime,
-                "extension": ext_sig,
                 "premium": premium,
                 "discount": discount,
             }
@@ -579,8 +559,6 @@ class SignalAnalyzer:
                 "institutional": inst,
                 "momentum": mom,
                 "composite": comp,
-                "vol_regime": vol_regime,
-                "extension": ext_sig,
                 "premium": premium,
                 "discount": discount,
             }
@@ -599,7 +577,5 @@ class SignalAnalyzer:
             "institutional": inst,
             "bos_quality": bos_q,
             "entry_pick": entry_pick,
-            "vol_regime": vol_regime,
-            "extension": ext_sig,
             "rr": rr,
         }
