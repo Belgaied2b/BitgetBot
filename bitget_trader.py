@@ -407,6 +407,64 @@ class BitgetTrader:
             }
         return resp
 
+
+    async def place_market(
+        self,
+        symbol: str,
+        side: str,
+        price_ref: float,
+        size: Optional[float] = None,
+        client_oid: Optional[str] = None,
+        trade_side: Optional[str] = "open",
+        reduce_only: Optional[bool] = None,
+        tick_hint: Optional[float] = None,
+        debug_tag: str = "ENTRY",
+    ):
+        """Market order (Bitget v2 mix place-order).
+
+        - orderType=market
+        - price is omitted
+        - If size is None, uses (margin_usdt * leverage) / price_ref to compute qty.
+        """
+        sym = str(symbol).upper()
+        price_ref = float(price_ref)
+        if price_ref <= 0:
+            raise ValueError("price_ref must be > 0 for market sizing")
+
+        raw_qty = float(size) if size is not None else (float(self.margin_usdt) * float(self.leverage)) / price_ref
+        q_price, q_qty, tick_used = self._quantize(sym, price_ref, raw_qty, tick_hint=tick_hint)
+
+        payload = {
+            "symbol": sym,
+            "productType": self.product_type,
+            "marginCoin": self.margin_coin,
+            "marginMode": self.margin_mode,
+            "orderType": "market",
+            "side": str(side).lower(),
+            "size": str(q_qty),
+        }
+        if client_oid:
+            payload["clientOid"] = client_oid
+        if trade_side:
+            payload["tradeSide"] = trade_side
+        if reduce_only is not None:
+            payload["reduceOnly"] = "YES" if bool(reduce_only) else "NO"
+
+        logger.info(
+            "[ORDER_%s] sym=%s side=%s tradeSide=%s reduceOnly=%s price_ref=%s raw_qty=%s q_qty=%s tick_used=%s",
+            debug_tag,
+            sym,
+            payload.get("side"),
+            payload.get("tradeSide"),
+            payload.get("reduceOnly"),
+            price_ref,
+            raw_qty,
+            q_qty,
+            tick_used,
+        )
+        resp = await self._request_any_status("/api/v2/mix/order/place-order", payload, debug_tag=debug_tag)
+        return resp
+
     async def place_reduce_limit_tp(
         self,
         symbol: str,
