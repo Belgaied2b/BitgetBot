@@ -65,21 +65,30 @@ def _safe_last(series: pd.Series, default: float = np.nan) -> float:
         return float(default)
 
 
-def _clip01(x: float) -> float:
-    return float(max(0.0, min(1.0, float(x))))
-
-
 def _nan_to(x: float, default: float) -> float:
     try:
-        if not np.isfinite(float(x)):
+        xf = float(x)
+        if not np.isfinite(xf):
             return float(default)
-        return float(x)
+        return xf
     except Exception:
         return float(default)
 
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    """Missing helper fix (was causing NameError in extension_signal)."""
+    try:
+        x = float(x)
+        lo = float(lo)
+        hi = float(hi)
+        if lo > hi:
+            lo, hi = hi, lo
+        return max(lo, min(hi, x))
+    except Exception:
+        return float(lo)
+
+
 def _tanh_score(x: float) -> float:
-    # stable tanh mapping
     try:
         return float(np.tanh(float(x)))
     except Exception:
@@ -89,12 +98,14 @@ def _tanh_score(x: float) -> float:
 def _linreg_slope(y: pd.Series, n: int = 12) -> float:
     """
     Linear regression slope over last n points (normalized by price level).
-    Returns ~ small number, positive uptrend, negative downtrend.
+    Returns small number: positive uptrend, negative downtrend.
     """
     try:
         if y is None or len(y) < max(5, n):
             return 0.0
         w = y.tail(n).astype(float).values
+        if w.size < 5:
+            return 0.0
         x = np.arange(len(w), dtype=float)
         x = x - x.mean()
         w = w - w.mean()
@@ -102,7 +113,9 @@ def _linreg_slope(y: pd.Series, n: int = 12) -> float:
         if denom <= 0:
             return 0.0
         slope = float(np.sum(x * w) / denom)
-        level = float(abs(y.iloc[-1])) if float(abs(y.iloc[-1])) > 1e-12 else 1.0
+        level = float(abs(y.iloc[-1]))
+        if level <= 1e-12:
+            level = 1.0
         return float(slope / level)
     except Exception:
         return 0.0
@@ -140,7 +153,7 @@ def rsi(series_or_df: Any, length: int = 14) -> pd.Series:
     avg_gain = gain_series.ewm(alpha=1.0 / length, adjust=False).mean()
     avg_loss = loss_series.ewm(alpha=1.0 / length, adjust=False).mean()
 
-    rs = avg_gain / loss_series.replace(0.0, np.nan).ewm(alpha=1.0 / length, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
     out = 100.0 - (100.0 / (1.0 + rs))
     return out.replace([np.inf, -np.inf], np.nan).fillna(50.0)
 
@@ -169,7 +182,8 @@ def macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> p
 
 def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     if not _has_cols(df, ("high", "low", "close")):
-        return pd.Series([0.0])
+        # keep shape-safe output
+        return pd.Series(np.zeros(1, dtype=float))
 
     length = int(max(2, length))
     high = df["high"].astype(float)
@@ -198,7 +212,7 @@ def true_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
 def atr_pct(df: pd.DataFrame, length: int = 14) -> pd.Series:
     if not _has_cols(df, ("close", "high", "low")):
         return pd.Series([np.nan])
-    a = atr(df, length=length)
+    a = atr(df, length=int(length))
     c = df["close"].astype(float).replace(0.0, np.nan)
     return (a / c).replace([np.inf, -np.inf], np.nan)
 
@@ -288,19 +302,6 @@ def compute_ote(df: pd.DataFrame, bias: str, lookback: int = 60) -> Dict[str, An
     """
     Desk-grade OTE approximation for LIMIT entries.
 
-    We use swing range over lookback:
-      range = [low, high]
-
-    LONG:
-      - assume impulse from low -> high
-      - OTE zone = retracement from high: 0.62..0.705 of the range
-      - buy inside zone (discount)
-
-    SHORT:
-      - assume impulse from high -> low
-      - OTE zone = retracement from low: 0.62..0.705 of the range
-      - sell inside zone (premium)
-
     Output keys (compat with analyze_signal.py):
       - entry (zone mid)
       - in_zone (bool)
@@ -327,11 +328,9 @@ def compute_ote(df: pd.DataFrame, bias: str, lookback: int = 60) -> Dict[str, An
     diff = high - low
 
     if b == "LONG":
-        # retracement from high
         fib_62 = high - 0.62 * diff
         fib_705 = high - 0.705 * diff
     else:
-        # retracement from low (after dump)
         fib_62 = low + 0.62 * diff
         fib_705 = low + 0.705 * diff
 
@@ -344,24 +343,17 @@ def compute_ote(df: pd.DataFrame, bias: str, lookback: int = 60) -> Dict[str, An
     if in_zone:
         dist = 0.0
     else:
-        # distance to nearest bound
-        if last < ote_low:
-            dist = float(ote_low - last)
-        else:
-            dist = float(last - ote_high)
+        dist = float(ote_low - last) if last < ote_low else float(last - ote_high)
 
     return {
-        # analyzer-friendly
         "entry": entry,
         "entry_price": entry,
         "in_zone": in_zone,
         "ok": in_zone,
         "dist": dist,
-        # legacy keys
         "in_ote": in_zone,
         "ote_low": ote_low,
         "ote_high": ote_high,
-        # useful debug
         "swing_high": high,
         "swing_low": low,
         "last": last,
@@ -374,9 +366,6 @@ def compute_ote(df: pd.DataFrame, bias: str, lookback: int = 60) -> Dict[str, An
 # =====================================================================
 
 def volatility_regime(df: pd.DataFrame, atr_length: int = 14) -> str:
-    """
-    Uses smoothed ATR% over last bars to reduce noise.
-    """
     if df is None or df.empty or len(df) < int(atr_length) + 10:
         return "UNKNOWN"
 
@@ -384,7 +373,7 @@ def volatility_regime(df: pd.DataFrame, atr_length: int = 14) -> str:
     if ap is None or len(ap) < 5:
         return "UNKNOWN"
 
-    last = float(ap.tail(5).mean())  # smooth
+    last = float(ap.tail(5).mean())
     if not np.isfinite(last):
         return "UNKNOWN"
 
@@ -405,7 +394,7 @@ def extension_signal(df: pd.DataFrame, ema_fast_len: int = 20, ema_slow_len: int
       - distance vs EMA slow (dynamic threshold)
       - RSI extreme
     """
-    if df is None or df.empty or len(df) < max(int(ema_slow_len), 40) or not _has_cols(df, ("close",)):
+    if df is None or df.empty or len(df) < max(int(ema_slow_len), 40) or not _has_cols(df, ("close", "high", "low")):
         return None
 
     close = df["close"].astype(float)
@@ -422,8 +411,7 @@ def extension_signal(df: pd.DataFrame, ema_fast_len: int = 20, ema_slow_len: int
     dist_pct = float((last_close - last_ema) / last_ema)
 
     # dynamic dist threshold: bigger in high vol, smaller in low vol
-    ap = _safe_last(atr_pct(df, 14), np.nan)
-    ap = _nan_to(ap, 0.02)
+    ap = _nan_to(_safe_last(atr_pct(df, 14), np.nan), 0.02)
     thr = _clamp(2.5 * ap, 0.045, 0.12)  # desk: ~4.5%..12%
 
     if dist_pct > thr and last_rsi > 70:
@@ -439,14 +427,6 @@ def extension_signal(df: pd.DataFrame, ema_fast_len: int = 20, ema_slow_len: int
 
 def institutional_momentum(df: pd.DataFrame) -> str:
     """
-    Desk-grade momentum label:
-      - EMA20/EMA50 direction + EMA20 slope
-      - MACD direction + histogram
-      - RSI location
-      - RVOL (relative volume)
-      - ADX trend strength (filters chop)
-      - OBV slope (volume flow)
-
     Returns:
       STRONG_BULLISH / BULLISH / NEUTRAL / BEARISH / STRONG_BEARISH
     """
@@ -457,15 +437,13 @@ def institutional_momentum(df: pd.DataFrame) -> str:
 
     e20 = ema(close, 20)
     e50 = ema(close, 50)
-    spread = e20 - e50
-    spread_last = float(spread.iloc[-1])
+    spread_last = float((e20 - e50).iloc[-1])
 
-    # slope of EMA20 (trend persistence)
     e20_slope = _linreg_slope(e20, n=12)
 
     m = macd(df)
-    macd_last = float(m["macd"].iloc[-1]) if "macd" in m else 0.0
-    hist_last = float(m["hist"].iloc[-1]) if "hist" in m else 0.0
+    macd_last = float(m["macd"].iloc[-1]) if "macd" in m and len(m) else 0.0
+    hist_last = float(m["hist"].iloc[-1]) if "hist" in m and len(m) else 0.0
     hist_slope = _linreg_slope(m["hist"], n=10) if "hist" in m and len(m) >= 20 else 0.0
 
     r = rsi(close, 14)
@@ -473,25 +451,15 @@ def institutional_momentum(df: pd.DataFrame) -> str:
 
     rv = rel_volume(df, 40)
 
-    a = adx(df, 14)
-    adx_last = _safe_last(a, np.nan)
-    adx_last = _nan_to(adx_last, 18.0)
+    adx_last = _nan_to(_safe_last(adx(df, 14), np.nan), 18.0)
 
-    obv_s = obv(df)
-    obv_slope = _linreg_slope(obv_s, n=20)
+    obv_slope = _linreg_slope(obv(df), n=20)
 
     score = 0.0
 
     # EMA direction + slope
-    if spread_last > 0:
-        score += 1.0
-    elif spread_last < 0:
-        score -= 1.0
-
-    if e20_slope > 0.0006:
-        score += 0.5
-    elif e20_slope < -0.0006:
-        score -= 0.5
+    score += 1.0 if spread_last > 0 else (-1.0 if spread_last < 0 else 0.0)
+    score += 0.5 if e20_slope > 0.0006 else (-0.5 if e20_slope < -0.0006 else 0.0)
 
     # MACD + hist + hist slope
     if macd_last > 0 and hist_last > 0:
@@ -499,34 +467,19 @@ def institutional_momentum(df: pd.DataFrame) -> str:
     elif macd_last < 0 and hist_last < 0:
         score -= 1.0
 
-    if hist_slope > 0.0005:
-        score += 0.25
-    elif hist_slope < -0.0005:
-        score -= 0.25
+    score += 0.25 if hist_slope > 0.0005 else (-0.25 if hist_slope < -0.0005 else 0.0)
 
     # RSI
-    if r_last > 60:
-        score += 0.5
-    elif r_last < 40:
-        score -= 0.5
+    score += 0.5 if r_last > 60 else (-0.5 if r_last < 40 else 0.0)
 
     # RVOL
-    if rv > 1.6:
-        score += 0.5
-    elif rv < 0.7:
-        score -= 0.35
+    score += 0.5 if rv > 1.6 else (-0.35 if rv < 0.7 else 0.0)
 
-    # ADX (avoid giving strong labels in chop)
-    if adx_last >= 28:
-        score += 0.35
-    elif adx_last <= 14:
-        score -= 0.35
+    # ADX (avoid strong labels in chop)
+    score += 0.35 if adx_last >= 28 else (-0.35 if adx_last <= 14 else 0.0)
 
-    # OBV slope (volume flow confirmation)
-    if obv_slope > 0.0005:
-        score += 0.25
-    elif obv_slope < -0.0005:
-        score -= 0.25
+    # OBV slope
+    score += 0.25 if obv_slope > 0.0005 else (-0.25 if obv_slope < -0.0005 else 0.0)
 
     if score >= 2.2:
         return "STRONG_BULLISH"
@@ -547,16 +500,7 @@ def composite_momentum(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Desk composite score in [0,100] with richer components.
 
-    Components:
-      - trend_dir (EMA spread)
-      - trend_slope (EMA20 slope)
-      - macd (tanh of macd+hist)
-      - rsi (normalized)
-      - rvol (relative volume)
-      - adx (trend strength)
-      - obv_flow (obv slope)
-      - chop_penalty (bb width low + adx low)
-      - ext_penalty (overextension)
+    Labels include STRONG_* to match analyze_signal.py filters.
     """
     if df is None or df.empty or len(df) < 80 or not _has_cols(df, ("close", "volume", "high", "low")):
         return {"score": 50.0, "label": "NEUTRAL", "components": {}}
@@ -568,7 +512,7 @@ def composite_momentum(df: pd.DataFrame) -> Dict[str, Any]:
     spread_last = float((e20 - e50).iloc[-1])
 
     trend_dir = 1.0 if spread_last > 0 else (-1.0 if spread_last < 0 else 0.0)
-    trend_slope = _linreg_slope(e20, n=12)  # small
+    trend_slope = _linreg_slope(e20, n=12)
 
     m = macd(df)
     macd_last = float(m["macd"].iloc[-1])
@@ -577,15 +521,12 @@ def composite_momentum(df: pd.DataFrame) -> Dict[str, Any]:
 
     r = rsi(close, 14)
     r_last = float(r.iloc[-1])
-    rsi_score = float(np.clip((r_last - 50.0) / 20.0, -2.0, 2.0))  # stronger scaling than before
+    rsi_score = float(np.clip((r_last - 50.0) / 20.0, -2.0, 2.0))
 
     rv = rel_volume(df, 40)
-    # map rvol around 1.0 into [-1..+1] with saturation
     rvol_score = float(np.clip((rv - 1.0) / 0.8, -1.0, 1.0))
 
-    a = adx(df, 14)
-    adx_last = _nan_to(_safe_last(a, np.nan), 18.0)
-    # ADX score: <15 bearish for trend quality, >30 bullish (trend healthy)
+    adx_last = _nan_to(_safe_last(adx(df, 14), np.nan), 18.0)
     adx_score = float(np.clip((adx_last - 20.0) / 15.0, -1.0, 1.0))
 
     obv_s = obv(df)
@@ -594,9 +535,8 @@ def composite_momentum(df: pd.DataFrame) -> Dict[str, Any]:
 
     # Chop/squeeze detection
     bb = bollinger(df, 20, 2.0)
-    bb_width_last = _safe_last(bb["width"], np.nan)
-    bb_width_last = _nan_to(bb_width_last, 0.05)
-    # low width + low adx => chop penalty
+    bb_width_last = _nan_to(_safe_last(bb["width"], np.nan), 0.05)
+
     chop_penalty = 0.0
     if bb_width_last < 0.03 and adx_last < 16:
         chop_penalty = -0.8
@@ -607,10 +547,9 @@ def composite_momentum(df: pd.DataFrame) -> Dict[str, Any]:
     ext = extension_signal(df)
     ext_penalty = -0.7 if ext in ("OVEREXTENDED_LONG", "OVEREXTENDED_SHORT") else 0.0
 
-    # Combine (desk weights)
     raw = (
         1.00 * trend_dir
-        + 1.10 * (trend_slope / 0.002)          # normalize slope into ~[-1..+1] region
+        + 1.10 * (trend_slope / 0.002)          # normalize slope
         + 0.95 * macd_score
         + 0.85 * (rsi_score / 2.0)
         + 0.60 * rvol_score
@@ -620,14 +559,18 @@ def composite_momentum(df: pd.DataFrame) -> Dict[str, Any]:
         + 1.00 * ext_penalty
     )
 
-    # score 0..100 via tanh
-    score = 50.0 + 45.0 * _tanh_score(raw)   # wider spread (closer to desk intuition)
+    score = 50.0 + 45.0 * _tanh_score(raw)
     score = float(np.clip(score, 0.0, 100.0))
 
-    if score >= 72:
+    # Labels compatible with analyze_signal.py checks
+    if score >= 86:
+        label = "STRONG_BULLISH"
+    elif score >= 72:
         label = "BULLISH"
     elif score >= 56:
         label = "SLIGHT_BULLISH"
+    elif score <= 14:
+        label = "STRONG_BEARISH"
     elif score <= 28:
         label = "BEARISH"
     elif score <= 44:
