@@ -1,9 +1,24 @@
 # =====================================================================
-# stops.py — Desk Lead Institutional Stop Engine (FULL VERSION)
+# stops.py — Desk Lead Institutional Stop Engine (PRO v2)
 # Compatible with analyze_signal.py (protective_stop_long / protective_stop_short)
 # =====================================================================
+# Desk-lead upgrades:
+# - Directional tick rounding (LONG SL rounds DOWN, SHORT SL rounds UP)
+# - Uses settings.py if present (ATR_LEN, ATR_MULT_SL, buffers, caps, min ticks)
+# - Structural SL candidates:
+#     * Swing-based (most recent swing beyond entry)
+#     * Liquidity-based (equal highs/lows) with dedicated liquidity buffer
+#     * ATR-based (risk cap / fallback)
+# - Guardrails:
+#     * Minimum SL distance in ticks (avoid “too tight”)
+#     * Maximum SL distance in % (avoid absurd SL)
+#     * Always enforce SL side correct vs entry
+# - Rich meta payload for logs/debug (chosen ref, buffers, ticks, pct)
+# =====================================================================
 
-from typing import Dict, Any, Tuple
+from __future__ import annotations
+
+from typing import Dict, Any, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -13,93 +28,391 @@ from indicators import true_atr
 
 
 # =====================================================================
-# Helper — Round to Tick
+# Optional settings (safe defaults)
 # =====================================================================
 
-def _round_to_tick(price: float, tick: float) -> float:
-    """Round a price to the nearest valid tick.
+try:
+    from settings import (
+        ATR_LEN,
+        ATR_MULT_SL,
+        ATR_MULT_SL_CAP,
+        SL_BUFFER_PCT,
+        SL_BUFFER_TICKS,
+        MIN_SL_TICKS,
+        MAX_SL_PCT,
+        LIQ_BUFFER_PCT,
+        LIQ_BUFFER_TICKS,
+        STRUCT_LOOKBACK,
+    )
+except Exception:
+    ATR_LEN = 14
+    ATR_MULT_SL = 2.5
+    ATR_MULT_SL_CAP = 3.5
 
-    We keep it simple: nearest multiple of tick. If tick is invalid,
-    return price unchanged.
-    """
+    SL_BUFFER_PCT = 0.0020
+    SL_BUFFER_TICKS = 3
+    MIN_SL_TICKS = 3
+    MAX_SL_PCT = 0.07
+
+    LIQ_BUFFER_PCT = 0.0008
+    LIQ_BUFFER_TICKS = 3
+
+    STRUCT_LOOKBACK = 60
+
+
+REQUIRED_COLS = ("open", "high", "low", "close", "volume")
+
+
+def _ensure_ohlcv(df: pd.DataFrame) -> bool:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return False
+    for c in REQUIRED_COLS:
+        if c not in df.columns:
+            return False
+    return True
+
+
+# =====================================================================
+# Tick rounding (directional)
+# =====================================================================
+
+def _safe_tick(tick: float) -> float:
     try:
-        tick = float(tick)
-        if not np.isfinite(tick) or tick <= 0:
-            return float(price)
-        return float(round(float(price) / tick) * tick)
+        t = float(tick)
+        if not np.isfinite(t) or t <= 0:
+            return 0.0
+        return t
     except Exception:
+        return 0.0
+
+
+def _floor_to_tick(price: float, tick: float) -> float:
+    """
+    Floors price to tick grid (safe for LONG stops: ensure stop is not above intended).
+    """
+    t = _safe_tick(tick)
+    if t <= 0:
         return float(price)
+    p = float(price)
+    return float(np.floor(p / t) * t)
+
+
+def _ceil_to_tick(price: float, tick: float) -> float:
+    """
+    Ceils price to tick grid (safe for SHORT stops: ensure stop is not below intended).
+    """
+    t = _safe_tick(tick)
+    if t <= 0:
+        return float(price)
+    p = float(price)
+    return float(np.ceil(p / t) * t)
 
 
 # =====================================================================
-# Internal helpers — structural references & ATR
+# ATR
 # =====================================================================
-
-def _get_last_swing_low(df: pd.DataFrame) -> float:
-    swings = find_swings(df)
-    lows = swings.get("lows", []) or []
-    if not lows:
-        # fallback: recent min low
-        return float(df["low"].tail(30).min())
-    # last swing low (most recent)
-    return float(lows[-1][1])
-
-
-def _get_last_swing_high(df: pd.DataFrame) -> float:
-    swings = find_swings(df)
-    highs = swings.get("highs", []) or []
-    if not highs:
-        # fallback: recent max high
-        return float(df["high"].tail(30).max())
-    # last swing high (most recent)
-    return float(highs[-1][1])
-
-
-def _get_liquidity_low(df: pd.DataFrame, entry: float) -> float:
-    """Return the most relevant equal-lows level below price.
-
-    We look for the *highest* equal low strictly below entry. If none,
-    return np.nan and let the caller fallback to swing.
-    """
-    liq = detect_equal_levels(df)
-    eq_lows = liq.get("eq_lows", []) or []
-    below = [lvl for lvl in eq_lows if lvl < entry]
-    if not below:
-        return np.nan
-    # highest equal low below price
-    return float(max(below))
-
-
-def _get_liquidity_high(df: pd.DataFrame, entry: float) -> float:
-    """Return the most relevant equal-highs level above price.
-
-    We look for the *lowest* equal high strictly above entry. If none,
-    return np.nan and let the caller fallback to swing.
-    """
-    liq = detect_equal_levels(df)
-    eq_highs = liq.get("eq_highs", []) or []
-    above = [lvl for lvl in eq_highs if lvl > entry]
-    if not above:
-        return np.nan
-    # lowest equal high above price
-    return float(min(above))
-
 
 def _get_atr_value(df: pd.DataFrame, length: int = 14) -> float:
-    """Return latest true ATR value with robust fallbacks."""
+    """
+    Return latest true ATR value with robust fallbacks.
+    """
     try:
-        atr_series = true_atr(df, length=length)
-        val = float(atr_series.iloc[-1])
-        if np.isnan(val) or not np.isfinite(val):
-            raise ValueError("ATR nan")
-        return val
-    except Exception:
-        # Fallback: simple range-based proxy on last N bars
-        w = df.tail(max(length, 10))
-        if len(w) == 0:
+        if not _ensure_ohlcv(df) or len(df) < max(20, length + 2):
             return 0.0
-        approx = float((w["high"].max() - w["low"].min()) / max(len(w), 1))
-        return approx if np.isfinite(approx) else 0.0
+
+        atr_series = true_atr(df, length=int(length))
+        val = float(atr_series.iloc[-1])
+        if not np.isfinite(val) or val <= 0:
+            raise ValueError("ATR invalid")
+        return float(val)
+    except Exception:
+        # fallback proxy
+        try:
+            w = df.tail(max(int(length), 14))
+            if w.empty:
+                return 0.0
+            approx = float((w["high"].astype(float).max() - w["low"].astype(float).min()) / max(len(w), 1))
+            return float(approx) if np.isfinite(approx) and approx > 0 else 0.0
+        except Exception:
+            return 0.0
+
+
+# =====================================================================
+# Structural references (swings / liquidity)
+# =====================================================================
+
+def _get_struct_window(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        n = int(STRUCT_LOOKBACK) if int(STRUCT_LOOKBACK) > 20 else 60
+    except Exception:
+        n = 60
+    return df.tail(n)
+
+
+def _last_swing_low_below(df: pd.DataFrame, entry: float) -> Optional[float]:
+    """
+    Pick the most recent swing low that is strictly below entry.
+    If none, fallback to min low in a recent window.
+    """
+    try:
+        sub = _get_struct_window(df)
+        swings = find_swings(sub)
+        lows = swings.get("lows", []) or []
+        # walk backwards: most recent swing low below entry
+        for _, p in reversed(lows):
+            if np.isfinite(p) and float(p) < float(entry):
+                return float(p)
+        # fallback
+        v = float(sub["low"].astype(float).min())
+        return float(v) if np.isfinite(v) else None
+    except Exception:
+        return None
+
+
+def _last_swing_high_above(df: pd.DataFrame, entry: float) -> Optional[float]:
+    """
+    Pick the most recent swing high that is strictly above entry.
+    If none, fallback to max high in a recent window.
+    """
+    try:
+        sub = _get_struct_window(df)
+        swings = find_swings(sub)
+        highs = swings.get("highs", []) or []
+        for _, p in reversed(highs):
+            if np.isfinite(p) and float(p) > float(entry):
+                return float(p)
+        v = float(sub["high"].astype(float).max())
+        return float(v) if np.isfinite(v) else None
+    except Exception:
+        return None
+
+
+def _liq_low_below(df: pd.DataFrame, entry: float) -> Optional[float]:
+    """
+    Highest equal-low strictly below entry (closest liquidity pool under price).
+    """
+    try:
+        sub = df.tail(max(120, int(STRUCT_LOOKBACK)))
+        liq = detect_equal_levels(sub)
+        eq_lows = liq.get("eq_lows", []) or []
+        below = [float(x) for x in eq_lows if np.isfinite(x) and float(x) < float(entry)]
+        if not below:
+            return None
+        return float(max(below))
+    except Exception:
+        return None
+
+
+def _liq_high_above(df: pd.DataFrame, entry: float) -> Optional[float]:
+    """
+    Lowest equal-high strictly above entry (closest liquidity pool over price).
+    """
+    try:
+        sub = df.tail(max(120, int(STRUCT_LOOKBACK)))
+        liq = detect_equal_levels(sub)
+        eq_highs = liq.get("eq_highs", []) or []
+        above = [float(x) for x in eq_highs if np.isfinite(x) and float(x) > float(entry)]
+        if not above:
+            return None
+        return float(min(above))
+    except Exception:
+        return None
+
+
+# =====================================================================
+# Buffers / guardrails
+# =====================================================================
+
+def _buffer_price(entry: float, tick: float, pct: float, ticks: int) -> float:
+    """
+    Returns a positive buffer in price units.
+    Uses max(pct*entry, ticks*tick).
+    """
+    entry_f = float(entry)
+    t = _safe_tick(tick)
+    pct_buf = abs(entry_f) * float(pct) if np.isfinite(entry_f) else 0.0
+    tick_buf = float(ticks) * t if t > 0 else 0.0
+    out = float(max(pct_buf, tick_buf, 0.0))
+    return out
+
+
+def _enforce_min_distance_long(sl: float, entry: float, tick: float) -> float:
+    """
+    Ensure entry - sl >= MIN_SL_TICKS * tick (if tick known).
+    """
+    t = _safe_tick(tick)
+    if t <= 0:
+        return float(sl)
+
+    min_dist = float(max(int(MIN_SL_TICKS), 0)) * t
+    if min_dist <= 0:
+        return float(sl)
+
+    if (float(entry) - float(sl)) < min_dist:
+        return float(entry) - min_dist
+    return float(sl)
+
+
+def _enforce_min_distance_short(sl: float, entry: float, tick: float) -> float:
+    """
+    Ensure sl - entry >= MIN_SL_TICKS * tick (if tick known).
+    """
+    t = _safe_tick(tick)
+    if t <= 0:
+        return float(sl)
+
+    min_dist = float(max(int(MIN_SL_TICKS), 0)) * t
+    if min_dist <= 0:
+        return float(sl)
+
+    if (float(sl) - float(entry)) < min_dist:
+        return float(entry) + min_dist
+    return float(sl)
+
+
+def _cap_max_distance(sl: float, entry: float, side: str) -> float:
+    """
+    Hard cap SL distance in % of entry (MAX_SL_PCT) to avoid insane stops.
+    If structural stop is too wide, we clamp closer using ATR_MULT_SL_CAP*ATR
+    in the caller, then still enforce MAX_SL_PCT here.
+    """
+    entry_f = float(entry)
+    sl_f = float(sl)
+    if not (np.isfinite(entry_f) and np.isfinite(sl_f)) or entry_f == 0:
+        return sl_f
+
+    max_pct = float(MAX_SL_PCT)
+    if max_pct <= 0:
+        return sl_f
+
+    if side == "LONG":
+        # want sl <= entry, cap: entry - sl <= max_pct*entry
+        max_dist = abs(entry_f) * max_pct
+        dist = entry_f - sl_f
+        if dist > max_dist:
+            return entry_f - max_dist
+        return sl_f
+
+    # SHORT
+    max_dist = abs(entry_f) * max_pct
+    dist = sl_f - entry_f
+    if dist > max_dist:
+        return entry_f + max_dist
+    return sl_f
+
+
+# =====================================================================
+# Candidate builder
+# =====================================================================
+
+def _build_long_candidates(df: pd.DataFrame, entry: float, tick: float) -> Dict[str, float]:
+    """
+    Returns dict of candidate SL raw (unrounded) prices for LONG.
+    Lower is wider. We will choose the best (desk).
+    """
+    entry_f = float(entry)
+    atr_v = _get_atr_value(df, length=int(ATR_LEN))
+
+    gen_buf = _buffer_price(entry_f, tick, float(SL_BUFFER_PCT), int(SL_BUFFER_TICKS))
+    liq_buf = _buffer_price(entry_f, tick, float(LIQ_BUFFER_PCT), int(LIQ_BUFFER_TICKS))
+
+    swing = _last_swing_low_below(df, entry_f)
+    liq = _liq_low_below(df, entry_f)
+
+    cands: Dict[str, float] = {}
+
+    # Swing-based
+    if swing is not None and np.isfinite(swing):
+        cands["SWING"] = float(swing) - gen_buf
+
+    # Liquidity-based: go BELOW the pool (stop hunt)
+    if liq is not None and np.isfinite(liq):
+        cands["LIQ"] = float(liq) - liq_buf
+
+    # ATR-based fallback / cap (not too tight by default)
+    if np.isfinite(atr_v) and atr_v > 0:
+        cands["ATR"] = entry_f - float(ATR_MULT_SL) * atr_v
+        cands["ATR_CAP"] = entry_f - float(ATR_MULT_SL_CAP) * atr_v
+
+    return cands
+
+
+def _build_short_candidates(df: pd.DataFrame, entry: float, tick: float) -> Dict[str, float]:
+    """
+    Returns dict of candidate SL raw (unrounded) prices for SHORT.
+    Higher is wider.
+    """
+    entry_f = float(entry)
+    atr_v = _get_atr_value(df, length=int(ATR_LEN))
+
+    gen_buf = _buffer_price(entry_f, tick, float(SL_BUFFER_PCT), int(SL_BUFFER_TICKS))
+    liq_buf = _buffer_price(entry_f, tick, float(LIQ_BUFFER_PCT), int(LIQ_BUFFER_TICKS))
+
+    swing = _last_swing_high_above(df, entry_f)
+    liq = _liq_high_above(df, entry_f)
+
+    cands: Dict[str, float] = {}
+
+    if swing is not None and np.isfinite(swing):
+        cands["SWING"] = float(swing) + gen_buf
+
+    if liq is not None and np.isfinite(liq):
+        cands["LIQ"] = float(liq) + liq_buf
+
+    if np.isfinite(atr_v) and atr_v > 0:
+        cands["ATR"] = entry_f + float(ATR_MULT_SL) * atr_v
+        cands["ATR_CAP"] = entry_f + float(ATR_MULT_SL_CAP) * atr_v
+
+    return cands
+
+
+def _choose_long_sl(entry: float, tick: float, candidates: Dict[str, float]) -> Tuple[float, str]:
+    """
+    Desk rule:
+      - We prefer the *tightest* SL that is still valid (below entry) and respects min ticks,
+        but we also cap max distance later.
+      - So we filter valid candidates and choose the one closest to entry (highest SL).
+    """
+    entry_f = float(entry)
+
+    valid = []
+    for k, sl in candidates.items():
+        if sl is None:
+            continue
+        slf = float(sl)
+        if np.isfinite(slf) and slf < entry_f:
+            valid.append((k, slf))
+
+    if not valid:
+        # fallback 4% under entry
+        return (entry_f * 0.96, "FALLBACK_PCT")
+
+    # choose highest SL (closest to entry)
+    best_k, best_sl = sorted(valid, key=lambda x: x[1], reverse=True)[0]
+    return float(best_sl), str(best_k)
+
+
+def _choose_short_sl(entry: float, tick: float, candidates: Dict[str, float]) -> Tuple[float, str]:
+    """
+    For SHORT, prefer the *tightest* valid SL above entry (lowest SL).
+    """
+    entry_f = float(entry)
+
+    valid = []
+    for k, sl in candidates.items():
+        if sl is None:
+            continue
+        slf = float(sl)
+        if np.isfinite(slf) and slf > entry_f:
+            valid.append((k, slf))
+
+    if not valid:
+        # fallback 4% above entry
+        return (entry_f * 1.04, "FALLBACK_PCT")
+
+    # choose lowest SL (closest to entry)
+    best_k, best_sl = sorted(valid, key=lambda x: x[1])[0]
+    return float(best_sl), str(best_k)
 
 
 # =====================================================================
@@ -112,76 +425,102 @@ def protective_stop_long(
     tick: float = 0.1,
     return_meta: bool = False,
 ) -> Tuple[float, Dict[str, Any]]:
-    """Institutional protective stop for LONGs.
-
-    Logic:
-    - Take last swing low (structural reference).
-    - Look for equal-lows (liquidity) below price.
-    - Base reference = min(swing_low, liq_low) when liq exists, else swing_low.
-    - Add small ATR buffer below that reference.
-    - Ensure stop < entry.
-    - Round to tick.
     """
+    Desk Lead protective stop for LONG.
+
+    Pipeline:
+      1) Build candidates (LIQ / SWING / ATR)
+      2) Pick tightest valid
+      3) Enforce min distance in ticks
+      4) Cap max distance in % (MAX_SL_PCT)
+      5) Directional rounding (FLOOR)
+      6) Final sanity: SL < entry
+    """
+    meta: Dict[str, Any] = {}
+
     try:
-        if df is None or len(df) < 20:
-            # ultra defensive fallback: 3-4% under entry
-            sl_raw = float(entry) * 0.96
-            sl_final = _round_to_tick(sl_raw, tick)
-            meta = {
-                "mode": "fallback_len",
-                "sl_raw": sl_raw,
-                "atr": None,
-                "last_swing_low": None,
-                "liq_low": None,
-            }
-            return (sl_final, meta) if return_meta else (sl_final, {})
-
         entry_f = float(entry)
+        t = _safe_tick(tick)
 
-        last_swing_low = _get_last_swing_low(df)
-        liq_low = _get_liquidity_low(df, entry_f)
+        if not _ensure_ohlcv(df) or len(df) < 20 or not np.isfinite(entry_f):
+            sl_raw = entry_f * 0.96
+            sl_raw = _enforce_min_distance_long(sl_raw, entry_f, t)
+            sl_raw = _cap_max_distance(sl_raw, entry_f, side="LONG")
+            sl_final = _floor_to_tick(sl_raw, t)
+            if sl_final >= entry_f and t > 0:
+                sl_final = _floor_to_tick(entry_f - max(float(MIN_SL_TICKS) * t, t), t)
 
-        if np.isnan(liq_low):
-            base_ref = last_swing_low
-        else:
-            base_ref = min(last_swing_low, liq_low)
+            meta = {
+                "mode": "fallback_df",
+                "chosen": "FALLBACK_PCT",
+                "entry": entry_f,
+                "tick": t,
+                "sl_raw": float(sl_raw),
+                "sl_final": float(sl_final),
+            }
+            return (float(sl_final), meta) if return_meta else (float(sl_final), {})
 
-        atr_val = _get_atr_value(df, length=14)
-        # buffer: 0.2 * ATR below the structural / liquidity level
-        sl_raw = base_ref - atr_val * 0.2
+        atr_v = _get_atr_value(df, length=int(ATR_LEN))
 
-        # Guard rails: ensure SL is below entry
+        cands = _build_long_candidates(df, entry_f, t)
+        sl_raw, chosen = _choose_long_sl(entry_f, t, cands)
+
+        # Guardrails
+        sl_raw = _enforce_min_distance_long(sl_raw, entry_f, t)
+        sl_raw = _cap_max_distance(sl_raw, entry_f, side="LONG")
+
+        # If still not below entry, force minimal safe
         if sl_raw >= entry_f:
-            sl_raw = entry_f - max(atr_val, entry_f * 0.01)
+            fallback = entry_f - max(atr_v, abs(entry_f) * 0.01, (float(MIN_SL_TICKS) * t if t > 0 else 0.0))
+            sl_raw = float(fallback)
+            chosen = "FORCED_BELOW_ENTRY"
 
-        # Ensure SL stays positive
-        if sl_raw <= 0:
-            sl_raw = entry_f * 0.9
+        # Round (floor) for safety
+        sl_final = _floor_to_tick(sl_raw, t)
 
-        sl_final = _round_to_tick(sl_raw, tick)
+        # Final sanity vs entry
+        if sl_final >= entry_f:
+            if t > 0:
+                sl_final = _floor_to_tick(entry_f - max(float(MIN_SL_TICKS) * t, t), t)
+            else:
+                sl_final = float(entry_f * 0.99)
+
+        dist_abs = float(entry_f - sl_final)
+        dist_pct = float(dist_abs / abs(entry_f)) if entry_f != 0 else None
+        dist_ticks = float(dist_abs / t) if t > 0 else None
 
         meta = {
             "mode": "ok",
-            "last_swing_low": last_swing_low,
-            "liq_low": liq_low if not np.isnan(liq_low) else None,
-            "atr": atr_val,
-            "sl_raw": sl_raw,
+            "chosen": chosen,
+            "entry": entry_f,
+            "tick": t,
+            "atr": float(atr_v),
+            "candidates": {k: float(v) for k, v in cands.items()},
+            "sl_raw": float(sl_raw),
+            "sl_final": float(sl_final),
+            "dist_abs": dist_abs,
+            "dist_pct": dist_pct,
+            "dist_ticks": dist_ticks,
+            "buffers": {
+                "sl_buffer_price": _buffer_price(entry_f, t, float(SL_BUFFER_PCT), int(SL_BUFFER_TICKS)),
+                "liq_buffer_price": _buffer_price(entry_f, t, float(LIQ_BUFFER_PCT), int(LIQ_BUFFER_TICKS)),
+            },
         }
 
-        return (sl_final, meta) if return_meta else (sl_final, {})
+        return (float(sl_final), meta) if return_meta else (float(sl_final), {})
 
-    except Exception:
-        # Last-resort fallback
-        sl_raw = float(entry) * 0.95
-        sl_final = _round_to_tick(sl_raw, tick)
-        meta = {
-            "mode": "exception",
-            "sl_raw": sl_raw,
-            "atr": None,
-            "last_swing_low": None,
-            "liq_low": None,
-        }
-        return (sl_final, meta) if return_meta else (sl_final, {})
+    except Exception as e:
+        entry_f = float(entry) if np.isfinite(float(entry)) else 0.0
+        t = _safe_tick(tick)
+        sl_raw = entry_f * 0.95
+        sl_raw = _enforce_min_distance_long(sl_raw, entry_f, t)
+        sl_raw = _cap_max_distance(sl_raw, entry_f, side="LONG")
+        sl_final = _floor_to_tick(sl_raw, t)
+        if sl_final >= entry_f and t > 0:
+            sl_final = _floor_to_tick(entry_f - max(float(MIN_SL_TICKS) * t, t), t)
+
+        meta = {"mode": "exception", "error": str(e), "sl_raw": float(sl_raw), "sl_final": float(sl_final)}
+        return (float(sl_final), meta) if return_meta else (float(sl_final), {})
 
 
 def protective_stop_short(
@@ -190,70 +529,96 @@ def protective_stop_short(
     tick: float = 0.1,
     return_meta: bool = False,
 ) -> Tuple[float, Dict[str, Any]]:
-    """Institutional protective stop for SHORTs.
-
-    Logic:
-    - Take last swing high (structural reference).
-    - Look for equal-highs (liquidity) above price.
-    - Base reference = max(swing_high, liq_high) when liq exists, else swing_high.
-    - Add small ATR buffer above that reference.
-    - Ensure stop > entry.
-    - Round to tick.
     """
+    Desk Lead protective stop for SHORT.
+
+    Pipeline:
+      1) Build candidates (LIQ / SWING / ATR)
+      2) Pick tightest valid
+      3) Enforce min distance in ticks
+      4) Cap max distance in % (MAX_SL_PCT)
+      5) Directional rounding (CEIL)
+      6) Final sanity: SL > entry
+    """
+    meta: Dict[str, Any] = {}
+
     try:
-        if df is None or len(df) < 20:
-            # ultra defensive fallback: 3-4% au-dessus de l'entry
-            sl_raw = float(entry) * 1.04
-            sl_final = _round_to_tick(sl_raw, tick)
-            meta = {
-                "mode": "fallback_len",
-                "sl_raw": sl_raw,
-                "atr": None,
-                "last_swing_high": None,
-                "liq_high": None,
-            }
-            return (sl_final, meta) if return_meta else (sl_final, {})
-
         entry_f = float(entry)
+        t = _safe_tick(tick)
 
-        last_swing_high = _get_last_swing_high(df)
-        liq_high = _get_liquidity_high(df, entry_f)
+        if not _ensure_ohlcv(df) or len(df) < 20 or not np.isfinite(entry_f):
+            sl_raw = entry_f * 1.04
+            sl_raw = _enforce_min_distance_short(sl_raw, entry_f, t)
+            sl_raw = _cap_max_distance(sl_raw, entry_f, side="SHORT")
+            sl_final = _ceil_to_tick(sl_raw, t)
+            if sl_final <= entry_f and t > 0:
+                sl_final = _ceil_to_tick(entry_f + max(float(MIN_SL_TICKS) * t, t), t)
 
-        if np.isnan(liq_high):
-            base_ref = last_swing_high
-        else:
-            base_ref = max(last_swing_high, liq_high)
+            meta = {
+                "mode": "fallback_df",
+                "chosen": "FALLBACK_PCT",
+                "entry": entry_f,
+                "tick": t,
+                "sl_raw": float(sl_raw),
+                "sl_final": float(sl_final),
+            }
+            return (float(sl_final), meta) if return_meta else (float(sl_final), {})
 
-        atr_val = _get_atr_value(df, length=14)
+        atr_v = _get_atr_value(df, length=int(ATR_LEN))
 
-        # buffer: 0.2 * ATR au-dessus du niveau structurel/liquidité
-        sl_raw = base_ref + atr_val * 0.2
+        cands = _build_short_candidates(df, entry_f, t)
+        sl_raw, chosen = _choose_short_sl(entry_f, t, cands)
 
-        # Guard rails: ensure SL is above entry
+        # Guardrails
+        sl_raw = _enforce_min_distance_short(sl_raw, entry_f, t)
+        sl_raw = _cap_max_distance(sl_raw, entry_f, side="SHORT")
+
         if sl_raw <= entry_f:
-            sl_raw = entry_f + max(atr_val, entry_f * 0.01)
+            fallback = entry_f + max(atr_v, abs(entry_f) * 0.01, (float(MIN_SL_TICKS) * t if t > 0 else 0.0))
+            sl_raw = float(fallback)
+            chosen = "FORCED_ABOVE_ENTRY"
 
-        sl_final = _round_to_tick(sl_raw, tick)
+        sl_final = _ceil_to_tick(sl_raw, t)
+
+        if sl_final <= entry_f:
+            if t > 0:
+                sl_final = _ceil_to_tick(entry_f + max(float(MIN_SL_TICKS) * t, t), t)
+            else:
+                sl_final = float(entry_f * 1.01)
+
+        dist_abs = float(sl_final - entry_f)
+        dist_pct = float(dist_abs / abs(entry_f)) if entry_f != 0 else None
+        dist_ticks = float(dist_abs / t) if t > 0 else None
 
         meta = {
             "mode": "ok",
-            "last_swing_high": last_swing_high,
-            "liq_high": liq_high if not np.isnan(liq_high) else None,
-            "atr": atr_val,
-            "sl_raw": sl_raw,
+            "chosen": chosen,
+            "entry": entry_f,
+            "tick": t,
+            "atr": float(atr_v),
+            "candidates": {k: float(v) for k, v in cands.items()},
+            "sl_raw": float(sl_raw),
+            "sl_final": float(sl_final),
+            "dist_abs": dist_abs,
+            "dist_pct": dist_pct,
+            "dist_ticks": dist_ticks,
+            "buffers": {
+                "sl_buffer_price": _buffer_price(entry_f, t, float(SL_BUFFER_PCT), int(SL_BUFFER_TICKS)),
+                "liq_buffer_price": _buffer_price(entry_f, t, float(LIQ_BUFFER_PCT), int(LIQ_BUFFER_TICKS)),
+            },
         }
 
-        return (sl_final, meta) if return_meta else (sl_final, {})
+        return (float(sl_final), meta) if return_meta else (float(sl_final), {})
 
-    except Exception:
-        # Last-resort fallback
-        sl_raw = float(entry) * 1.05
-        sl_final = _round_to_tick(sl_raw, tick)
-        meta = {
-            "mode": "exception",
-            "sl_raw": sl_raw,
-            "atr": None,
-            "last_swing_high": None,
-            "liq_high": None,
-        }
-        return (sl_final, meta) if return_meta else (sl_final, {})
+    except Exception as e:
+        entry_f = float(entry) if np.isfinite(float(entry)) else 0.0
+        t = _safe_tick(tick)
+        sl_raw = entry_f * 1.05
+        sl_raw = _enforce_min_distance_short(sl_raw, entry_f, t)
+        sl_raw = _cap_max_distance(sl_raw, entry_f, side="SHORT")
+        sl_final = _ceil_to_tick(sl_raw, t)
+        if sl_final <= entry_f and t > 0:
+            sl_final = _ceil_to_tick(entry_f + max(float(MIN_SL_TICKS) * t, t), t)
+
+        meta = {"mode": "exception", "error": str(e), "sl_raw": float(sl_raw), "sl_final": float(sl_final)}
+        return (float(sl_final), meta) if return_meta else (float(sl_final), {})
