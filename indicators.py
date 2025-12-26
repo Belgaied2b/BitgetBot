@@ -2,12 +2,17 @@
 # indicators.py — Core + Institutional Indicators (Desk-lead, Hardened)
 # =====================================================================
 # ✅ Robust OHLCV checks (fail-safe, no crashes)
-# ✅ ATR / true_atr stable (used by stops/tp)
+# ✅ ATR / true_atr stable (used by stops/tp) + SERIES SHAPE SAFE
 # ✅ OTE upgraded for analyze_signal.py compatibility (entry + in_zone + dist)
 # ✅ Vol regime improved (ATR% + smoothing)
 # ✅ Extension signal dynamic (threshold adapts to ATR%)
-# ✅ Momentum upgraded (EMA slope + MACD + RSI + RVOL + ADX + OBV)
+# ✅ Momentum upgraded (EMA slope + MACD + RSI + RVOL + ADX + OBV + BB chop)
 # ✅ Composite momentum upgraded (0-100 + label + rich components)
+#
+# NEW (Desk filters to reduce over-signals):
+# ✅ ema_trend_bias(): EMA20/50 bias with slope+spread threshold (anti-range)
+# ✅ is_choppy_market(): BB width + ADX chop detector
+# ✅ desk_momentum_gate(): boolean gate per direction + reason
 #
 # Backward compatibility:
 # - compute_ote keeps keys: in_ote, ote_low, ote_high
@@ -44,6 +49,22 @@ def _has_cols(df: pd.DataFrame, cols: Tuple[str, ...]) -> bool:
         return False
 
 
+def _shape_series(df: Optional[pd.DataFrame], fill: float, *, name: Optional[str] = None) -> pd.Series:
+    """
+    Returns a Series aligned on df.index (shape-safe).
+    If df is None/empty -> returns length-1 series.
+    """
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        s = pd.Series(np.full(len(df), float(fill), dtype=float), index=df.index)
+        if name:
+            s.name = name
+        return s
+    s = pd.Series([float(fill)], dtype=float)
+    if name:
+        s.name = name
+    return s
+
+
 def _to_close_series(x: Any) -> pd.Series:
     """Accepts DataFrame(OHLCV) with 'close' or a Series."""
     if isinstance(x, pd.Series):
@@ -76,7 +97,6 @@ def _nan_to(x: float, default: float) -> float:
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
-    """Missing helper fix (was causing NameError in extension_signal)."""
     try:
         x = float(x)
         lo = float(lo)
@@ -136,6 +156,43 @@ def sma(series_or_df: Any, length: int = 20) -> pd.Series:
 
 
 # =====================================================================
+# EMA trend (Desk anti-range)
+# =====================================================================
+
+def ema_trend_bias(
+    df: pd.DataFrame,
+    fast: int = 20,
+    slow: int = 50,
+    *,
+    spread_min_pct: float = 0.0008,  # 0.08%
+    slope_min: float = 0.0006,
+) -> str:
+    """
+    Returns: LONG / SHORT / RANGE
+    Desk-style: requires EMA stack + slope + min spread percent.
+    """
+    try:
+        if df is None or df.empty or "close" not in df.columns or len(df) < slow + 8:
+            return "RANGE"
+        c = df["close"].astype(float)
+        ef = c.ewm(span=int(fast), adjust=False).mean()
+        es = c.ewm(span=int(slow), adjust=False).mean()
+
+        slope = _linreg_slope(ef, n=12)
+        spread = float(ef.iloc[-1] - es.iloc[-1])
+        level = float(abs(es.iloc[-1])) if abs(float(es.iloc[-1])) > 1e-12 else 1.0
+        spread_pct = spread / level
+
+        if (ef.iloc[-1] > es.iloc[-1]) and (slope > slope_min) and (spread_pct > spread_min_pct):
+            return "LONG"
+        if (ef.iloc[-1] < es.iloc[-1]) and (slope < -slope_min) and (spread_pct < -spread_min_pct):
+            return "SHORT"
+        return "RANGE"
+    except Exception:
+        return "RANGE"
+
+
+# =====================================================================
 # RSI
 # =====================================================================
 
@@ -177,13 +234,15 @@ def macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> p
 
 
 # =====================================================================
-# ATR / true_atr (stable)
+# ATR / true_atr (stable, shape-safe)
 # =====================================================================
 
 def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    if df is None or df.empty:
+        return _shape_series(df, 0.0, name="atr")
+
     if not _has_cols(df, ("high", "low", "close")):
-        # keep shape-safe output
-        return pd.Series(np.zeros(1, dtype=float))
+        return _shape_series(df, 0.0, name="atr")
 
     length = int(max(2, length))
     high = df["high"].astype(float)
@@ -198,7 +257,9 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
     out = tr.rolling(window=length, min_periods=1).mean()
-    return out.bfill().fillna(0.0)
+    out = out.bfill().fillna(0.0)
+    out.name = "atr"
+    return out
 
 
 def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
@@ -210,15 +271,19 @@ def true_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
 
 
 def atr_pct(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    if df is None or df.empty:
+        return _shape_series(df, np.nan, name="atr_pct")
     if not _has_cols(df, ("close", "high", "low")):
-        return pd.Series([np.nan])
+        return _shape_series(df, np.nan, name="atr_pct")
     a = atr(df, length=int(length))
     c = df["close"].astype(float).replace(0.0, np.nan)
-    return (a / c).replace([np.inf, -np.inf], np.nan)
+    out = (a / c).replace([np.inf, -np.inf], np.nan)
+    out.name = "atr_pct"
+    return out
 
 
 # =====================================================================
-# ADX (trend strength)
+# ADX (trend strength) — shape-safe
 # =====================================================================
 
 def adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
@@ -226,8 +291,8 @@ def adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
     ADX (Average Directional Index) — trend strength [0..100]
     Uses Wilder smoothing (EMA alpha=1/length).
     """
-    if not _has_cols(df, ("high", "low", "close")) or len(df) < max(20, length + 5):
-        return pd.Series([np.nan])
+    if df is None or df.empty or (not _has_cols(df, ("high", "low", "close"))) or len(df) < max(20, length + 5):
+        return _shape_series(df, np.nan, name="adx")
 
     length = int(max(2, length))
 
@@ -250,11 +315,13 @@ def adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
 
     dx = (100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di)).replace([np.inf, -np.inf], np.nan)
     out = dx.ewm(alpha=1.0 / length, adjust=False).mean()
-    return out.clip(lower=0.0, upper=100.0)
+    out = out.clip(lower=0.0, upper=100.0)
+    out.name = "adx"
+    return out
 
 
 # =====================================================================
-# Volume tools (RVOL / OBV)
+# Volume tools (RVOL / OBV) — shape-safe
 # =====================================================================
 
 def rel_volume(df: pd.DataFrame, lookback: int = 40) -> float:
@@ -270,12 +337,16 @@ def rel_volume(df: pd.DataFrame, lookback: int = 40) -> float:
 
 
 def obv(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return _shape_series(df, 0.0, name="obv")
     if not _has_cols(df, ("close", "volume")):
-        return pd.Series([0.0])
+        return _shape_series(df, 0.0, name="obv")
+
     close = df["close"].astype(float)
     vol = df["volume"].astype(float)
     direction = np.sign(close.diff().fillna(0.0))
     out = (direction * vol).fillna(0.0).cumsum()
+    out.name = "obv"
     return out
 
 
@@ -284,6 +355,10 @@ def obv(df: pd.DataFrame) -> pd.Series:
 # =====================================================================
 
 def bollinger(df: pd.DataFrame, length: int = 20, n_std: float = 2.0) -> Dict[str, pd.Series]:
+    if df is None or df.empty or "close" not in df.columns:
+        z = _shape_series(df, np.nan)
+        return {"mid": z, "upper": z, "lower": z, "width": z}
+
     c = _to_close_series(df)
     length = int(max(5, length))
     ma = c.rolling(length, min_periods=1).mean()
@@ -292,6 +367,26 @@ def bollinger(df: pd.DataFrame, length: int = 20, n_std: float = 2.0) -> Dict[st
     lower = ma - float(n_std) * sd
     width = (upper - lower) / ma.replace(0.0, np.nan)
     return {"mid": ma, "upper": upper, "lower": lower, "width": width.replace([np.inf, -np.inf], np.nan)}
+
+
+def is_choppy_market(df: pd.DataFrame, *, bb_len: int = 20, adx_len: int = 14) -> bool:
+    """
+    Desk chop filter:
+      - BB width too small AND ADX weak => range/chop
+    """
+    try:
+        if df is None or df.empty or len(df) < 60:
+            return True
+        bb = bollinger(df, bb_len, 2.0)
+        bb_width = _nan_to(_safe_last(bb["width"], np.nan), 0.06)
+        a = _nan_to(_safe_last(adx(df, adx_len), np.nan), 18.0)
+
+        # desk thresholds
+        if (bb_width < 0.028 and a < 16.0) or (bb_width < 0.020):
+            return True
+        return False
+    except Exception:
+        return False
 
 
 # =====================================================================
@@ -340,10 +435,7 @@ def compute_ote(df: pd.DataFrame, bias: str, lookback: int = 60) -> Dict[str, An
 
     in_zone = bool(ote_low <= last <= ote_high)
 
-    if in_zone:
-        dist = 0.0
-    else:
-        dist = float(ote_low - last) if last < ote_low else float(last - ote_high)
+    dist = 0.0 if in_zone else (float(ote_low - last) if last < ote_low else float(last - ote_high))
 
     return {
         "entry": entry,
@@ -410,7 +502,6 @@ def extension_signal(df: pd.DataFrame, ema_fast_len: int = 20, ema_slow_len: int
 
     dist_pct = float((last_close - last_ema) / last_ema)
 
-    # dynamic dist threshold: bigger in high vol, smaller in low vol
     ap = _nan_to(_safe_last(atr_pct(df, 14), np.nan), 0.02)
     thr = _clamp(2.5 * ap, 0.045, 0.12)  # desk: ~4.5%..12%
 
@@ -450,18 +541,14 @@ def institutional_momentum(df: pd.DataFrame) -> str:
     r_last = float(r.iloc[-1])
 
     rv = rel_volume(df, 40)
-
     adx_last = _nan_to(_safe_last(adx(df, 14), np.nan), 18.0)
-
     obv_slope = _linreg_slope(obv(df), n=20)
 
     score = 0.0
 
-    # EMA direction + slope
     score += 1.0 if spread_last > 0 else (-1.0 if spread_last < 0 else 0.0)
     score += 0.5 if e20_slope > 0.0006 else (-0.5 if e20_slope < -0.0006 else 0.0)
 
-    # MACD + hist + hist slope
     if macd_last > 0 and hist_last > 0:
         score += 1.0
     elif macd_last < 0 and hist_last < 0:
@@ -469,16 +556,9 @@ def institutional_momentum(df: pd.DataFrame) -> str:
 
     score += 0.25 if hist_slope > 0.0005 else (-0.25 if hist_slope < -0.0005 else 0.0)
 
-    # RSI
     score += 0.5 if r_last > 60 else (-0.5 if r_last < 40 else 0.0)
-
-    # RVOL
     score += 0.5 if rv > 1.6 else (-0.35 if rv < 0.7 else 0.0)
-
-    # ADX (avoid strong labels in chop)
     score += 0.35 if adx_last >= 28 else (-0.35 if adx_last <= 14 else 0.0)
-
-    # OBV slope
     score += 0.25 if obv_slope > 0.0005 else (-0.25 if obv_slope < -0.0005 else 0.0)
 
     if score >= 2.2:
@@ -533,7 +613,6 @@ def composite_momentum(df: pd.DataFrame) -> Dict[str, Any]:
     obv_slope = _linreg_slope(obv_s, n=20)
     obv_flow = float(np.clip(obv_slope / 0.0015, -1.0, 1.0))
 
-    # Chop/squeeze detection
     bb = bollinger(df, 20, 2.0)
     bb_width_last = _nan_to(_safe_last(bb["width"], np.nan), 0.05)
 
@@ -543,13 +622,12 @@ def composite_momentum(df: pd.DataFrame) -> Dict[str, Any]:
     elif bb_width_last < 0.02:
         chop_penalty = -0.6
 
-    # Extension penalty
     ext = extension_signal(df)
     ext_penalty = -0.7 if ext in ("OVEREXTENDED_LONG", "OVEREXTENDED_SHORT") else 0.0
 
     raw = (
         1.00 * trend_dir
-        + 1.10 * (trend_slope / 0.002)          # normalize slope
+        + 1.10 * (trend_slope / 0.002)
         + 0.95 * macd_score
         + 0.85 * (rsi_score / 2.0)
         + 0.60 * rvol_score
@@ -562,7 +640,6 @@ def composite_momentum(df: pd.DataFrame) -> Dict[str, Any]:
     score = 50.0 + 45.0 * _tanh_score(raw)
     score = float(np.clip(score, 0.0, 100.0))
 
-    # Labels compatible with analyze_signal.py checks
     if score >= 86:
         label = "STRONG_BULLISH"
     elif score >= 72:
@@ -599,3 +676,52 @@ def composite_momentum(df: pd.DataFrame) -> Dict[str, Any]:
             "raw": float(raw),
         },
     }
+
+
+# =====================================================================
+# Desk gate to reduce signals (simple + effective)
+# =====================================================================
+
+def desk_momentum_gate(df: pd.DataFrame, direction: str) -> Dict[str, Any]:
+    """
+    Returns:
+      {"ok": bool, "reason": str, "label": str, "score": float, "chop": bool, "ext": str|None, "ema_bias": str}
+
+    Use this in analyze_signal to harden entries and reduce spam.
+    """
+    d = (direction or "").upper()
+    if d not in ("LONG", "SHORT"):
+        d = "LONG"
+
+    ema_bias = ema_trend_bias(df, 20, 50)
+    chop = is_choppy_market(df)
+    ext = extension_signal(df)
+
+    cm = composite_momentum(df)
+    label = str(cm.get("label") or "NEUTRAL")
+    score = float(cm.get("score") or 50.0)
+
+    # Hard rules (desk)
+    if chop:
+        return {"ok": False, "reason": "choppy_market", "label": label, "score": score, "chop": chop, "ext": ext, "ema_bias": ema_bias}
+
+    if d == "LONG" and ext == "OVEREXTENDED_LONG":
+        return {"ok": False, "reason": "overextended_long", "label": label, "score": score, "chop": chop, "ext": ext, "ema_bias": ema_bias}
+    if d == "SHORT" and ext == "OVEREXTENDED_SHORT":
+        return {"ok": False, "reason": "overextended_short", "label": label, "score": score, "chop": chop, "ext": ext, "ema_bias": ema_bias}
+
+    # Trend alignment (optional hardening)
+    if ema_bias == "RANGE":
+        return {"ok": False, "reason": "ema_range", "label": label, "score": score, "chop": chop, "ext": ext, "ema_bias": ema_bias}
+    if ema_bias == "LONG" and d == "SHORT":
+        return {"ok": False, "reason": "ema_bias_veto", "label": label, "score": score, "chop": chop, "ext": ext, "ema_bias": ema_bias}
+    if ema_bias == "SHORT" and d == "LONG":
+        return {"ok": False, "reason": "ema_bias_veto", "label": label, "score": score, "chop": chop, "ext": ext, "ema_bias": ema_bias}
+
+    # Momentum threshold
+    if d == "LONG" and label not in ("BULLISH", "STRONG_BULLISH"):
+        return {"ok": False, "reason": "momentum_not_bullish", "label": label, "score": score, "chop": chop, "ext": ext, "ema_bias": ema_bias}
+    if d == "SHORT" and label not in ("BEARISH", "STRONG_BEARISH"):
+        return {"ok": False, "reason": "momentum_not_bearish", "label": label, "score": score, "chop": chop, "ext": ext, "ema_bias": ema_bias}
+
+    return {"ok": True, "reason": "ok", "label": label, "score": score, "chop": chop, "ext": ext, "ema_bias": ema_bias}
