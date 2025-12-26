@@ -165,6 +165,10 @@ async def _pending_load() -> None:
         logger.warning("pending_load failed: %s", e)
 
 
+# =====================================================================
+# Price band helpers
+# =====================================================================
+
 def _parse_band(msg: str) -> Tuple[Optional[float], Optional[float]]:
     if not msg:
         return None, None
@@ -186,6 +190,32 @@ def _parse_min_usdt(msg: str) -> Optional[float]:
     except Exception:
         return None
 
+
+def _clamp_and_quantize(price: float, tick: float, mn: Optional[float], mx: Optional[float]) -> Optional[float]:
+    p = float(price)
+    if tick <= 0:
+        if mx is not None:
+            p = min(p, float(mx))
+        if mn is not None:
+            p = max(p, float(mn))
+        return p if p > 0 else None
+
+    if mx is not None:
+        p = min(p, float(mx) - 2.0 * tick)
+        p = float(math.floor(p / tick) * tick)
+
+    if mn is not None:
+        p = max(p, float(mn) + 2.0 * tick)
+        p = float(math.ceil(p / tick) * tick)
+
+    if p <= 0:
+        return None
+    return float(p)
+
+
+# =====================================================================
+# Desk logging
+# =====================================================================
 
 def _new_tid(symbol: str) -> str:
     return f"{str(symbol).upper()}-{uuid.uuid4().hex[:8]}"
@@ -253,8 +283,19 @@ def _fmt_num(x: float) -> str:
         return str(x)
 
 
-def _mk_signal_msg(symbol: str, tid: str, side: str, setup: str, entry: float, sl: float, tp1: float,
-                   rr: float, inst: int, entry_type: str, pos_mode: str) -> str:
+def _mk_signal_msg(
+    symbol: str,
+    tid: str,
+    side: str,
+    setup: str,
+    entry: float,
+    sl: float,
+    tp1: float,
+    rr: float,
+    inst: int,
+    entry_type: str,
+    pos_mode: str
+) -> str:
     return (
         f"*📌 SIGNAL*\n"
         f"*{_tg_escape(symbol)}* — {_tg_escape(_fmt_side(side))}\n"
@@ -305,13 +346,43 @@ def _direction_from_side(side: str) -> str:
     return "LONG" if (side or "").upper() == "BUY" else "SHORT"
 
 
-def _close_side_from_direction(direction: str) -> str:
-    return "SELL" if direction == "LONG" else "BUY"
+def _detect_pos_mode() -> str:
+    pm = (POSITION_MODE or "hedge").strip().lower()
+    if pm in {"hedge"}:
+        return "hedge"
+    if pm in {"one_way", "one-way", "oneway"}:
+        return "one_way"
+    # default safe
+    return "hedge"
+
+
+def _is_hedge(pos_mode: str) -> bool:
+    return (pos_mode or "").lower().startswith("hedge")
+
+
+def _close_side_for_mode(direction: str, pos_mode: str) -> str:
+    """
+    FIX 22002:
+    - hedge: close LONG=BUY, close SHORT=SELL  (side same as entry)
+    - one_way: close LONG=SELL, close SHORT=BUY (side flipped)
+    """
+    d = (direction or "").upper()
+    if _is_hedge(pos_mode):
+        return "BUY" if d == "LONG" else "SELL"
+    return "SELL" if d == "LONG" else "BUY"
+
+
+def _tp_trade_side(pos_mode: str) -> str:
+    return "close" if _is_hedge(pos_mode) else "open"
+
+
+def _tp_reduce_only(pos_mode: str) -> bool:
+    return (not _is_hedge(pos_mode))
 
 
 def _trigger_type_sl() -> str:
     s = (STOP_TRIGGER_TYPE_SL or "MP").upper()
-    return "mark_price" ifpi == "MP" else "fill_price"
+    return "mark_price" if s == "MP" else "fill_price"
 
 
 def _estimate_tick_from_price(price: float) -> float:
@@ -547,8 +618,8 @@ async def analyze_symbol(sym: str, client, analyze_sem: asyncio.Semaphore, stats
             return None
 
         direction = _direction_from_side(side)
-        close_side = _close_side_from_direction(direction)
-        pos_mode = str(POSITION_MODE or "hedge")
+        pos_mode = _detect_pos_mode()
+        close_side = _close_side_for_mode(direction, pos_mode)
 
         fp = make_fingerprint(sym, side, entry, sl, tp1, extra=setup, precision=6)
 
@@ -598,7 +669,6 @@ def _setup_priority(setup: str) -> int:
 
 def rank_candidates(cands: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     def key(c: Dict[str, Any]):
-        # inst d’abord, puis setup, puis RR, puis comp
         return (
             int(c.get("inst_score") or 0),
             _setup_priority(c.get("setup") or ""),
@@ -617,8 +687,10 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     tid = candidate["tid"]
     side = candidate["side"]
     direction = candidate["direction"]
-    close_side = candidate["close_side"]
     pos_mode = candidate["pos_mode"]
+
+    # IMPORTANT: recompute close_side using mode (safety)
+    close_side = _close_side_for_mode(direction, pos_mode)
 
     entry = float(candidate["entry"])
     sl = float(candidate["sl"])
@@ -628,14 +700,12 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
 
     notional = float(MARGIN_USDT) * float(LEVERAGE)
 
-    # trade dedup
     fp = candidate["fingerprint"]
     if TRADE_GUARD.is_duplicate(fp):
         await stats.inc("duplicates_trade", 1)
         await stats.add_reason("duplicate_trade")
         return
 
-    # risk gate
     allowed, rreason = RISK.can_trade(
         symbol=sym,
         side=direction,
@@ -650,7 +720,6 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
         await send_telegram(_mk_exec_msg("EXEC_SKIPPED", sym, tid, reason=f"risk:{rreason}"))
         return
 
-    # meta/tick
     try:
         meta_dbg = await asyncio.wait_for(trader.debug_meta(sym), timeout=META_TIMEOUT_S)
     except Exception:
@@ -662,7 +731,7 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
 
     desk_log(logging.INFO, "EXEC_PRE", sym, tid,
              entry_raw=entry, tick_meta=tick_meta, tick_used=tick_used, q_entry=q_entry,
-             direction=direction, pos_mode=pos_mode,
+             direction=direction, pos_mode=pos_mode, close_side=close_side,
              meta_pricePlace=meta_dbg.get("pricePlace"),
              meta_priceTick=meta_dbg.get("priceTick"),
              meta_qtyStep=meta_dbg.get("qtyStep"),
@@ -679,11 +748,9 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
 
     entry_client_oid = f"entry-{tid}"
 
-    # Desk: retry 40762 en réduisant le size (si balance trop faible)
-    # try factors: 1.0 (default via size=None) then 0.5 then 0.25 (explicit size)
     factors = [1.0, 0.5, 0.25]
-
     entry_resp: Dict[str, Any] = {}
+
     for k, f in enumerate(factors):
         async def _place_entry():
             if f >= 0.999:
@@ -699,7 +766,6 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
                     debug_tag="ENTRY",
                 )
 
-            # explicit size fallback
             raw_qty = (notional * f) / max(q_entry, 1e-12)
             return await trader.place_limit(
                 symbol=sym,
@@ -743,16 +809,14 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
 
     desk_log(logging.INFO, "ENTRY_OK", sym, tid, orderId=entry_order_id, qty=qty_total)
 
-    # Mark trade dedup ONLY after entry accepted
     TRADE_GUARD.mark(fp)
 
-    # create pending for watcher
     async with PENDING_LOCK:
         PENDING[tid] = {
             "symbol": sym,
             "entry_side": side.upper(),
             "direction": direction,
-            "close_side": close_side,
+            "close_side": close_side,   # <<< correct for hedge/one-way
             "pos_mode": pos_mode,
             "entry": q_entry,
             "sl": sl,
@@ -810,8 +874,10 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     continue
 
                 direction = str(st.get("direction") or "")
-                close_side = str(st.get("close_side") or "")
                 pos_mode = str(st.get("pos_mode") or "one_way")
+                # safety: recompute close side from stored direction+mode
+                close_side = _close_side_for_mode(direction, pos_mode)
+                st["close_side"] = close_side
 
                 entry = float(st.get("entry") or 0.0)
                 sl = float(st.get("sl") or 0.0)
@@ -954,10 +1020,13 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         desk_log(logging.INFO, "SL_OK", sym, tid, sl=q_sl, planId=sl_plan_id)
                         await send_telegram(_mk_exec_msg("SL_OK", sym, tid, sl=q_sl, planId=sl_plan_id))
 
-                    # 2) TP1  ✅ DESK FIX: tradeSide=close ALWAYS
+                    # 2) TP1 (mode-aware)
                     if not st.get("tp1_order_id") and (not bool(st.get("tp1_inflight", False))):
                         st["tp1_inflight"] = True
                         dirty = True
+
+                        tp_trade_side = _tp_trade_side(pos_mode)
+                        tp_reduce_only = _tp_reduce_only(pos_mode)
 
                         async def _place_tp1(price_use: float, qty_use: float, attempt_k: int):
                             return await trader.place_limit(
@@ -966,8 +1035,8 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                                 price=price_use,
                                 size=qty_use,
                                 client_oid=_oid("tp1", tid, attempt_k),
-                                trade_side="close",          # <<< CRITICAL FIX
-                                reduce_only=True,
+                                trade_side=tp_trade_side,         # hedge: close / one_way: open
+                                reduce_only=tp_reduce_only,       # one_way True, hedge False
                                 tick_hint=tick_used,
                                 debug_tag="TP1",
                             )
@@ -982,6 +1051,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                         code = str(tp1_resp.get("code", ""))
 
+                        # MIN USDT adjust
                         if (not _is_ok(tp1_resp)) and code == "45110":
                             msg = str(tp1_resp.get("msg") or "")
                             mmin = _parse_min_usdt(msg) or MIN_TP_USDT_FALLBACK
@@ -1005,6 +1075,21 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                             st["last_arm_fail_ts"] = time.time()
                             dirty = True
                             continue
+
+                        # price band clamp
+                        if (not _is_ok(tp1_resp)) and code == "22047":
+                            mn, mx = _parse_band(str(tp1_resp.get("msg") or ""))
+                            clamped = _clamp_and_quantize(q_tp1, tick_used, mn, mx)
+                            desk_log(logging.WARNING, "TP1_22047", sym, tid, mn=mn, mx=mx, before=q_tp1, after=clamped, tick=tick_used)
+                            if clamped is None:
+                                st["arm_attempts"] = attempts + 1
+                                st["last_arm_fail_ts"] = time.time()
+                                dirty = True
+                                continue
+                            try:
+                                tp1_resp = await asyncio.wait_for(_place_tp1(clamped, qty_tp1, attempts + 1), timeout=ORDER_TIMEOUT_S)
+                            except Exception as e:
+                                tp1_resp = {"code": "EXC", "msg": str(e)}
 
                         if not _is_ok(tp1_resp):
                             st["arm_attempts"] = attempts + 1
@@ -1162,13 +1247,10 @@ async def scan_once(client, trader: BitgetTrader) -> None:
 
     ranked = rank_candidates(candidates)
 
-    # Select top N for execution
     N = int(MAX_ORDERS_PER_SCAN)
     selected = ranked[: max(0, N)]
-
     await stats.inc("exec_selected", len(selected))
 
-    # notify ranked out (optional / light)
     for c in ranked[N:]:
         await stats.add_reason("budget:ranked_out")
 
@@ -1176,17 +1258,18 @@ async def scan_once(client, trader: BitgetTrader) -> None:
         dt = time.time() - t_scan0
         reasons = stats.reasons.most_common(12)
         reasons_str = ", ".join([f"{k}:{v}" for k, v in reasons]) if reasons else "-"
-        logger.info("🧾 Scan summary: total=%s valids=%s rejects=%s skips=%s alert_sent=%s exec_selected=%s exec_sent=%s exec_failed=%s time=%.1fs | top_reasons=%s",
-                    stats.total, stats.valids, stats.rejects, stats.skips, stats.alert_sent,
-                    stats.exec_selected, stats.exec_sent, stats.exec_failed, dt, reasons_str)
+        logger.info(
+            "🧾 Scan summary: total=%s valids=%s rejects=%s skips=%s alert_sent=%s exec_selected=%s exec_sent=%s exec_failed=%s time=%.1fs | top_reasons=%s",
+            stats.total, stats.valids, stats.rejects, stats.skips, stats.alert_sent,
+            stats.exec_selected, stats.exec_sent, stats.exec_failed, dt, reasons_str
+        )
         return
 
-    # Execute selected sequentially (desk control)
     for c in selected:
         try:
             await execute_candidate(c, client, trader, stats)
         except Exception as e:
-            stats.exec_failed += 1
+            await stats.inc("exec_failed", 1)
             desk_log(logging.ERROR, "EXEC_ERR", c.get("symbol", "?"), c.get("tid", "?"), err=str(e))
 
     dt = time.time() - t_scan0
@@ -1217,7 +1300,7 @@ async def start_scanner() -> None:
     await _pending_load()
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        await send_telegram("✅ *Bot démarré* \\(Rank\\-\\>Execute top N, TP1 tradeSide\\=close, BE after TP1 ON\\)")
+        await send_telegram("✅ *Bot démarré* \\(Rank\\-\\>Execute top N, TP1 hedge/oneway fixed, BE after TP1 ON\\)")
     else:
         logger.warning("Telegram disabled: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
 
@@ -1232,7 +1315,10 @@ async def start_scanner() -> None:
 
     _ensure_watcher(trader)
 
-    logger.info("🚀 Scanner started | interval=%s min | dry_run=%s | max_orders_per_scan=%s", SCAN_INTERVAL_MIN, DRY_RUN, MAX_ORDERS_PER_SCAN)
+    logger.info(
+        "🚀 Scanner started | interval=%s min | dry_run=%s | max_orders_per_scan=%s | pos_mode=%s",
+        SCAN_INTERVAL_MIN, DRY_RUN, MAX_ORDERS_PER_SCAN, _detect_pos_mode()
+    )
 
     while True:
         t0 = time.time()
