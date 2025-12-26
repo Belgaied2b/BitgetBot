@@ -49,15 +49,20 @@ def _has_cols(df: pd.DataFrame, cols: Tuple[str, ...]) -> bool:
 
 
 # Try to reuse true ATR from indicators if available (preferred)
+_compute_atr_ext = None
 try:
-    from indicators import compute_atr as _compute_atr_ext  # type: ignore
+    # preferred naming in many codebases
+    from indicators import true_atr as _compute_atr_ext  # type: ignore
 except Exception:
-    _compute_atr_ext = None
+    try:
+        from indicators import compute_atr as _compute_atr_ext  # type: ignore
+    except Exception:
+        _compute_atr_ext = None
 
 
 def _atr(df: pd.DataFrame, length: int = 14) -> float:
     """
-    Returns last ATR value (float). Uses indicators.compute_atr if available,
+    Returns last ATR value (float). Uses indicators.true_atr/compute_atr if available,
     otherwise uses a local ATR implementation.
     """
     try:
@@ -65,11 +70,14 @@ def _atr(df: pd.DataFrame, length: int = 14) -> float:
             return 0.0
 
         if _compute_atr_ext is not None:
-            s = _compute_atr_ext(df, length=length)
+            s = _compute_atr_ext(df, length=length)  # series
             v = float(s.iloc[-1]) if s is not None and len(s) else 0.0
             return max(0.0, v)
 
         # local ATR
+        if not _has_cols(df, ("high", "low", "close")):
+            return 0.0
+
         high = df["high"].astype(float)
         low = df["low"].astype(float)
         close = df["close"].astype(float)
@@ -244,12 +252,10 @@ def has_liquidity_zone(df: pd.DataFrame, direction: str, lookback: int = 200) ->
         buf = max(a * 0.15, close * 0.0008)
 
         if d == "LONG":
-            # liquidity above (equal highs)
             for x in lv.get("eq_highs", []) or []:
                 if abs(float(x) - close) <= buf:
                     return True
         if d == "SHORT":
-            # liquidity below (equal lows)
             for x in lv.get("eq_lows", []) or []:
                 if abs(float(x) - close) <= buf:
                     return True
@@ -288,7 +294,6 @@ def _trend_from_ema(close: pd.Series, fast: int = 20, slow: int = 50) -> str:
         level = float(abs(es.iloc[-1])) if abs(float(es.iloc[-1])) > 1e-12 else 1.0
         spread_pct = spread / level
 
-        # desk threshold: avoid "fake" trend when EMAs stacked but flat
         min_spread = 0.0008  # 0.08%
         if ef.iloc[-1] > es.iloc[-1] and slope > 0 and spread_pct > min_spread:
             return "LONG"
@@ -328,15 +333,12 @@ def _classify_bos(
     if len(highs) < 1 and len(lows) < 1:
         return res
 
-    # last swing levels
     last_hi = float(highs[-1][1]) if len(highs) >= 1 else None
     last_lo = float(lows[-1][1]) if len(lows) >= 1 else None
 
-    # external reference from last 3 swings
     ext_hi = float(max([p for _, p in highs[-3:]])) if len(highs) >= 2 else None
     ext_lo = float(min([p for _, p in lows[-3:]])) if len(lows) >= 2 else None
 
-    # break checks (with buffer)
     bos_up = False
     bos_dn = False
     bos_type_up = None
@@ -354,7 +356,6 @@ def _classify_bos(
         broken_dn = last_lo
         bos_type_dn = "EXTERNAL" if (ext_lo is not None and last_close < (ext_lo - break_buffer)) else "INTERNAL"
 
-    # Resolve conflicts (rare): pick stronger break distance
     if bos_up and bos_dn:
         du = abs(last_close - float(broken_up or last_close))
         dd = abs(last_close - float(broken_dn or last_close))
@@ -375,7 +376,7 @@ def _detect_bos_choch_cos(df: pd.DataFrame) -> Dict[str, Any]:
     """
     BOS/CHOCH/COS:
       - BOS : buffered break of last swing high/low
-      - CHOCH : BOS opposite to EMA trend (optionally validated via "prior trend context")
+      - CHOCH : BOS opposite to EMA trend
       - COS : BOS aligned with EMA trend
     """
     if df is None or len(df) < 60 or not _has_cols(df, ("open", "high", "low", "close")):
@@ -393,7 +394,6 @@ def _detect_bos_choch_cos(df: pd.DataFrame) -> Dict[str, Any]:
 
     swings = find_swings(df, left=3, right=3)
 
-    # break buffer = max(0.12*ATR, 0.04% price) to avoid 1-tick noise
     a = _atr(df, 14)
     buf = max(a * 0.12, last_close * 0.0004)
 
@@ -418,21 +418,6 @@ def _detect_bos_choch_cos(df: pd.DataFrame) -> Dict[str, Any]:
             choch = True
         elif trend == "SHORT":
             cos = True
-
-    # Optional CHOCH validation (lighter): require some prior momentum in the trend direction
-    # If trend says SHORT but we get UP break, CHOCH is only "strong" if prior window was making lower closes.
-    if choch:
-        try:
-            w = close.tail(30)
-            if len(w) >= 10:
-                drift = float(w.iloc[-1] - w.iloc[0])
-                if trend == "SHORT" and drift > 0:
-                    # trend SHORT but recent drift up -> CHOCH less reliable
-                    pass
-                if trend == "LONG" and drift < 0:
-                    pass
-        except Exception:
-            pass
 
     bos_info.update({"choch": bool(choch), "cos": bool(cos)})
     return bos_info
@@ -489,12 +474,12 @@ def bos_quality_details(
       + Candle body ratio (impulse candle)
       + Impulse vs ATR (range/ATR)
       + Close location vs direction
-      + Liquidity sweep bonus
+      + Liquidity sweep bonus (sweep + close back)
       + OI slope (if provided) / neutral if missing
       - Wick imbalance penalty (fake break)
       - Tiny range penalty (dead market)
 
-    ok = score >= 0 (kept permissive)
+    ok = score >= 0
     """
     if df is None or len(df) < max(int(vol_lookback), 40) or not _has_cols(df, ("open", "high", "low", "close", "volume")):
         return {"ok": True, "score": 0.0, "reason": "not_enough_data"}
@@ -515,26 +500,21 @@ def bos_quality_details(
     body = float(abs(last_close - last_open))
     body_ratio = (body / rng) if rng > 0 else 0.0
 
-    # ATR context
     a = _atr(df, 14)
     impulse = (rng / a) if a > 0 else 0.0
 
-    # Volume factor
     w = df.tail(int(vol_lookback))
     avg_vol = float(w["volume"].astype(float).mean()) if len(w) else 0.0
     volume_factor = (last_vol / avg_vol) if avg_vol > 0 else 1.0
 
-    # Close position in candle
     range_pos = ((last_close - last_low) / rng) if rng > 0 else 0.5
 
-    # Wick balance (fake break proxy)
     upper_wick = float(last_high - max(last_open, last_close))
     lower_wick = float(min(last_open, last_close) - last_low)
     wick_ratio = 0.0
     if rng > 0:
         wick_ratio = float((upper_wick + lower_wick) / rng)
 
-    # OI slope (optional)
     oi_slope = 0.0
     oi_used = False
     if oi_series is not None:
@@ -550,9 +530,8 @@ def bos_quality_details(
             oi_slope = 0.0
             oi_used = False
 
-    # Liquidity sweep bonus
+    # Liquidity sweep bonus (sweep then close back inside)
     liquidity_sweep = False
-    ref_price = float(price) if price is not None else last_close
     if df_liq is None:
         df_liq = df
     try:
@@ -560,14 +539,21 @@ def bos_quality_details(
         eq_highs = lv.get("eq_highs", []) or []
         eq_lows = lv.get("eq_lows", []) or []
 
-        # sweep if price crossed any level (simple)
-        for x in eq_highs:
-            if ref_price > float(x):
-                liquidity_sweep = True
-                break
-        if not liquidity_sweep:
+        buf = max((a * 0.08) if a > 0 else 0.0, abs(float(tick)) * 5.0, last_close * 0.0004)
+        d = (direction or "").upper()
+
+        if d == "UP":
+            # sweep highs: wick above liquidity then close back below/near it
+            for x in eq_highs:
+                lvl = float(x)
+                if last_high > (lvl + buf) and last_close < (lvl + 0.25 * buf):
+                    liquidity_sweep = True
+                    break
+        elif d == "DOWN":
+            # sweep lows: wick below liquidity then close back above/near it
             for x in eq_lows:
-                if ref_price < float(x):
+                lvl = float(x)
+                if last_low < (lvl - buf) and last_close > (lvl - 0.25 * buf):
                     liquidity_sweep = True
                     break
     except Exception:
@@ -579,7 +565,6 @@ def bos_quality_details(
     score = 0.0
     reasons: List[str] = []
 
-    # 1) Market activity / range
     if rng <= 0 or (a > 0 and rng < 0.25 * a):
         score -= 1.0
         reasons.append("tiny_range")
@@ -588,7 +573,6 @@ def bos_quality_details(
     elif a > 0 and impulse >= 0.9:
         score += 0.5
 
-    # 2) Volume
     if volume_factor >= 1.8:
         score += 1.5
     elif volume_factor >= 1.2:
@@ -599,7 +583,6 @@ def bos_quality_details(
         score -= 0.8
         reasons.append("low_volume")
 
-    # 3) Body ratio
     if body_ratio >= 0.62:
         score += 1.5
     elif body_ratio >= 0.45:
@@ -610,12 +593,10 @@ def bos_quality_details(
         score -= 0.8
         reasons.append("small_body")
 
-    # 4) Wick penalty (too wick-heavy -> less trustworthy break)
     if wick_ratio >= 0.65 and body_ratio < 0.35:
         score -= 0.8
         reasons.append("wicky_candle")
 
-    # 5) Close location vs direction
     d = (direction or "").upper()
     if d == "UP":
         if range_pos >= 0.62:
@@ -630,7 +611,6 @@ def bos_quality_details(
             score -= 0.7
             reasons.append("close_not_down")
 
-    # 6) OI slope (if available)
     if oi_used:
         abs_oi = abs(float(oi_slope))
         if abs_oi >= 0.012:
@@ -641,13 +621,11 @@ def bos_quality_details(
             score -= 0.5
             reasons.append("weak_oi")
 
-    # 7) Liquidity sweep bonus
     if liquidity_sweep:
         score += 0.6
 
     ok = bool(score >= 0.0)
 
-    # Grade (for logs)
     if score >= 3.0:
         grade = "A+"
     elif score >= 2.0:
@@ -708,21 +686,17 @@ def _detect_order_blocks(df: pd.DataFrame, lookback: int = 120) -> Dict[str, Any
     bullish_ob = None
     bearish_ob = None
 
-    # Scan last 40 candles for a strong impulse candle
     start = max(10, len(sub) - 50)
     for i in range(start, len(sub) - 1):
         rng = float(h[i] - l[i])
         body = float(abs(c[i] - o[i]))
         impulse = rng / a if a > 0 else 0.0
 
-        # impulse threshold: >=1.6 ATR and body sizable
         if impulse >= 1.6 and body / max(rng, 1e-12) >= 0.45:
-            # determine direction of impulse candle
             up = c[i] > o[i]
             down = c[i] < o[i]
 
             if up:
-                # last bearish candle before i within previous 8
                 for j in range(max(0, i - 8), i):
                     if c[j] < o[j]:
                         bullish_ob = {
@@ -731,7 +705,6 @@ def _detect_order_blocks(df: pd.DataFrame, lookback: int = 120) -> Dict[str, Any
                             "high": float(max(o[j], c[j])),
                             "direction": "bullish",
                         }
-                # keep most recent found
             elif down:
                 for j in range(max(0, i - 8), i):
                     if c[j] > o[j]:
@@ -771,9 +744,7 @@ def _detect_fvg(df: pd.DataFrame, lookback: int = 140, keep_last: int = 8) -> Li
     H = sub["high"].astype(float).to_numpy()
     L = sub["low"].astype(float).to_numpy()
 
-    # create zones
     for i in range(2, len(sub)):
-        # Bullish FVG
         if L[i] > H[i - 2]:
             z_low = float(H[i - 2])
             z_high = float(L[i])
@@ -791,7 +762,6 @@ def _detect_fvg(df: pd.DataFrame, lookback: int = 140, keep_last: int = 8) -> Li
                     }
                 )
 
-        # Bearish FVG
         if H[i] < L[i - 2]:
             z_low = float(H[i])
             z_high = float(L[i - 2])
@@ -812,7 +782,6 @@ def _detect_fvg(df: pd.DataFrame, lookback: int = 140, keep_last: int = 8) -> Li
     if not zones:
         return []
 
-    # mark mitigated (price revisits zone after creation)
     try:
         for z in zones:
             zi = int(z.get("index", 0)) - idx_offset
@@ -821,7 +790,6 @@ def _detect_fvg(df: pd.DataFrame, lookback: int = 140, keep_last: int = 8) -> Li
             low_z = float(z["low"])
             high_z = float(z["high"])
 
-            # if any later candle trades into the zone -> mitigated
             later = sub.iloc[zi + 1 :]
             if later.empty:
                 continue
@@ -831,12 +799,11 @@ def _detect_fvg(df: pd.DataFrame, lookback: int = 140, keep_last: int = 8) -> Li
     except Exception:
         pass
 
-    # keep last unmitigated zones (most relevant for entry)
     unmit = [z for z in zones if not z.get("mitigated")]
     if unmit:
         unmit = sorted(unmit, key=lambda x: int(x.get("index", 0)), reverse=True)[: int(keep_last)]
-        return list(reversed(unmit))  # chronological
-    # else fallback to last zones
+        return list(reversed(unmit))
+
     zones = sorted(zones, key=lambda x: int(x.get("index", 0)), reverse=True)[: int(keep_last)]
     return list(reversed(zones))
 
