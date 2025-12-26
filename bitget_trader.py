@@ -1,12 +1,12 @@
 # =====================================================================
 # bitget_trader.py — Bitget Execution (Entry + TP1 + SL->BE)
-# Desk-lead hardened:
-# - Meta cache refresh locked + stable param ordering (signature-safe)
-# - Quantization rules per order type (entry/TP vs SL trigger)
-# - Dynamic price formatting fallback on 40020 (precision/price error)
-# - Auto clamp + retry on 22047 (price band) for LIMIT / PLAN
-# - Attach parsed hints for scanner (min_usdt / band min-max / debug payload)
-# - Safer qty formatting (no sci notation) + float-noise resistant floor/ceil
+# Desk-lead hardened (FIXED):
+# ✅ FIX: meta.priceTick calculation (priceEndStep * 10^-pricePlace) => no more tick=1.0 nonsense
+# ✅ FIX: qtyStep uses sizeMultiplier (true step); minQty uses minTradeNum
+# ✅ FIX: if reduceOnly=True -> tradeSide is FORCED to "close" (prevents TP opening positions => 40762)
+# ✅ Safer formatting (no sci notation) + float-noise resistant floor/ceil
+# ✅ Retry on 22047 (price band) + 40020 (precision) with forced decimals
+# ✅ Meta cache locked refresh + stable param ordering (signature-safe)
 # =====================================================================
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 
-from retry_utils import retry_async
 from settings import PRODUCT_TYPE, MARGIN_COIN
 
 logger = logging.getLogger(__name__)
@@ -88,21 +87,18 @@ def _decimals_from_step(step: float, cap: int = 12) -> int:
     t = abs(float(step))
     if t <= 0:
         return 6
-    # step like 0.001 -> 3 decimals
     d = int(round(-math.log10(t)))
     return max(0, min(cap, d))
 
 
 def _fmt_decimal(x: float, decimals: int) -> str:
     decimals = max(0, min(12, int(decimals)))
-    # never sci notation
     return f"{float(x):.{decimals}f}"
 
 
 def _floor_step(x: float, step: float) -> float:
     if step <= 0:
         return float(x)
-    # float-noise resistant
     return float(math.floor((float(x) / step) + 1e-12) * step)
 
 
@@ -145,7 +141,7 @@ def _clamp_band(price: float, tick: float, mn: Optional[float], mx: Optional[flo
             p = max(p, float(mn))
         return p if p > 0 else None
 
-    # keep a small buffer away from band edges
+    # small buffer away from edges
     if mx is not None:
         p = min(p, float(mx) - 2.0 * tick)
     if mn is not None:
@@ -164,10 +160,11 @@ def _clamp_band(price: float, tick: float, mn: Optional[float], mx: Optional[flo
 class ContractMeta:
     symbol: str
     price_place: int
-    price_tick: float
+    price_end_step: float          # e.g. "1", "5", ...
+    price_tick: float              # FIXED: price_end_step * 10^-price_place (or tickSize/priceStep)
     qty_place: int
-    qty_step: float
-    min_qty: float
+    qty_step: float                # FIXED: sizeMultiplier (or volumeStep/fallback)
+    min_qty: float                 # FIXED: minTradeNum
     raw: Dict[str, Any]
 
 
@@ -178,6 +175,24 @@ class ContractMetaCache:
         self._ts = 0.0
         self._by_symbol: Dict[str, ContractMeta] = {}
         self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _derive_price_tick(price_place: int, price_end_step: float, tick_size: float, price_step: float) -> float:
+        """
+        Desk FIX:
+          - If tickSize/priceStep available => use it.
+          - Else use priceEndStep * 10^-pricePlace (Bitget docs: priceEndStep=price step multiplier).
+        """
+        if tick_size and tick_size > 0:
+            return float(tick_size)
+        if price_step and price_step > 0:
+            return float(price_step)
+
+        pp = int(max(0, price_place))
+        base = 10 ** (-pp) if pp > 0 else 1.0
+        pes = float(price_end_step) if price_end_step and price_end_step > 0 else 1.0
+        # priceEndStep is a multiplier (often integer 1/5/10)
+        return float(pes * base)
 
     async def refresh(self, force: bool = False) -> None:
         async with self._lock:
@@ -206,27 +221,31 @@ class ContractMetaCache:
                 price_place = _safe_int(c.get("pricePlace"), 6)
                 qty_place = _safe_int(c.get("volumePlace"), 4)
 
-                # Robust tick extraction
-                price_tick = (
-                    _safe_float(c.get("priceEndStep"), 0.0)
-                    or _safe_float(c.get("priceStep"), 0.0)
-                    or _safe_float(c.get("tickSize"), 0.0)
-                    or _safe_float(c.get("priceTick"), 0.0)
-                    or (10 ** (-max(0, price_place)))
-                )
+                price_end_step = _safe_float(c.get("priceEndStep"), 0.0)
+                tick_size = _safe_float(c.get("tickSize"), 0.0)
+                price_step = _safe_float(c.get("priceStep"), 0.0)
 
-                qty_step = (
-                    _safe_float(c.get("sizeMultiplier"), 0.0)
-                    or _safe_float(c.get("volumeStep"), 0.0)
-                    or _safe_float(c.get("minTradeNum"), 0.0)
-                    or (10 ** (-max(0, qty_place)))
-                )
+                price_tick = self._derive_price_tick(price_place, price_end_step, tick_size, price_step)
+                if not (price_tick > 0):
+                    # final fallback
+                    price_tick = float(10 ** (-max(0, price_place))) if price_place > 0 else 1e-6
 
-                min_qty = _safe_float(c.get("minTradeNum"), 0.0) or qty_step
+                # qty_step: Bitget docs => sizeMultiplier is the required increment
+                qty_step = _safe_float(c.get("sizeMultiplier"), 0.0)
+                if not (qty_step > 0):
+                    qty_step = _safe_float(c.get("volumeStep"), 0.0)
+                if not (qty_step > 0):
+                    qty_step = float(10 ** (-max(0, qty_place))) if qty_place > 0 else 1.0
+
+                # min qty: minTradeNum
+                min_qty = _safe_float(c.get("minTradeNum"), 0.0)
+                if not (min_qty > 0):
+                    min_qty = qty_step
 
                 by_symbol[sym] = ContractMeta(
                     symbol=sym,
                     price_place=int(price_place),
+                    price_end_step=float(price_end_step if price_end_step > 0 else 1.0),
                     price_tick=float(price_tick),
                     qty_place=int(qty_place),
                     qty_step=float(qty_step),
@@ -234,15 +253,15 @@ class ContractMetaCache:
                     raw=c,
                 )
 
-                # one-time-ish warning when meta is clearly suspicious for sub-1 prices
-                if float(price_tick or 0) >= 1.0 and int(price_place) == 0:
+                # suspicious guard
+                if float(price_tick) >= 1.0 and int(price_place) >= 4:
                     logger.warning(
-                        "[META_SUS] %s pricePlace=%s priceTick=%s raw_tickSize=%s raw_priceEndStep=%s raw_priceStep=%s",
+                        "[META_SUS] %s pricePlace=%s priceEndStep=%s => priceTick=%s (raw tickSize=%s priceStep=%s)",
                         sym,
                         price_place,
+                        c.get("priceEndStep"),
                         price_tick,
                         c.get("tickSize"),
-                        c.get("priceEndStep"),
                         c.get("priceStep"),
                     )
 
@@ -253,6 +272,12 @@ class ContractMetaCache:
     async def get(self, symbol: str) -> Optional[ContractMeta]:
         sym = (symbol or "").upper()
         await self.refresh()
+        meta = self._by_symbol.get(sym)
+        if meta:
+            return meta
+
+        # one forced refresh if missing
+        await self.refresh(force=True)
         return self._by_symbol.get(sym)
 
 
@@ -386,6 +411,7 @@ class BitgetTrader:
         return {
             "symbol": meta.symbol,
             "pricePlace": meta.price_place,
+            "priceEndStep": meta.price_end_step,
             "priceTick": meta.price_tick,
             "qtyPlace": meta.qty_place,
             "qtyStep": meta.qty_step,
@@ -397,6 +423,7 @@ class BitgetTrader:
                 "pricePlace": meta.raw.get("pricePlace"),
                 "volumePlace": meta.raw.get("volumePlace"),
                 "volumeStep": meta.raw.get("volumeStep"),
+                "sizeMultiplier": meta.raw.get("sizeMultiplier"),
                 "minTradeNum": meta.raw.get("minTradeNum"),
             },
         }
@@ -411,7 +438,7 @@ class BitgetTrader:
         price: float,
         qty: float,
         *,
-        side: Optional[str] = None,          # BUY/SELL (for LIMIT)
+        side: Optional[str] = None,           # BUY/SELL (for LIMIT)
         close_side: Optional[str] = None,     # BUY/SELL (for SL trigger)
         is_trigger: bool = False,             # SL trigger quantization
         tick_hint: Optional[float] = None,
@@ -420,26 +447,27 @@ class BitgetTrader:
         Returns: (q_price, q_qty, tick_used, step_used, price_place, qty_place)
         """
         meta = await self._meta.get(symbol)
+        p = float(price)
+        q = float(qty)
+
         if not meta:
-            tick = float(tick_hint or _estimate_tick_from_price(price))
+            tick = float(tick_hint or _estimate_tick_from_price(p))
             step = 1e-6
-            q_price = float(price)
-            q_qty = _floor_step(float(qty), step)
+            q_price = p
+            q_qty = _floor_step(q, step)
             return q_price, q_qty, tick, step, 6, 6
 
         meta_tick = float(meta.price_tick or (10 ** (-max(0, meta.price_place))))
         tick = float(tick_hint or meta_tick)
         step = float(meta.qty_step or (10 ** (-max(0, meta.qty_place))))
 
-        # Suspicious meta: tick=1 with pricePlace=0 but price<1 => never format to 0
-        if meta.price_place == 0 and meta_tick >= 1.0 and float(price) < 1.0:
-            tick = float(tick_hint or _estimate_tick_from_price(price))
+        # If tick still looks wrong vs price, fallback to estimate (rare)
+        if tick <= 0:
+            tick = float(tick_hint or _estimate_tick_from_price(p))
 
         # Price quantization rules:
-        # - LIMIT: BUY -> floor, SELL -> ceil (more fill-prob)
-        # - TRIGGER (SL): close_side SELL (long stop) -> ceil (trigger earlier),
-        #                 close_side BUY (short stop) -> floor
-        p = float(price)
+        # - LIMIT: BUY -> floor, SELL -> ceil
+        # - TRIGGER (SL): close_side SELL (long SL) -> ceil ; close_side BUY (short SL) -> floor
         if tick > 0:
             if is_trigger:
                 cs = (close_side or "").upper()
@@ -456,13 +484,11 @@ class BitgetTrader:
                 elif s == "SELL":
                     q_price = _ceil_step(p, tick)
                 else:
-                    # fallback: nearest
                     q_price = float(round(p / tick) * tick)
         else:
             q_price = p
 
-        # Qty quantization: always floor (avoid over-sizing)
-        q = float(qty)
+        # Qty quantization: floor to step (avoid oversizing)
         q_qty = _floor_step(q, step) if step > 0 else q
 
         # min qty gate
@@ -484,8 +510,8 @@ class BitgetTrader:
         force_decimals: Optional[int] = None,
     ) -> str:
         """
-        - Normal: use meta.pricePlace
-        - Fallback: decimals derived from tick_used to avoid Bitget 40020 price issues
+        - Normal: meta.pricePlace
+        - Fallback: decimals derived from tick_used to avoid 40020
         """
         meta = await self._meta.get(symbol)
         p = float(price)
@@ -497,23 +523,13 @@ class BitgetTrader:
             d = _decimals_from_step(tick_used or _estimate_tick_from_price(p))
             return _fmt_decimal(p, d)
 
-        meta_tick = float(meta.price_tick or (10 ** (-max(0, meta.price_place))))
-        suspicious = (meta.price_place == 0 and meta_tick >= 1.0 and p < 1.0)
-        if suspicious:
-            d = _decimals_from_step(tick_used or _estimate_tick_from_price(p))
-            return _fmt_decimal(p, d)
-
         # normal case
-        if meta.price_place >= 0:
-            # sometimes pricePlace is wrong; we handle via retry on 40020
-            return _fmt_decimal(p, max(0, meta.price_place))
-
-        # fallback
-        d = _decimals_from_step(tick_used or meta_tick)
-        return _fmt_decimal(p, d)
+        pp = int(meta.price_place) if meta.price_place is not None else 6
+        if pp < 0:
+            pp = _decimals_from_step(tick_used or meta.price_tick or _estimate_tick_from_price(p))
+        return _fmt_decimal(p, max(0, min(12, pp)))
 
     def _format_qty_str(self, qty: float, qty_place: int) -> str:
-        # never scientific notation
         d = max(0, min(12, int(qty_place)))
         return _fmt_decimal(float(qty), d)
 
@@ -541,13 +557,18 @@ class BitgetTrader:
           - quantize price BUY floor / SELL ceil
           - retry on 22047 (band clamp)
           - retry on 40020 (force decimals derived from tick)
+          - FIX: if reduce_only=True => tradeSide forced to "close"
         """
         sym = (symbol or "").upper()
         s = (side or "").lower()
 
+        # FIX: force close on reduceOnly
+        if reduce_only:
+            trade_side = "close"
+
         if size is None:
             notional = self.margin_usdt * self.leverage
-            raw_qty = notional / max(1e-12, float(price))
+            raw_qty = float(notional) / max(1e-12, float(price))
         else:
             raw_qty = float(size)
 
@@ -557,7 +578,6 @@ class BitgetTrader:
         if q_qty <= 0:
             return {"ok": False, "code": "QTY0", "msg": "quantized qty is 0"}
 
-        # normal formatting
         price_str = await self._format_price(sym, q_price, tick_used=tick_used)
         size_str = self._format_qty_str(q_qty, qp)
 
@@ -580,7 +600,8 @@ class BitgetTrader:
 
         logger.info(
             "[ORDER_%s] sym=%s side=%s tradeSide=%s reduceOnly=%s raw_price=%s q_price=%s price_str=%s raw_qty=%s q_qty=%s tick_used=%s",
-            debug_tag, sym, s, payload["tradeSide"], payload.get("reduceOnly"), float(price), q_price, price_str, float(raw_qty), q_qty, tick_used
+            debug_tag, sym, s, payload["tradeSide"], payload.get("reduceOnly"),
+            float(price), q_price, price_str, float(raw_qty), q_qty, tick_used
         )
 
         async def _send(data_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -620,7 +641,6 @@ class BitgetTrader:
 
         # Attach debug block for scanner
         if not _is_ok(resp):
-            # Surface parsed hints
             if code in _ERR_MIN_USDT:
                 mmin = _parse_min_usdt(msg)
                 if mmin is not None:
@@ -673,8 +693,8 @@ class BitgetTrader:
             price=price,
             size=qty,
             client_oid=client_oid,
-            trade_side="close",
-            reduce_only=True,
+            trade_side="close",         # explicit
+            reduce_only=True,           # forces close anyway
             tick_hint=tick_hint,
             debug_tag=debug_tag,
         )
@@ -853,7 +873,6 @@ class BitgetTrader:
         if state in {"filled", "full_fill", "fullfill", "completed", "success"}:
             return True
 
-        # numerical fallback
         filled = _safe_float(
             data.get("baseVolume")
             or data.get("filledQty")
