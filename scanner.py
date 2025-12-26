@@ -24,6 +24,8 @@ from settings import (
     API_PASSPHRASE,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
+    TOKEN,
+    CHAT_ID,
     SCAN_INTERVAL_MIN,
     TOP_N_SYMBOLS,
     MAX_ORDERS_PER_SCAN,
@@ -40,6 +42,22 @@ from analyze_signal import SignalAnalyzer
 
 from duplicate_guard import DuplicateGuard, fingerprint as make_fingerprint
 from risk_manager import RiskManager
+
+# Telegram behavior:
+# - TELEGRAM_SIGNAL_ON_VALID: send a "setup valid" message even before execution
+# - TELEGRAM_SIGNAL_ON_EXEC: send a message when an entry order is actually accepted
+# - TELEGRAM_SIGNAL_ON_SKIP: send a message when a valid setup is skipped (risk/microstructure/budget)
+def _env_bool(name: str, default: str = "1") -> bool:
+    v = os.getenv(name, default)
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+TELEGRAM_SIGNAL_ON_VALID = _env_bool("TELEGRAM_SIGNAL_ON_VALID", "1")
+TELEGRAM_SIGNAL_ON_EXEC = _env_bool("TELEGRAM_SIGNAL_ON_EXEC", "1")
+TELEGRAM_SIGNAL_ON_SKIP = _env_bool("TELEGRAM_SIGNAL_ON_SKIP", "1")
+
+# Prefer legacy env names TOKEN/CHAT_ID if you used them before.
+TG_TOKEN = TOKEN or TELEGRAM_BOT_TOKEN
+TG_CHAT_ID = CHAT_ID or TELEGRAM_CHAT_ID
 
 logger = logging.getLogger(__name__)
 
@@ -143,12 +161,12 @@ def _oid(prefix: str, tid: str, attempt: int) -> str:
 # =====================================================================
 
 async def send_telegram(msg: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TG_TOKEN or not TG_CHAT_ID:
         return
     import requests
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": TG_CHAT_ID,
         "text": msg,
         "parse_mode": "Markdown",
         "disable_web_page_preview": True,
@@ -178,6 +196,28 @@ def _mk_signal_msg(symbol: str, tid: str, side: str, setup: str, entry: float, s
         f"SL: `{_fmt_num(sl)}`\n"
         f"TP1: `{_fmt_num(tp1)}` (runner ensuite)\n"
         f"RR: `{_fmt_num(rr)}`\n"
+        f"tid: `{tid}`"
+    )
+
+def _mk_skip_msg(
+    symbol: str,
+    tid: str,
+    side: str,
+    setup: str,
+    entry: float,
+    sl: float,
+    tp1: float,
+    rr: float,
+    inst: int,
+    entry_type: str,
+    reason: str,
+) -> str:
+    return (
+        f"*⚠️ SKIPPED*\n"
+        f"*{symbol}* — {_fmt_side(side)}\n"
+        f"setup: `{setup}` | inst: `{inst}` | entry_type: `{entry_type}`\n"
+        f"reason: `{reason}`\n"
+        f"entry: `{_fmt_num(entry)}` | SL: `{_fmt_num(sl)}` | TP1: `{_fmt_num(tp1)}` | RR: `{_fmt_num(rr)}`\n"
         f"tid: `{tid}`"
     )
 
@@ -590,6 +630,9 @@ async def process_symbol(
         if not allowed:
             await stats.inc("risk_rejects", 1)
             await stats.add_reason(f"risk:{reason}")
+            # Optional: notify Telegram that the setup was valid but skipped by risk rules
+            if TELEGRAM_SIGNAL_ON_SKIP:
+                await send_telegram(_mk_skip_msg(str(symbol).upper(), tid, side, setup, entry, sl, tp1, rr, inst_score, entry_type, reason=f"risk:{reason}"))
             return
 
         pos_mode = await _detect_pos_mode(trader, symbol)
@@ -612,6 +655,8 @@ async def process_symbol(
             await order_budget.acquire()
         except asyncio.TimeoutError:
             await stats.add_reason("budget:max_orders_per_scan")
+            if TELEGRAM_SIGNAL_ON_SKIP:
+                await send_telegram(_mk_skip_msg(str(symbol).upper(), tid, side, setup, entry, sl, tp1, rr, inst_score, entry_type, reason="budget:max_orders_per_scan"))
             return
 
         tick_meta = await _get_tick_cached(trader, symbol)
@@ -657,6 +702,8 @@ async def process_symbol(
         if not ok_ms:
             desk_log(logging.WARNING, "REJ", symbol, tid, reason=f"microstructure_veto: {ms_note}")
             await stats.inc("rejects", 1)
+            if TELEGRAM_SIGNAL_ON_SKIP:
+                await send_telegram(_mk_skip_msg(str(symbol).upper(), tid, side, setup, entry, sl, tp1, rr, inst_score, entry_type, reason=f"microstructure_veto: {ms_note}"))
             try:
                 order_budget.release()
             except Exception:
@@ -704,6 +751,8 @@ async def process_symbol(
         qty_total = _safe_float(entry_resp.get("qty"), 0.0)
 
         desk_log(logging.INFO, "ENTRY_OK", symbol, tid, orderId=entry_order_id, qty=qty_total)
+        if TELEGRAM_SIGNAL_ON_EXEC:
+            await send_telegram(_mk_exec_msg("ENTRY_OK", str(symbol).upper(), tid, side=side, setup=setup, entry=q_entry, qty=qty_total, pos_mode=pos_mode))
         # Mark duplicate only after Bitget accepted the entry (prevents "signal sent but no order")
         DUP_GUARD.mark(fp)
         # Send main Telegram message only after ENTRY_OK so Telegram == "order exists"
@@ -721,6 +770,7 @@ async def process_symbol(
                 "sl": sl,
                 "tp1": tp1,
                 "qty_total": qty_total,
+                "notional": float(notional),
                 "qty_tp1": 0.0,
                 "entry_order_id": str(entry_order_id) if entry_order_id else None,
                 "entry_client_oid": f"entry-{tid}",
@@ -773,6 +823,29 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                 tp1 = float(st["tp1"])
                 qty_step = float(st.get("qty_step") or 1.0)
                 min_qty = float(st.get("min_qty") or 0.0)
+                # If we have already seen the position on Bitget, keep watching until it is fully closed.
+                # This prevents the RiskManager from drifting (phantom open positions) and keeps desk state clean.
+                if st.get("pos_seen"):
+                    try:
+                        pos_total_now = await _get_position_total(trader, sym, direction, pos_mode)
+                    except Exception:
+                        pos_total_now = 0.0
+                    if float(pos_total_now) <= 0:
+                        st["pos_zero_hits"] = int(st.get("pos_zero_hits") or 0) + 1
+                        if st["pos_zero_hits"] >= 2:
+                            desk_log(logging.INFO, "POS_CLOSED", sym, tid)
+                            if st.get("risk_opened"):
+                                try:
+                                    open_side = "BUY" if direction == "LONG" else "SELL"
+                                    RISK.register_closed(sym, open_side, pnl=0.0)
+                                except Exception:
+                                    logger.exception("[RISK_CLOSED_FAIL] %s %s", sym, tid)
+                            async with PENDING_LOCK:
+                                PENDING.pop(tid, None)
+                            continue
+                    else:
+                        st["pos_zero_hits"] = 0
+
 
                 last_fail = float(st.get("last_arm_fail_ts") or 0.0)
                 if last_fail > 0 and (time.time() - last_fail) < ARM_COOLDOWN_S:
@@ -808,6 +881,19 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         # Clamp qty_total to visible position (handles partial fills)
                         if float(st.get("qty_total") or 0.0) > 0:
                             st["qty_total"] = min(float(st["qty_total"]), float(pos_total))
+                        st["pos_seen"] = True
+                        if not st.get("risk_opened"):
+                            try:
+                                open_side = "BUY" if direction == "LONG" else "SELL"
+                                RISK.register_open(
+                                    sym,
+                                    open_side,
+                                    notional=float(st.get("notional") or DEFAULT_NOTIONAL_USDT),
+                                    risk=RISK.risk_for_this_trade(),
+                                )
+                                st["risk_opened"] = True
+                            except Exception:
+                                logger.exception("[RISK_OPEN_FAIL] %s %s", sym, tid)
 
                     qty_total = float(st.get("qty_total") or 0.0)
                     if qty_total <= 0:
@@ -1023,8 +1109,9 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     qty_rem = _q_qty_floor(max(0.0, qty_total - qty_tp1), qty_step)
                     if qty_rem <= 0:
                         desk_log(logging.INFO, "BE_SKIP", sym, tid, reason="no_runner_remaining")
-                        async with PENDING_LOCK:
-                            PENDING.pop(tid, None)
+                        # position should fully close once TP1 is filled; keep watching to cleanup risk/state
+                        st["be_done"] = True
+                        st["watch_close"] = True
                         continue
 
                     tick_meta = await _get_tick_cached(trader, sym)
@@ -1077,9 +1164,8 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     desk_log(logging.INFO, "BE_OK", sym, tid, be=be_q, planId=new_plan, qty_rem=qty_rem)
                     await send_telegram(_mk_exec_msg("BE_OK", sym, tid, be=be_q, planId=new_plan, runner_qty=qty_rem))
 
-                    # done
-                    async with PENDING_LOCK:
-                        PENDING.pop(tid, None)
+                    # keep watching until the runner is fully closed
+                    st["watch_close"] = True
                     continue
 
         except Exception:
