@@ -322,16 +322,19 @@ class RiskManager:
         # 4) Enregistrement de la position dans le risk manager
         #    (compteurs directionnels + trades/jour)
         # ------------------------------
+        # IMPORTANT: can_trade() is a pure *gate*.
+        # We DO NOT mutate state here, otherwise you'll hit max_open_positions even when orders are not sent/filled.
+        # The scanner/watcher must call register_open() only once the position is actually visible on Bitget.
         risk_used = self.risk_for_this_trade()
-        self.register_open(symbol, side, notional=notional, risk=risk_used)
 
         LOGGER.info(
-            "[RISK] %s %s allowed: notional=%.2f, risk_used=%.2f, daily_trades=%d",
+            "[RISK] %s %s pre-approved: notional=%.2f, risk_used=%.2f, daily_trades=%d, open_positions=%d",
             symbol,
             side,
             notional,
             risk_used,
             self._daily_trades(),
+            len(self.open_positions),
         )
 
         return True, "OK"
