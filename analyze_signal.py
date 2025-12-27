@@ -25,6 +25,17 @@ from stops import protective_stop_long, protective_stop_short
 from tp_clamp import compute_tp1
 from institutional_data import compute_full_institutional_analysis
 
+# Optional desk context (macro + options). Non-blocking if unavailable.
+try:
+    from macro_data import score_macro_alignment  # type: ignore
+except Exception:
+    score_macro_alignment = None  # type: ignore
+
+try:
+    from options_data import score_options_context  # type: ignore
+except Exception:
+    score_options_context = None  # type: ignore
+
 from settings import (
     MIN_INST_SCORE,
     RR_MIN_STRICT,
@@ -453,6 +464,57 @@ class SignalAnalyzer:
 
         LOGGER.info("[INST_RAW] %s score=%s eff=%s override=%s available=%s binance_symbol=%s",
                     symbol, inst_score, inst_score_eff, inst_override, available, binance_symbol)
+
+        # ---- Desk context (macro + options) — bonus only (never blocks) ----
+        desk_plus_score = 0
+        macro_res = None
+        options_res = None
+
+        macro_ctx = None
+        options_ctx = None
+        try:
+            if isinstance(macro, dict):
+                macro_ctx = macro.get("macro") or macro.get("global") or macro
+                options_ctx = macro.get("options")
+            else:
+                macro_ctx = macro
+        except Exception:
+            macro_ctx = macro
+
+        if score_macro_alignment and macro_ctx is not None:
+            try:
+                macro_res = score_macro_alignment(macro_ctx, bias=bias, symbol=symbol)  # type: ignore
+                if int(macro_res.get("score") or 0) > 0:
+                    desk_plus_score += 1
+            except Exception:
+                macro_res = {"ok": False, "score": 0, "regime": "unknown", "reason": "macro_exc"}
+
+        if score_options_context and options_ctx is not None:
+            try:
+                options_res = score_options_context(options_ctx, bias=bias)  # type: ignore
+                if int(options_res.get("score") or 0) > 0:
+                    desk_plus_score += 1
+            except Exception:
+                options_res = {"ok": False, "score": 0, "regime": "unknown", "reason": "options_exc"}
+
+        if desk_plus_score:
+            inst_score_eff = int(inst_score_eff) + int(desk_plus_score)
+            inst_score_eff = max(0, min(6, inst_score_eff))
+
+        # attach for logs / telegram
+        try:
+            inst["desk_plus_score"] = int(desk_plus_score)
+            if macro_res is not None:
+                inst["macro_ctx"] = macro_res
+            if options_res is not None:
+                inst["options_ctx"] = options_res
+        except Exception:
+            pass
+
+        LOGGER.info("[DESK_CTX] %s desk_plus=%s inst_eff=%s macro=%s options=%s",
+                    symbol, desk_plus_score, inst_score_eff,
+                    (macro_res or {}).get("regime") if isinstance(macro_res, dict) else None,
+                    (options_res or {}).get("regime") if isinstance(options_res, dict) else None)
 
         if not bypass_inst and inst_override:
             LOGGER.warning("[INST_OVERRIDE] %s %s", symbol, inst_override)
