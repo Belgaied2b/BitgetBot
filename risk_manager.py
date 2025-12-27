@@ -59,14 +59,14 @@ class RiskConfig:
     max_trades_per_day: int = 20
 
     # max concurrently open positions
-    max_open_positions: int = 5
+    max_open_positions: int = 10
 
     # directional caps
-    max_long_positions: int = 4
-    max_short_positions: int = 4
+    max_long_positions: int = 10
+    max_short_positions: int = 10
 
     # tilt: consecutive losses => cooldown
-    max_consecutive_losses: int = 3
+    max_consecutive_losses: int = 5
     tilt_cooldown_seconds: int = 60 * 60
 
     # drawdown risk reducer
