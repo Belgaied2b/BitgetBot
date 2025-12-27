@@ -127,6 +127,7 @@ def _pending_serializable(state: Dict[str, Any]) -> Dict[str, Any]:
         "created_ts",
         "arm_attempts",
         "last_arm_fail_ts",
+        "freeze_until",
         "sl_inflight",
         "tp1_inflight",
         "tp1_min_usdt",
@@ -139,6 +140,7 @@ def _pending_serializable(state: Dict[str, Any]) -> Dict[str, Any]:
         "notional",
         "setup",
         "entry_type",
+        "rr",
         "inst_score",
         "runner_monitor",
         "runner_qty",
@@ -545,8 +547,8 @@ async def _fetch_last_closed_pnl(trader: BitgetTrader, symbol: str, direction: s
     return 0.0
 
 
-async def _risk_close_trade(trader: BitgetTrader, symbol: str, direction: str, reason: str) -> None:
-    pnl = await _fetch_last_closed_pnl(trader, symbol, direction)
+async def _risk_close_trade(trader: BitgetTrader, symbol: str, direction: str, reason: str, pnl_override: Optional[float] = None) -> None:
+    pnl = float(pnl_override) if pnl_override is not None else await _fetch_last_closed_pnl(trader, symbol, direction)
     try:
         RISK.register_closed(symbol, direction, pnl)
     except Exception:
@@ -731,7 +733,6 @@ async def analyze_symbol(sym: str, client, analyze_sem: asyncio.Semaphore, stats
             extra=f"{setup}|{entry_type}|{pos_mode}",
             precision=10
         )
-
         return {
             "tid": tid,
             "symbol": str(sym).upper(),
@@ -742,14 +743,6 @@ async def analyze_symbol(sym: str, client, analyze_sem: asyncio.Semaphore, stats
             "entry": entry,
             "sl": sl,
             "tp1": tp1,
-            "setup": setup,
-            "entry_type": entry_type,
-            "inst_score": inst_score,
-            "notional": notional,
-            "risk_rid": risk_rid,
-            "risk_confirmed": True,
-            "runner_monitor": False,
-            "runner_qty": 0.0,
             "rr": rr,
             "setup": setup,
             "entry_type": entry_type,
@@ -947,6 +940,14 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
             "direction": direction,
             "close_side": close_side,
             "pos_mode": pos_mode,
+            "setup": setup,
+            "entry_type": entry_type,
+            "inst_score": inst_score,
+            "rr": rr,
+            "notional": float(notional),
+            "risk_rid": str(risk_rid),
+            "risk_confirmed": True,
+            "freeze_until": 0.0,
             "entry": q_entry,
             "sl": sl,
             "tp1": tp1,
@@ -1017,23 +1018,23 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                 if last_fail > 0 and (time.time() - last_fail) < ARM_COOLDOWN_S:
                     continue
 
+                freeze_until = float(st.get("freeze_until") or 0.0)
+                if freeze_until > time.time():
+                    continue
+                if freeze_until > 0:
+                    st["freeze_until"] = 0.0
+                    dirty = True
+
                 attempts = int(st.get("arm_attempts") or 0)
                 if attempts >= ARM_MAX_ATTEMPTS:
-                    desk_log(logging.ERROR, "ARM_ABORT", sym, tid, attempts=attempts)
-
-                    # risk cleanup: abandon pending
-                    if bool(st.get("risk_confirmed", False)):
-                        await _risk_close_trade(trader, sym, direction, reason="arm_abort")
-                    else:
-                        try:
-                            await RISK.cancel_reservation(st.get("risk_rid"))
-                        except Exception:
-                            pass
-
-                    async with PENDING_LOCK:
-                        PENDING.pop(tid, None)
+                    freeze_s = int(os.getenv("ARM_FREEZE_SECONDS", "900"))
+                    freeze_s = max(60, int(freeze_s))
+                    st["freeze_until"] = time.time() + float(freeze_s)
+                    st["arm_attempts"] = 0
+                    st["last_arm_fail_ts"] = time.time()
+                    desk_log(logging.ERROR, "ARM_FREEZE", sym, tid, attempts=attempts, freeze_s=freeze_s)
                     dirty = True
-                    await send_telegram(_mk_exec_msg("ARM_ABORT", sym, tid, attempts=attempts))
+                    await send_telegram(_mk_exec_msg("ARM_FREEZE", sym, tid, attempts=attempts, freeze_s=freeze_s))
                     continue
 
                 # If BE already placed (runner mode), just monitor position closure
@@ -1066,7 +1067,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                         # risk cleanup: entry cancelled / rejected
                         if bool(st.get("risk_confirmed", False)):
-                            await _risk_close_trade(trader, sym, direction, reason=f"entry_state={state}")
+                            await _risk_close_trade(trader, sym, direction, reason=f"entry_state={state}", pnl_override=0.0)
                         else:
                             try:
                                 await RISK.cancel_reservation(st.get("risk_rid"))
