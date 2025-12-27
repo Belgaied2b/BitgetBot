@@ -598,18 +598,24 @@ class SignalAnalyzer:
             good_inst = inst_score_eff >= INST_SCORE_DESK_PRIORITY
             good_rr = float(rr) >= RR_MIN_DESK_PRIORITY
 
+            # ✅ FIX: composite threshold must be direction-aware
+            # Here comp_score is "bullishness" (0=very bearish, 100=very bullish).
             comp_thr = 65.0
+            comp_thr_short = 100.0 - comp_thr  # 35.0
+
             if bias == "LONG":
                 good_comp = (comp_score >= comp_thr) and (comp_label in ("STRONG_BULLISH", "BULLISH", "SLIGHT_BULLISH"))
+                comp_rule = f">={comp_thr:.1f}"
             else:
-                good_comp = (comp_score >= comp_thr) and (comp_label in ("STRONG_BEARISH", "BEARISH", "SLIGHT_BEARISH"))
+                good_comp = (comp_score <= comp_thr_short) and (comp_label in ("STRONG_BEARISH", "BEARISH", "SLIGHT_BEARISH"))
+                comp_rule = f"<={comp_thr_short:.1f}"
 
             inst_continuation_ok = bool(good_inst and good_rr and good_comp)
 
             inst_continuation_reason = (
                 f"good_inst={good_inst}({inst_score_eff}>={INST_SCORE_DESK_PRIORITY}) "
                 f"good_rr={good_rr}({float(rr):.3f}>={RR_MIN_DESK_PRIORITY}) "
-                f"good_comp={good_comp}({comp_score:.1f},{comp_label},thr={comp_thr})"
+                f"good_comp={good_comp}({comp_score:.1f},{comp_label},thr={comp_rule})"
             )
 
             LOGGER.info("[EVAL_PRE] %s INST_CONTINUATION_CHECK %s ok=%s",
