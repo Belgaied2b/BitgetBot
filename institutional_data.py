@@ -45,6 +45,13 @@ LOGGER = logging.getLogger(__name__)
 
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
 
+# Order book (depth) microstructure (lightweight, optional)
+# Docs: GET /fapi/v1/depth (USDS-M futures)
+ORDERBOOK_LIMIT = int(os.getenv("BINANCE_ORDERBOOK_LIMIT", "100"))  # valid: 5..1000
+ORDERBOOK_TTL_S = float(os.getenv("BINANCE_ORDERBOOK_TTL_S", "12"))
+_ORDERBOOK_CACHE: Dict[str, Tuple[float, Optional[float], str]] = {}  # sym -> (ts, imbalance, regime)
+_ORDERBOOK_LOCK = asyncio.Lock()
+
 # ---------------------------------------------------------------------
 # Cache léger pour éviter de spammer l'API
 # ---------------------------------------------------------------------
@@ -93,6 +100,58 @@ async def _http_get(
     except Exception as e:
         LOGGER.error(f"[INST] Exception GET {path} params={params}: {e}")
         return None
+
+
+async def _fetch_orderbook_imbalance(session: aiohttp.ClientSession, binance_symbol: str) -> Tuple[Optional[float], str]:
+    """
+    Returns (imbalance, regime).
+    imbalance in [-1..+1] computed from summed qty of bids/asks.
+    regime: strong_buy / strong_sell / neutral / unavailable
+    """
+    sym = (binance_symbol or "").upper().strip()
+    if not sym:
+        return None, "unavailable"
+
+    now = time.time()
+    async with _ORDERBOOK_LOCK:
+        cached = _ORDERBOOK_CACHE.get(sym)
+        if cached and (now - float(cached[0])) < ORDERBOOK_TTL_S:
+            return cached[1], cached[2]
+
+    params = {"symbol": sym, "limit": int(ORDERBOOK_LIMIT)}
+    data = await _http_get(session, "/fapi/v1/depth", params=params)
+
+    imb = None
+    regime = "unavailable"
+    try:
+        if isinstance(data, dict) and "bids" in data and "asks" in data:
+            bids = data.get("bids") or []
+            asks = data.get("asks") or []
+            bid_qty = 0.0
+            ask_qty = 0.0
+            for p, q in bids:
+                bid_qty += float(q)
+            for p, q in asks:
+                ask_qty += float(q)
+
+            den = bid_qty + ask_qty
+            if den > 0:
+                imb = (bid_qty - ask_qty) / den
+                # thresholds tuned to avoid noise
+                if imb >= 0.08:
+                    regime = "strong_buy"
+                elif imb <= -0.08:
+                    regime = "strong_sell"
+                else:
+                    regime = "neutral"
+    except Exception:
+        imb = None
+        regime = "unavailable"
+
+    async with _ORDERBOOK_LOCK:
+        _ORDERBOOK_CACHE[sym] = (now, imb, regime)
+
+    return imb, regime
 
 
 # =====================================================================
@@ -466,9 +525,10 @@ def _score_institutional(
     oi_slope: Optional[float],
     cvd_slope: Optional[float],
     funding_rate: Optional[float],
+    ob_regime: Optional[str] = None,
 ) -> int:
     """
-    Construit un score institutionnel simple dans [0, 4].
+    Construit un score institutionnel simple dans [0, 5].
 
     Logique :
       - CVD directionnel = facteur principal (jusqu'à +2)
@@ -505,7 +565,15 @@ def _score_institutional(
         elif b == "SHORT" and funding_rate > 0.0005:
             score += 1
 
-    score = max(0, min(4, score))
+    # Order book imbalance (microstructure) — optional (bonus only)
+    if ob_regime:
+        ob = str(ob_regime)
+        if b == "LONG" and ob == "strong_buy":
+            score += 1
+        elif b == "SHORT" and ob == "strong_sell":
+            score += 1
+
+    score = max(0, min(5, score))
     return int(score)
 
 
@@ -584,11 +652,22 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
     crowding_regime = _classify_crowding(bias, funding_rate)
     flow_regime = _classify_flow(cvd_slope)
 
+    # 4) Order book depth (optional)
+    ob_imbalance: Optional[float] = None
+    ob_regime: str = "unavailable"
+    if available and binance_symbol:
+        try:
+            ob_imbalance, ob_regime = await _fetch_orderbook_imbalance(session, str(binance_symbol))
+        except Exception:
+            ob_imbalance, ob_regime = None, "unavailable"
+            warnings.append("orderbook_error")
+
     inst_score = _score_institutional(
         bias=bias,
         oi_slope=oi_slope,
         cvd_slope=cvd_slope,
         funding_rate=funding_rate,
+        ob_regime=ob_regime,
     )
 
     # available = on a AU MOINS une info exploitable (klines, oi ou funding)
@@ -606,6 +685,8 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
         "oi_slope": oi_slope,
         "cvd_slope": cvd_slope,
         "funding_rate": funding_rate,
+        "ob_imbalance": ob_imbalance,
+        "ob_regime": ob_regime,
         "funding_regime": funding_regime,
         "crowding_regime": crowding_regime,
         "flow_regime": flow_regime,
