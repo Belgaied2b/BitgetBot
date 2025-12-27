@@ -6,36 +6,19 @@
 #       * Open Interest (OI)
 #       * CVD (Cumulative Volume Delta) via taker buy volume
 #       * Funding (premiumIndex)
-#   - Utiliser exclusivement des endpoints gratuits Binance USDT-M futures.
-#   - Rester léger : appelé uniquement quand la structure / BOS est OK,
-#     donc pas 543 symboles à chaque scan.
+#       * (Optionnel) Orderbook imbalance (depth)
+#   - Endpoints gratuits Binance USDT-M futures.
+#   - Léger : appelé seulement si structure/BOS OK.
 #
 # API principale :
-#
-#   async def compute_full_institutional_analysis(symbol: str, bias: str) -> dict:
-#       bias: "LONG" ou "SHORT"
-#
-# Retourne un dict du type :
-#   {
-#       "institutional_score": int,
-#       "binance_symbol": str | None,
-#       "available": bool,
-#       "oi": float | None,
-#       "oi_slope": float | None,
-#       "cvd_slope": float | None,
-#       "funding_rate": float | None,
-#       "funding_regime": str,
-#       "crowding_regime": str,
-#       "flow_regime": str,
-#       "warnings": list[str],
-#   }
-#
+#   async def compute_full_institutional_analysis(symbol: str, bias: str) -> dict
 # =====================================================================
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os  # ✅ FIX 1
 import time
 from typing import Any, Dict, List, Optional, Tuple, Set
 
@@ -47,8 +30,25 @@ BINANCE_FAPI_BASE = "https://fapi.binance.com"
 
 # Order book (depth) microstructure (lightweight, optional)
 # Docs: GET /fapi/v1/depth (USDS-M futures)
-ORDERBOOK_LIMIT = int(os.getenv("BINANCE_ORDERBOOK_LIMIT", "100"))  # valid: 5..1000
-ORDERBOOK_TTL_S = float(os.getenv("BINANCE_ORDERBOOK_TTL_S", "12"))
+def _safe_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+def _safe_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+ORDERBOOK_LIMIT = _safe_int_env("BINANCE_ORDERBOOK_LIMIT", 100)  # valid: 5..1000
+ORDERBOOK_LIMIT = max(5, min(1000, ORDERBOOK_LIMIT))
+ORDERBOOK_TTL_S = _safe_float_env("BINANCE_ORDERBOOK_TTL_S", 12.0)
+
+# threshold fixed (as you had): avoid noise
+ORDERBOOK_IMB_THRESHOLD = _safe_float_env("ORDERBOOK_IMB_THRESHOLD", 0.08)
+
 _ORDERBOOK_CACHE: Dict[str, Tuple[float, Optional[float], str]] = {}  # sym -> (ts, imbalance, regime)
 _ORDERBOOK_LOCK = asyncio.Lock()
 
@@ -63,7 +63,6 @@ _KLINES_CACHE: Dict[Tuple[str, str], Tuple[float, List[List[Any]]]] = {}
 _FUNDING_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
 # Historique OI: symbol -> (timestamp_sec, oi_value)
-# (on garde le dernier snapshot pour calculer un slope simple)
 _OI_HISTORY: Dict[str, Tuple[float, float]] = {}
 
 # Cache symboles Binance Futures USDT-perp
@@ -73,8 +72,8 @@ _BINANCE_SYMBOLS_TS: float = 0.0
 # TTLs (en secondes)
 KLINES_TTL = 60.0
 FUNDING_TTL = 60.0
-OI_TTL = 60.0  # si on veut un jour filtrer par temps, déjà prêt
-BINANCE_SYMBOLS_TTL = 900.0  # 15 minutes pour la liste des symboles
+OI_TTL = 60.0
+BINANCE_SYMBOLS_TTL = 900.0  # 15 minutes
 
 
 # =====================================================================
@@ -91,14 +90,14 @@ async def _http_get(
         async with session.get(url, params=params, timeout=10) as resp:
             if resp.status != 200:
                 txt = await resp.text()
-                LOGGER.warning(f"[INST] HTTP {resp.status} GET {path} params={params} resp={txt}")
+                LOGGER.warning("[INST] HTTP %s GET %s params=%s resp=%s", resp.status, path, params, (txt or "")[:250])
                 return None
             return await resp.json()
     except asyncio.TimeoutError:
-        LOGGER.error(f"[INST] Timeout GET {path} params={params}")
+        LOGGER.warning("[INST] Timeout GET %s params=%s", path, params)
         return None
     except Exception as e:
-        LOGGER.error(f"[INST] Exception GET {path} params={params}: {e}")
+        LOGGER.warning("[INST] Exception GET %s params=%s err=%s", path, params, e)
         return None
 
 
@@ -121,7 +120,7 @@ async def _fetch_orderbook_imbalance(session: aiohttp.ClientSession, binance_sym
     params = {"symbol": sym, "limit": int(ORDERBOOK_LIMIT)}
     data = await _http_get(session, "/fapi/v1/depth", params=params)
 
-    imb = None
+    imb: Optional[float] = None
     regime = "unavailable"
     try:
         if isinstance(data, dict) and "bids" in data and "asks" in data:
@@ -129,6 +128,7 @@ async def _fetch_orderbook_imbalance(session: aiohttp.ClientSession, binance_sym
             asks = data.get("asks") or []
             bid_qty = 0.0
             ask_qty = 0.0
+
             for p, q in bids:
                 bid_qty += float(q)
             for p, q in asks:
@@ -137,10 +137,9 @@ async def _fetch_orderbook_imbalance(session: aiohttp.ClientSession, binance_sym
             den = bid_qty + ask_qty
             if den > 0:
                 imb = (bid_qty - ask_qty) / den
-                # thresholds tuned to avoid noise
-                if imb >= 0.08:
+                if imb >= ORDERBOOK_IMB_THRESHOLD:
                     regime = "strong_buy"
-                elif imb <= -0.08:
+                elif imb <= -ORDERBOOK_IMB_THRESHOLD:
                     regime = "strong_sell"
                 else:
                     regime = "neutral"
@@ -158,9 +157,7 @@ async def _fetch_orderbook_imbalance(session: aiohttp.ClientSession, binance_sym
 # Symboles Binance Futures (cache exchangeInfo)
 # =====================================================================
 
-async def _get_binance_symbols(
-    session: aiohttp.ClientSession,
-) -> Set[str]:
+async def _get_binance_symbols(session: aiohttp.ClientSession) -> Set[str]:
     """
     Charge / met à jour la liste des symboles Binance Futures USDT-perp (PERPETUAL, quoteAsset=USDT).
     Résultat mis en cache pour BINANCE_SYMBOLS_TTL secondes.
@@ -188,7 +185,6 @@ async def _get_binance_symbols(
                 continue
             if s.get("quoteAsset") != "USDT":
                 continue
-
             sym = str(s.get("symbol", "")).upper()
             if sym:
                 symbols.add(sym)
@@ -197,7 +193,6 @@ async def _get_binance_symbols(
 
     _BINANCE_SYMBOLS = symbols
     _BINANCE_SYMBOLS_TS = now
-
     LOGGER.info("[INST] Binance futures symbols loaded: %d", len(symbols))
     return _BINANCE_SYMBOLS
 
@@ -209,24 +204,17 @@ async def _get_binance_symbols(
 def _map_symbol_to_binance(symbol: str, binance_symbols: Set[str]) -> Optional[str]:
     """
     Map symbol Bitget (ex: 'BTCUSDT') vers Binance USDT-M futures symbol.
-
-    - Cas direct : BTCUSDT -> BTCUSDT si présent dans binance_symbols.
-    - Cas 1000TOKENUSDT -> TOKENUSDT si TOKENUSDT est présent.
-    - Sinon -> None (pas de couverture insti Binance).
     """
-    s = symbol.upper()
+    s = str(symbol or "").upper()
 
-    # Mapping direct
     if s in binance_symbols:
         return s
 
-    # Cas 1000TOKENUSDT -> TOKENUSDT
     if s.startswith("1000"):
         alt = s[4:]
         if alt in binance_symbols:
             return alt
 
-    # Ici tu peux ajouter d'autres règles si besoin (tokens exotiques)
     return None
 
 
@@ -234,34 +222,7 @@ def _map_symbol_to_binance(symbol: str, binance_symbols: Set[str]) -> Optional[s
 # Fetch klines 1h Binance (pour CVD)
 # =====================================================================
 
-async def _fetch_klines_1h(
-    session: aiohttp.ClientSession,
-    binance_symbol: str,
-    limit: int = 100,
-) -> Optional[List[List[Any]]]:
-    """
-    Récupère les klines 1h Binance Futures USDT-M :
-    /fapi/v1/klines?symbol=...&interval=1h&limit=...
-
-    Format klines Binance :
-      [
-        [
-          0  openTime,
-          1  open,
-          2  high,
-          3  low,
-          4  close,
-          5  volume,
-          6  closeTime,
-          7  quoteAssetVolume,
-          8  numberOfTrades,
-          9  takerBuyBaseAssetVolume,
-          10 takerBuyQuoteAssetVolume,
-          11 ignore
-        ],
-        ...
-      ]
-    """
+async def _fetch_klines_1h(session: aiohttp.ClientSession, binance_symbol: str, limit: int = 120) -> Optional[List[List[Any]]]:
     cache_key = (binance_symbol, "1h")
     now = time.time()
 
@@ -271,11 +232,7 @@ async def _fetch_klines_1h(
         if now - ts < KLINES_TTL:
             return data
 
-    params = {
-        "symbol": binance_symbol,
-        "interval": "1h",
-        "limit": limit,
-    }
+    params = {"symbol": binance_symbol, "interval": "1h", "limit": limit}
     data = await _http_get(session, "/fapi/v1/klines", params=params)
     if not isinstance(data, list) or len(data) == 0:
         return None
@@ -288,23 +245,7 @@ async def _fetch_klines_1h(
 # Fetch funding (premiumIndex)
 # =====================================================================
 
-async def _fetch_funding(
-    session: aiohttp.ClientSession,
-    binance_symbol: str,
-) -> Optional[Dict[str, Any]]:
-    """
-    Récupère premiumIndex / funding actuel :
-    /fapi/v1/premiumIndex?symbol=...
-
-    Retour type:
-    {
-      "symbol": "BTCUSDT",
-      "markPrice": "87879.59652239",
-      "indexPrice": "87859.22134211",
-      "lastFundingRate": "0.00010000",
-      ...
-    }
-    """
+async def _fetch_funding(session: aiohttp.ClientSession, binance_symbol: str) -> Optional[Dict[str, Any]]:
     now = time.time()
     cached = _FUNDING_CACHE.get(binance_symbol)
     if cached is not None:
@@ -312,8 +253,7 @@ async def _fetch_funding(
         if now - ts < FUNDING_TTL:
             return data
 
-    params = {"symbol": binance_symbol}
-    data = await _http_get(session, "/fapi/v1/premiumIndex", params=params)
+    data = await _http_get(session, "/fapi/v1/premiumIndex", params={"symbol": binance_symbol})
     if not isinstance(data, dict) or "symbol" not in data:
         return None
 
@@ -325,100 +265,49 @@ async def _fetch_funding(
 # Fetch open interest snapshot
 # =====================================================================
 
-async def _fetch_open_interest(
-    session: aiohttp.ClientSession,
-    binance_symbol: str,
-) -> Optional[float]:
-    """
-    Récupère le snapshot d'open interest :
-    /fapi/v1/openInterest?symbol=...
-
-    Retour type:
-    {
-      "symbol": "BTCUSDT",
-      "openInterest": "12345.678",
-      ...
-    }
-
-    NOTE IMPORTANTE :
-      - Ici, on NE met PAS à jour _OI_HISTORY.
-        On laisse _compute_oi_slope() utiliser l'ancien snapshot,
-        puis compute_full_institutional_analysis() mettra à jour l'historique
-        après calcul du slope. Sinon on aurait toujours slope = 0.
-    """
-    params = {"symbol": binance_symbol}
-    data = await _http_get(session, "/fapi/v1/openInterest", params=params)
+async def _fetch_open_interest(session: aiohttp.ClientSession, binance_symbol: str) -> Optional[float]:
+    data = await _http_get(session, "/fapi/v1/openInterest", params={"symbol": binance_symbol})
     if not isinstance(data, dict) or "openInterest" not in data:
         return None
-
     try:
-        oi = float(data["openInterest"])
+        return float(data["openInterest"])
     except Exception:
         return None
 
-    return oi
-
 
 def _compute_oi_slope(binance_symbol: str, new_oi: Optional[float]) -> Optional[float]:
-    """
-    Calcule une pente simple d'OI par rapport au dernier snapshot,
-    si disponible. Retourne un ratio approximatif.
-
-    - new_oi: valeur courante
-    - historique dans _OI_HISTORY (timestamp, old_oi)
-
-    Slope approximatif :
-      (new_oi - old_oi) / max(old_oi, 1e-8)
-    """
     if new_oi is None:
         return None
 
     prev = _OI_HISTORY.get(binance_symbol)
     if prev is None:
-        # pas d'historique -> slope neutre mais valide
         return 0.0
 
     _, old_oi = prev
     if old_oi <= 0:
         return 0.0
 
-    slope = (new_oi - old_oi) / old_oi
-    return float(slope)
+    return float((new_oi - old_oi) / old_oi)
 
 
 # =====================================================================
 # CVD à partir des klines
 # =====================================================================
 
-def _compute_cvd_slope_from_klines(
-    klines: List[List[Any]],
-    window: int = 40,
-) -> Optional[float]:
-    """
-    Calcule un CVD (Cumulative Volume Delta) approximatif à partir
-    des klines Binance.
-
-    Pour chaque kline :
-      delta = 2 * takerBuyBase - totalVolume
-    (si takerBuyBase = totalVolume -> delta = +totalVolume)
-    (si takerBuyBase = 0          -> delta = -totalVolume)
-
-    On cumule le delta, puis on prend la pente sur les N dernières barres.
-    """
+def _compute_cvd_slope_from_klines(klines: List[List[Any]], window: int = 40) -> Optional[float]:
     if not klines or len(klines) < window + 5:
         return None
 
-    sub = klines[-(window + 5) :]
+    sub = klines[-(window + 5):]
     cvs: List[float] = []
     cvd = 0.0
 
     for item in sub:
         try:
-            vol = float(item[5])       # total volume
-            taker_buy = float(item[9]) # taker buy base volume
+            vol = float(item[5])
+            taker_buy = float(item[9])
         except Exception:
             continue
-
         delta = 2.0 * taker_buy - vol
         cvd += delta
         cvs.append(cvd)
@@ -444,13 +333,8 @@ def _compute_cvd_slope_from_klines(
 # =====================================================================
 
 def _classify_funding(funding_rate: Optional[float]) -> str:
-    """
-    Classe le funding en régimes :
-      - "very_negative" / "negative" / "neutral" / "positive" / "very_positive"
-    """
     if funding_rate is None:
         return "unknown"
-
     fr = funding_rate
     if fr <= -0.0015:
         return "very_negative"
@@ -464,17 +348,6 @@ def _classify_funding(funding_rate: Optional[float]) -> str:
 
 
 def _classify_crowding(bias: str, funding_rate: Optional[float]) -> str:
-    """
-    Crowding prédateur, version très simple :
-
-      - Pour un LONG :
-          * funding très négatif => shorts crowdés (bon pour LONG)
-          * funding très positif => longs crowdés (risque de squeeze down)
-
-      - Pour un SHORT :
-          * funding très positif => longs crowdés (bon pour SHORT)
-          * funding très négatif => shorts crowdés (risque de squeeze up)
-    """
     if funding_rate is None:
         return "unknown"
 
@@ -486,21 +359,16 @@ def _classify_crowding(bias: str, funding_rate: Optional[float]) -> str:
         if fr >= 0.001:
             return "long_crowded_risky"
         return "balanced"
-    elif b == "SHORT":
+    if b == "SHORT":
         if fr >= 0.001:
             return "long_crowded_favorable"
         if fr <= -0.001:
             return "short_crowded_risky"
         return "balanced"
-    else:
-        return "unknown"
+    return "unknown"
 
 
 def _classify_flow(cvd_slope: Optional[float]) -> str:
-    """
-    Simple classification du flux depuis la pente de CVD :
-      - "strong_buy" / "buy" / "neutral" / "sell" / "strong_sell"
-    """
     if cvd_slope is None:
         return "unknown"
 
@@ -527,14 +395,6 @@ def _score_institutional(
     funding_rate: Optional[float],
     ob_regime: Optional[str] = None,
 ) -> int:
-    """
-    Construit un score institutionnel simple dans [0, 5].
-
-    Logique :
-      - CVD directionnel = facteur principal (jusqu'à +2)
-      - OI slope = renfort (jusqu'à +1)
-      - Funding contrarian = bonus (jusqu'à +1)
-    """
     b = bias.upper()
     score = 0
 
@@ -565,7 +425,7 @@ def _score_institutional(
         elif b == "SHORT" and funding_rate > 0.0005:
             score += 1
 
-    # Order book imbalance (microstructure) — optional (bonus only)
+    # Orderbook bonus (optional)
     if ob_regime:
         ob = str(ob_regime)
         if b == "LONG" and ob == "strong_buy":
@@ -573,8 +433,7 @@ def _score_institutional(
         elif b == "SHORT" and ob == "strong_sell":
             score += 1
 
-    score = max(0, min(5, score))
-    return int(score)
+    return int(max(0, min(5, score)))
 
 
 # =====================================================================
@@ -584,25 +443,29 @@ def _score_institutional(
 async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[str, Any]:
     """
     Calcule un score institutionnel pour un symbol Bitget donné, en utilisant
-    les données Binance USDT-M Futures (klines, OI, funding).
+    les données Binance USDT-M Futures (klines, OI, funding, orderbook).
 
-    - Si Binance ne connaît pas le symbole -> score neutre (0), available=False,
-      mais le reste de la pipeline peut continuer (structure/momentum/RR).
+    - Si Binance ne connaît pas le symbole -> score 0, available=False.
     """
-    bias = bias.upper()
+    bias_u = str(bias or "").upper()
+    if bias_u not in ("LONG", "SHORT"):
+        bias_u = "LONG"
 
     warnings: List[str] = []
     oi_value: Optional[float] = None
     oi_slope: Optional[float] = None
     cvd_slope: Optional[float] = None
     funding_rate: Optional[float] = None
+    ob_imbalance: Optional[float] = None
+    ob_regime: str = "unavailable"
+
+    binance_symbol: Optional[str] = None
 
     async with aiohttp.ClientSession() as session:
-        # 0) Récupérer / rafraîchir la liste des symboles Binance Futures
+        # 0) Liste des symboles Binance Futures
         binance_symbols = await _get_binance_symbols(session)
         binance_symbol = _map_symbol_to_binance(symbol, binance_symbols)
 
-        # Si aucun mapping viable -> pas de couverture insti Binance
         if binance_symbol is None:
             return {
                 "institutional_score": 0,
@@ -612,32 +475,41 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
                 "oi_slope": None,
                 "cvd_slope": None,
                 "funding_rate": None,
+                "ob_imbalance": None,
+                "ob_regime": "unavailable",
                 "funding_regime": "unknown",
                 "crowding_regime": "unknown",
                 "flow_regime": "unknown",
                 "warnings": ["symbol_not_mapped_to_binance"],
             }
 
-        # 1) Klines -> CVD
-        klines = await _fetch_klines_1h(session, binance_symbol, limit=120)
+        # 1) Fetch concurrent (plus "desk")
+        t_kl = asyncio.create_task(_fetch_klines_1h(session, binance_symbol, limit=120))
+        t_oi = asyncio.create_task(_fetch_open_interest(session, binance_symbol))
+        t_fu = asyncio.create_task(_fetch_funding(session, binance_symbol))
+        t_ob = asyncio.create_task(_fetch_orderbook_imbalance(session, binance_symbol))
+
+        klines = await t_kl
+        oi_value = await t_oi
+        funding_data = await t_fu
+        ob_imbalance, ob_regime = await t_ob
+
+        # 1) CVD
         if not klines:
             warnings.append("no_klines")
             cvd_slope = None
         else:
             cvd_slope = _compute_cvd_slope_from_klines(klines, window=40)
 
-        # 2) OI snapshot + slope (utilise l'historique _OI_HISTORY)
-        oi_value = await _fetch_open_interest(session, binance_symbol)
+        # 2) OI + slope
         if oi_value is None:
             warnings.append("no_oi")
             oi_slope = None
         else:
             oi_slope = _compute_oi_slope(binance_symbol, oi_value)
-            # met à jour l'historique APRÈS calcul du slope
             _OI_HISTORY[binance_symbol] = (time.time(), oi_value)
 
-        # 3) Funding / premiumIndex
-        funding_data = await _fetch_funding(session, binance_symbol)
+        # 3) Funding
         if funding_data is None:
             warnings.append("no_funding")
             funding_rate = None
@@ -648,34 +520,26 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
                 funding_rate = None
                 warnings.append("funding_parse_error")
 
+    # Regimes
     funding_regime = _classify_funding(funding_rate)
-    crowding_regime = _classify_crowding(bias, funding_rate)
+    crowding_regime = _classify_crowding(bias_u, funding_rate)
     flow_regime = _classify_flow(cvd_slope)
 
-    # 4) Order book depth (optional)
-    ob_imbalance: Optional[float] = None
-    ob_regime: str = "unavailable"
-    if available and binance_symbol:
-        try:
-            ob_imbalance, ob_regime = await _fetch_orderbook_imbalance(session, str(binance_symbol))
-        except Exception:
-            ob_imbalance, ob_regime = None, "unavailable"
-            warnings.append("orderbook_error")
+    # available = on a AU MOINS une info exploitable
+    available = any([
+        oi_value is not None,
+        cvd_slope is not None,
+        funding_rate is not None,
+        ob_imbalance is not None,
+    ])
 
     inst_score = _score_institutional(
-        bias=bias,
+        bias=bias_u,
         oi_slope=oi_slope,
         cvd_slope=cvd_slope,
         funding_rate=funding_rate,
         ob_regime=ob_regime,
     )
-
-    # available = on a AU MOINS une info exploitable (klines, oi ou funding)
-    available = any([
-        oi_value is not None,
-        cvd_slope is not None,
-        funding_rate is not None,
-    ])
 
     return {
         "institutional_score": inst_score,
