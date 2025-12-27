@@ -139,10 +139,10 @@ LEVERAGE = _get_float("LEVERAGE", 10.0, min_v=1.0, max_v=125.0)
 SCAN_INTERVAL_MIN = _get_int("SCAN_INTERVAL_MIN", 5, min_v=1, max_v=60)
 
 # Limit orders sent per scan loop (risk/ops)
-MAX_ORDERS_PER_SCAN = _get_int("MAX_ORDERS_PER_SCAN", 5, min_v=0, max_v=50)
+MAX_ORDERS_PER_SCAN = _get_int("MAX_ORDERS_PER_SCAN", 10, min_v=0, max_v=50)
 
 # Universe
-TOP_N_SYMBOLS = _get_int("TOP_N_SYMBOLS", 80, min_v=5, max_v=400)
+TOP_N_SYMBOLS = _get_int("TOP_N_SYMBOLS", 150, min_v=5, max_v=400)
 
 # Global unit risk (used by some modules)
 RISK_USDT = _get_float("RISK_USDT", 20.0, min_v=1.0, max_v=500.0)
