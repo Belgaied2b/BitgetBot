@@ -332,7 +332,8 @@ def _direction_from_side(side: str) -> str:
 
 
 def _close_side_from_direction(direction: str) -> str:
-    return "SELL" if direction == "LONG" else "BUY"
+    # Bitget v2 uses side=BUY to close LONG, side=SELL to close SHORT (tradeSide='close').
+    return "BUY" if str(direction).upper() == "LONG" else "SELL"
 
 
 def _trigger_type_sl() -> str:
@@ -497,9 +498,19 @@ async def _get_position_total(trader: BitgetTrader, symbol: str, direction: str)
     for row in data:
         if not isinstance(row, dict):
             continue
-        if str(row.get("holdSide") or "").lower() != hold:
+        hs = str(row.get("holdSide") or row.get("posSide") or row.get("positionSide") or "").lower()
+        if hs and hs != hold:
             continue
-        return _safe_float(row.get("total"), 0.0)
+        tot = _safe_float(row.get("total"), 0.0)
+        if tot != 0:
+            return abs(tot)
+
+    # fallback: any total in the payload
+    for row in data:
+        if isinstance(row, dict):
+            tot = _safe_float(row.get("total"), 0.0)
+            if tot != 0:
+                return abs(tot)
 
     # fallback single row
     if len(data) == 1 and isinstance(data[0], dict):
@@ -801,6 +812,20 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     notional = float(MARGIN_USDT) * float(LEVERAGE)
 
 
+    # avoid stacking same symbol+direction while a previous trade is still pending/managed
+    try:
+        async with PENDING_LOCK:
+            for _tid, _st in PENDING.items():
+                if str(_st.get("symbol") or "").upper() != sym:
+                    continue
+                if str(_st.get("direction") or "").upper() != direction:
+                    continue
+                await stats.add_reason("skip:symbol_pending")
+                await send_telegram(_mk_exec_msg("EXEC_SKIPPED", sym, tid, reason="symbol_pending"))
+                return
+    except Exception:
+        pass
+
     # risk gate (reserve -> confirm/cancel)
     allowed, rreason, risk_rid = await RISK.reserve_trade(
         symbol=sym,
@@ -1004,7 +1029,8 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     continue
 
                 direction = str(st.get("direction") or "")
-                close_side = str(st.get("close_side") or "")
+                # Always recompute (older pending_state.json may contain the legacy opposite side)
+                close_side = _close_side_from_direction(direction)
                 pos_mode = str(st.get("pos_mode") or "one_way")
 
                 entry = float(st.get("entry") or 0.0)
@@ -1094,6 +1120,16 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         dirty = True
                         continue
 
+                    # Wait until the exchange position is visible before placing CLOSE orders (avoids 22002).
+                    pos_total = await _get_position_total(trader, sym, direction)
+                    if pos_total == 0:
+                        desk_log(logging.INFO, "ARM_WAIT_POS", sym, tid, step="pos_not_ready")
+                        st["last_arm_fail_ts"] = time.time()
+                        dirty = True
+                        continue
+                    if pos_total > 0:
+                        qty_total = min(qty_total, float(pos_total))
+
                     tick_meta = await _get_tick_cached(trader, sym)
                     tick_used = _sanitize_tick(sym, entry, tick_meta, tid)
 
@@ -1149,6 +1185,13 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         dirty = True
 
                         if not _is_ok(sl_resp):
+                            code2 = str(sl_resp.get("code", ""))
+                            # 22002 = No position to close -> wait for position visibility
+                            if code2 == "22002":
+                                st["last_arm_fail_ts"] = time.time()
+                                dirty = True
+                                desk_log(logging.WARNING, "SL_WAIT_POS", sym, tid, code=code2, msg=sl_resp.get("msg"))
+                                continue
                             st["arm_attempts"] = attempts + 1
                             st["last_arm_fail_ts"] = time.time()
                             desk_log(logging.ERROR, "SL_FAIL", sym, tid, code=sl_resp.get("code"), msg=sl_resp.get("msg"), dbg=sl_resp.get("_debug"))
@@ -1194,7 +1237,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                         # Soft-handle: position not ready yet (avoid spam)
                         if (not _is_ok(tp1_resp)) and code == "22002":
-                            st["arm_attempts"] = attempts + 1
                             st["last_arm_fail_ts"] = time.time()
                             dirty = True
                             desk_log(logging.WARNING, "TP1_WAIT_POS", sym, tid, code=code, msg=tp1_resp.get("msg"))
