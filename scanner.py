@@ -13,6 +13,14 @@ from typing import Any, Dict, Tuple, Optional, List
 
 import pandas as pd
 
+# Desk context (macro + options) — optional
+try:
+    from macro_data import MacroCache  # type: ignore
+    from options_data import OptionsCache  # type: ignore
+except Exception:
+    MacroCache = None  # type: ignore
+    OptionsCache = None  # type: ignore
+
 from settings import (
     API_KEY,
     API_SECRET,
@@ -91,6 +99,10 @@ WATCHER_TASK: Optional[asyncio.Task] = None
 
 TICK_CACHE: Dict[str, float] = {}
 TICK_LOCK = asyncio.Lock()
+
+# Macro/options caches (single fetch per scan)
+MACRO_CACHE = MacroCache() if MacroCache else None
+OPTIONS_CACHE = OptionsCache() if OptionsCache else None
 
 
 def _pending_serializable(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -647,7 +659,7 @@ class ScanStats:
 # Analyze worker (phase A)
 # =====================================================================
 
-async def analyze_symbol(sym: str, client, analyze_sem: asyncio.Semaphore, stats: ScanStats) -> Optional[Dict[str, Any]]:
+async def analyze_symbol(sym: str, client, analyze_sem: asyncio.Semaphore, stats: ScanStats, macro_ctx: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     tid = _new_tid(sym)
     await stats.inc("total", 1)
 
@@ -669,7 +681,7 @@ async def analyze_symbol(sym: str, client, analyze_sem: asyncio.Semaphore, stats
 
         t1 = time.time()
         try:
-            result = await asyncio.wait_for(analyzer.analyze(sym, df_h1, df_h4, macro={}), timeout=ANALYZE_TIMEOUT_S)
+            result = await asyncio.wait_for(analyzer.analyze(sym, df_h1, df_h4, macro=(macro_ctx or {})), timeout=ANALYZE_TIMEOUT_S)
         except asyncio.TimeoutError:
             result = {"valid": False, "reject_reason": "analyze_timeout"}
         analyze_ms = int((time.time() - t1) * 1000)
@@ -1356,8 +1368,23 @@ async def scan_once(client, trader: BitgetTrader) -> None:
 
     analyze_sem = asyncio.Semaphore(int(MAX_CONCURRENT_ANALYZE))
 
+    # ---- Fetch desk context once per scan (non-blocking) ----
+    macro_ctx: Dict[str, Any] = {}
+    if MACRO_CACHE and OPTIONS_CACHE:
+        try:
+            msnap = await asyncio.wait_for(MACRO_CACHE.get(force=False), timeout=8)
+            osnap = await asyncio.wait_for(OPTIONS_CACHE.get(force=False), timeout=8)
+            macro_ctx = {
+                "macro": msnap.__dict__ if hasattr(msnap, "__dict__") else msnap,
+                "options": osnap.__dict__ if hasattr(osnap, "__dict__") else osnap,
+            }
+        except Exception as e:
+            logger.debug("desk ctx fetch failed: %s", e)
+            macro_ctx = {}
+
     async def _worker(sym: str):
-        return await analyze_symbol(sym, client, analyze_sem, stats)
+        return await analyze_symbol(sym, client, analyze_sem, stats, macro_ctx)
+
 
     results = await asyncio.gather(*[_worker(sym) for sym in symbols], return_exceptions=True)
 
