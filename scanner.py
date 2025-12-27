@@ -28,6 +28,7 @@ from settings import (
     STOP_TRIGGER_TYPE_SL,
     BE_FEE_BUFFER_TICKS,
     POSITION_MODE,
+    RISK_USDT,
 )
 
 from bitget_client import get_client
@@ -122,6 +123,10 @@ def _pending_serializable(state: Dict[str, Any]) -> Dict[str, Any]:
         "min_qty",
         "q_tp1",
         "q_sl",
+        "notional",
+        "risk_rid",
+        "risk_confirmed",
+        "risk_side",
     ]
     out: Dict[str, Any] = {}
     for k in keep:
@@ -165,6 +170,23 @@ async def _pending_load() -> None:
                     continue
                 PENDING[str(tid)] = st
         logger.info("[BOOT] restored pending=%d from %s", len(PENDING), PENDING_STATE_FILE)
+        # Seed risk engine with restored pending trades (best-effort).
+        # We treat restored pendings as "open exposure" to avoid over-trading after restart.
+        try:
+            async with PENDING_LOCK:
+                _restored = list(PENDING.items())
+            for _tid, _st in _restored:
+                _sym = str(_st.get("symbol") or "").upper()
+                if not _sym:
+                    continue
+                _dir = str(_st.get("risk_side") or _st.get("direction") or "LONG")
+                _notional = float(_st.get("notional") or (float(MARGIN_USDT) * float(LEVERAGE)))
+                if _notional <= 0:
+                    _notional = float(MARGIN_USDT) * float(LEVERAGE)
+                _risk = float(RISK_USDT)
+                RISK.register_open(_sym, _dir, _notional, _risk)
+        except Exception as e:
+            logger.warning("[BOOT] risk seed failed: %s", e)
     except Exception as e:
         logger.warning("pending_load failed: %s", e)
 
@@ -437,6 +459,20 @@ async def _get_tick_cached(trader: BitgetTrader, symbol: str) -> float:
     return t
 
 
+async def _risk_release_pending(st: Dict[str, Any], sym: str, direction: str, tid: str, reason: str) -> None:
+    """Best-effort release/cancel risk reservations when a trade is dropped/finished."""
+    rid = st.get("risk_rid")
+    confirmed = bool(st.get("risk_confirmed"))
+    try:
+        if confirmed:
+            # No PnL attribution at scanner level (requires fills). We just free exposure.
+            RISK.register_closed(sym, direction, pnl=0.0)
+        else:
+            await RISK.cancel_reservation(rid)
+    except Exception as e:
+        desk_log(logging.WARNING, "RISK_REL_FAIL", sym, tid, reason=reason, err=str(e))
+
+
 # =====================================================================
 # Fetch
 # =====================================================================
@@ -632,8 +668,8 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
 
     notional = float(MARGIN_USDT) * float(LEVERAGE)
 
-    # risk gate
-    allowed, rreason = RISK.can_trade(
+    # risk gate (reserve -> confirm/cancel)
+    allowed, rreason, rid = await RISK.reserve_trade(
         symbol=sym,
         side=direction,
         notional=notional,
@@ -669,6 +705,7 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     if TRADE_GUARD.is_duplicate(fp_trade):
         await stats.inc("duplicates_trade", 1)
         await stats.add_reason("duplicate_trade")
+        await RISK.cancel_reservation(rid)
         return
 
     desk_log(logging.INFO, "EXEC_PRE", sym, tid,
@@ -682,6 +719,7 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     if q_entry <= 0:
         await stats.inc("exec_failed", 1)
         await stats.add_reason("entry_q_zero")
+        await RISK.cancel_reservation(rid)
         return
 
     await stats.inc("exec_sent", 1)
@@ -736,6 +774,7 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
             break
 
     if not _is_ok(entry_resp):
+        await RISK.cancel_reservation(rid)
         await stats.inc("exec_failed", 1)
         desk_log(logging.ERROR, "ENTRY_FAIL", sym, tid, code=entry_resp.get("code"), msg=entry_resp.get("msg"), dbg=(entry_resp.get("_debug") or {}))
         try:
@@ -750,6 +789,9 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     qty_total = _safe_float(entry_resp.get("qty"), 0.0)
 
     desk_log(logging.INFO, "ENTRY_OK", sym, tid, orderId=entry_order_id, qty=qty_total)
+    # confirm reserved risk (trade accepted)
+    if rid:
+        await RISK.confirm_open(str(rid))
 
     # mark trade dedup ONLY after entry accepted
     TRADE_GUARD.mark(fp_trade)
@@ -774,6 +816,10 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
             "armed": False,
             "be_done": False,
             "created_ts": time.time(),
+            "notional": notional,
+            "risk_rid": str(rid) if rid else None,
+            "risk_confirmed": bool(rid),
+            "risk_side": direction,
             "arm_attempts": 0,
             "last_arm_fail_ts": 0.0,
             "sl_inflight": False,
@@ -834,6 +880,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                 attempts = int(st.get("arm_attempts") or 0)
                 if attempts >= ARM_MAX_ATTEMPTS:
                     desk_log(logging.ERROR, "ARM_ABORT", sym, tid, attempts=attempts)
+                    await _risk_release_pending(st, sym, direction, tid, reason="ARM_ABORT")
                     async with PENDING_LOCK:
                         PENDING.pop(tid, None)
                     dirty = True
@@ -856,6 +903,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     state = _order_state(detail)
                     if state in {"cancelled", "canceled", "rejected", "fail", "failed", "expired"}:
                         desk_log(logging.WARNING, "ARM_DROP", sym, tid, reason=f"entry_state={state}")
+                        await _risk_release_pending(st, sym, direction, tid, reason=f"ARM_DROP:{state}")
                         async with PENDING_LOCK:
                             PENDING.pop(tid, None)
                         dirty = True
@@ -1045,6 +1093,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                     qty_rem = _q_qty_floor(max(0.0, qty_total - qty_tp1), qty_step)
                     if qty_rem <= 0:
+                        await _risk_release_pending(st, sym, direction, tid, reason="DONE:tp1_full_close")
                         async with PENDING_LOCK:
                             PENDING.pop(tid, None)
                         dirty = True
@@ -1102,6 +1151,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                     await send_telegram(_mk_exec_msg("BE_OK", sym, tid, be=be_q, planId=new_plan, runner_qty=qty_rem))
 
+                    await _risk_release_pending(st, sym, direction, tid, reason="BE_OK")
                     async with PENDING_LOCK:
                         PENDING.pop(tid, None)
                     dirty = True
