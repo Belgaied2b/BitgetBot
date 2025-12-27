@@ -28,7 +28,6 @@ from settings import (
     STOP_TRIGGER_TYPE_SL,
     BE_FEE_BUFFER_TICKS,
     POSITION_MODE,
-    RISK_USDT,
 )
 
 from bitget_client import get_client
@@ -123,10 +122,14 @@ def _pending_serializable(state: Dict[str, Any]) -> Dict[str, Any]:
         "min_qty",
         "q_tp1",
         "q_sl",
-        "notional",
         "risk_rid",
         "risk_confirmed",
-        "risk_side",
+        "notional",
+        "setup",
+        "entry_type",
+        "inst_score",
+        "runner_monitor",
+        "runner_qty",
     ]
     out: Dict[str, Any] = {}
     for k in keep:
@@ -170,23 +173,6 @@ async def _pending_load() -> None:
                     continue
                 PENDING[str(tid)] = st
         logger.info("[BOOT] restored pending=%d from %s", len(PENDING), PENDING_STATE_FILE)
-        # Seed risk engine with restored pending trades (best-effort).
-        # We treat restored pendings as "open exposure" to avoid over-trading after restart.
-        try:
-            async with PENDING_LOCK:
-                _restored = list(PENDING.items())
-            for _tid, _st in _restored:
-                _sym = str(_st.get("symbol") or "").upper()
-                if not _sym:
-                    continue
-                _dir = str(_st.get("risk_side") or _st.get("direction") or "LONG")
-                _notional = float(_st.get("notional") or (float(MARGIN_USDT) * float(LEVERAGE)))
-                if _notional <= 0:
-                    _notional = float(MARGIN_USDT) * float(LEVERAGE)
-                _risk = float(RISK_USDT)
-                RISK.register_open(_sym, _dir, _notional, _risk)
-        except Exception as e:
-            logger.warning("[BOOT] risk seed failed: %s", e)
     except Exception as e:
         logger.warning("pending_load failed: %s", e)
 
@@ -458,19 +444,150 @@ async def _get_tick_cached(trader: BitgetTrader, symbol: str) -> float:
             TICK_CACHE[sym] = t
     return t
 
+# =====================================================================
+# Position / PnL helpers (risk close + bootstrap)
+# =====================================================================
 
-async def _risk_release_pending(st: Dict[str, Any], sym: str, direction: str, tid: str, reason: str) -> None:
-    """Best-effort release/cancel risk reservations when a trade is dropped/finished."""
-    rid = st.get("risk_rid")
-    confirmed = bool(st.get("risk_confirmed"))
+def _hold_side(direction: str) -> str:
+    return "long" if str(direction).upper() == "LONG" else "short"
+
+
+async def _get_position_total(trader: BitgetTrader, symbol: str, direction: str) -> float:
+    """Return current position total (base units) for the requested side."""
+    sym = str(symbol).upper()
+    hold = _hold_side(direction)
     try:
-        if confirmed:
-            # No PnL attribution at scanner level (requires fills). We just free exposure.
-            RISK.register_closed(sym, direction, pnl=0.0)
-        else:
-            await RISK.cancel_reservation(rid)
+        resp = await trader.client._request(
+            "GET",
+            "/api/v2/mix/position/single-position",
+            params={
+                "productType": trader.product_type,
+                "symbol": sym,
+                "marginCoin": trader.margin_coin,
+            },
+            auth=True,
+        )
+    except Exception:
+        return -1.0
+
+    if not _is_ok(resp):
+        return -1.0
+
+    data = resp.get("data") or []
+    if isinstance(data, dict):
+        data = data.get("list") or data.get("data") or []
+    if not isinstance(data, list):
+        return 0.0
+
+    # prefer side match
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("holdSide") or "").lower() != hold:
+            continue
+        return _safe_float(row.get("total"), 0.0)
+
+    # fallback single row
+    if len(data) == 1 and isinstance(data[0], dict):
+        return _safe_float(data[0].get("total"), 0.0)
+
+    return 0.0
+
+
+async def _fetch_last_closed_pnl(trader: BitgetTrader, symbol: str, direction: str) -> float:
+    """Fetch last realized pnl for symbol+side from position history."""
+    sym = str(symbol).upper()
+    hold = _hold_side(direction)
+    try:
+        resp = await trader.client._request(
+            "GET",
+            "/api/v2/mix/position/history-position",
+            params={
+                "symbol": sym,
+                "productType": trader.product_type,
+                "limit": "20",
+            },
+            auth=True,
+        )
+    except Exception:
+        return 0.0
+
+    if not _is_ok(resp):
+        return 0.0
+
+    data = resp.get("data") or {}
+    lst = data.get("list") if isinstance(data, dict) else None
+    if not isinstance(lst, list):
+        return 0.0
+
+    for row in lst:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("holdSide") or "").lower() != hold:
+            continue
+        pnl = row.get("pnl")
+        if pnl is None:
+            pnl = row.get("netProfit")
+        return _safe_float(pnl, 0.0)
+
+    return 0.0
+
+
+async def _risk_close_trade(trader: BitgetTrader, symbol: str, direction: str, reason: str) -> None:
+    pnl = await _fetch_last_closed_pnl(trader, symbol, direction)
+    try:
+        RISK.register_closed(symbol, direction, pnl)
+    except Exception:
+        pass
+    desk_log(logging.INFO, "RISK_CLOSE", symbol, "-", side=direction, pnl=pnl, reason=reason)
+
+
+async def _bootstrap_risk_open_positions(trader: BitgetTrader) -> None:
+    """On boot, seed risk with existing exchange positions (so caps work after restart)."""
+    try:
+        resp = await trader.client._request(
+            "GET",
+            "/api/v2/mix/position/all-position",
+            params={
+                "productType": trader.product_type,
+                "marginCoin": trader.margin_coin,
+            },
+            auth=True,
+        )
     except Exception as e:
-        desk_log(logging.WARNING, "RISK_REL_FAIL", sym, tid, reason=reason, err=str(e))
+        logger.warning("[BOOT] risk bootstrap failed: %s", e)
+        return
+
+    if not _is_ok(resp):
+        return
+
+    data = resp.get("data") or []
+    if not isinstance(data, list):
+        return
+
+    added = 0
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        total = _safe_float(row.get("total"), 0.0)
+        if total <= 0:
+            continue
+        sym = str(row.get("symbol") or "").upper()
+        if not sym:
+            continue
+        hs = str(row.get("holdSide") or "").lower()
+        direction = "LONG" if hs == "long" else "SHORT"
+        mark = _safe_float(row.get("markPrice"), 0.0) or _safe_float(row.get("openPriceAvg"), 0.0)
+        notional = abs(total) * float(mark)
+        risk_used = RISK.risk_for_this_trade()
+        try:
+            RISK.register_open(sym, direction, notional, risk_used)
+            added += 1
+        except Exception:
+            pass
+
+    if added:
+        logger.info("[BOOT] risk bootstrap: registered %d open positions from exchange", added)
 
 
 # =====================================================================
@@ -613,6 +730,14 @@ async def analyze_symbol(sym: str, client, analyze_sem: asyncio.Semaphore, stats
             "entry": entry,
             "sl": sl,
             "tp1": tp1,
+            "setup": setup,
+            "entry_type": entry_type,
+            "inst_score": inst_score,
+            "notional": notional,
+            "risk_rid": risk_rid,
+            "risk_confirmed": True,
+            "runner_monitor": False,
+            "runner_qty": 0.0,
             "rr": rr,
             "setup": setup,
             "entry_type": entry_type,
@@ -665,11 +790,14 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     tp1 = float(candidate["tp1"])
     rr = float(candidate["rr"])
     setup = str(candidate["setup"])
+    entry_type = str(candidate.get("entry_type") or "MARKET")
+    inst_score = int(candidate.get("inst_score") or 0)
 
     notional = float(MARGIN_USDT) * float(LEVERAGE)
 
+
     # risk gate (reserve -> confirm/cancel)
-    allowed, rreason, rid = await RISK.reserve_trade(
+    allowed, rreason, risk_rid = await RISK.reserve_trade(
         symbol=sym,
         side=direction,
         notional=notional,
@@ -705,7 +833,7 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     if TRADE_GUARD.is_duplicate(fp_trade):
         await stats.inc("duplicates_trade", 1)
         await stats.add_reason("duplicate_trade")
-        await RISK.cancel_reservation(rid)
+        await RISK.cancel_reservation(risk_rid)
         return
 
     desk_log(logging.INFO, "EXEC_PRE", sym, tid,
@@ -719,7 +847,7 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     if q_entry <= 0:
         await stats.inc("exec_failed", 1)
         await stats.add_reason("entry_q_zero")
-        await RISK.cancel_reservation(rid)
+        await RISK.cancel_reservation(risk_rid)
         return
 
     await stats.inc("exec_sent", 1)
@@ -774,7 +902,6 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
             break
 
     if not _is_ok(entry_resp):
-        await RISK.cancel_reservation(rid)
         await stats.inc("exec_failed", 1)
         desk_log(logging.ERROR, "ENTRY_FAIL", sym, tid, code=entry_resp.get("code"), msg=entry_resp.get("msg"), dbg=(entry_resp.get("_debug") or {}))
         try:
@@ -783,15 +910,20 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
             md = {}
         desk_log(logging.ERROR, "META_DUMP", sym, tid, meta=md)
         await send_telegram(_mk_exec_msg("ENTRY_FAIL", sym, tid, code=entry_resp.get("code"), msg=entry_resp.get("msg")))
+        await RISK.cancel_reservation(risk_rid)
         return
 
     entry_order_id = (entry_resp.get("data") or {}).get("orderId") or entry_resp.get("orderId")
     qty_total = _safe_float(entry_resp.get("qty"), 0.0)
 
     desk_log(logging.INFO, "ENTRY_OK", sym, tid, orderId=entry_order_id, qty=qty_total)
-    # confirm reserved risk (trade accepted)
-    if rid:
-        await RISK.confirm_open(str(rid))
+
+    # confirm risk reservation (counts as an open position at desk level)
+    try:
+        await RISK.confirm_open(risk_rid)
+    except Exception:
+        pass
+
 
     # mark trade dedup ONLY after entry accepted
     TRADE_GUARD.mark(fp_trade)
@@ -816,10 +948,6 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
             "armed": False,
             "be_done": False,
             "created_ts": time.time(),
-            "notional": notional,
-            "risk_rid": str(rid) if rid else None,
-            "risk_confirmed": bool(rid),
-            "risk_side": direction,
             "arm_attempts": 0,
             "last_arm_fail_ts": 0.0,
             "sl_inflight": False,
@@ -880,11 +1008,31 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                 attempts = int(st.get("arm_attempts") or 0)
                 if attempts >= ARM_MAX_ATTEMPTS:
                     desk_log(logging.ERROR, "ARM_ABORT", sym, tid, attempts=attempts)
-                    await _risk_release_pending(st, sym, direction, tid, reason="ARM_ABORT")
+
+                    # risk cleanup: abandon pending
+                    if bool(st.get("risk_confirmed", False)):
+                        await _risk_close_trade(trader, sym, direction, reason="arm_abort")
+                    else:
+                        try:
+                            await RISK.cancel_reservation(st.get("risk_rid"))
+                        except Exception:
+                            pass
+
                     async with PENDING_LOCK:
                         PENDING.pop(tid, None)
                     dirty = True
                     await send_telegram(_mk_exec_msg("ARM_ABORT", sym, tid, attempts=attempts))
+                    continue
+
+                # If BE already placed (runner mode), just monitor position closure
+                if bool(st.get("be_done", False)):
+                    pos_total = await _get_position_total(trader, sym, direction)
+                    if pos_total >= 0 and pos_total <= 0:
+                        await _risk_close_trade(trader, sym, direction, reason="position_closed_after_be")
+                        async with PENDING_LOCK:
+                            PENDING.pop(tid, None)
+                        dirty = True
+                        await send_telegram(_mk_exec_msg("DONE", sym, tid, reason="position_closed"))
                     continue
 
                 if not bool(st.get("armed", False)):
@@ -903,7 +1051,16 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     state = _order_state(detail)
                     if state in {"cancelled", "canceled", "rejected", "fail", "failed", "expired"}:
                         desk_log(logging.WARNING, "ARM_DROP", sym, tid, reason=f"entry_state={state}")
-                        await _risk_release_pending(st, sym, direction, tid, reason=f"ARM_DROP:{state}")
+
+                        # risk cleanup: entry cancelled / rejected
+                        if bool(st.get("risk_confirmed", False)):
+                            await _risk_close_trade(trader, sym, direction, reason=f"entry_state={state}")
+                        else:
+                            try:
+                                await RISK.cancel_reservation(st.get("risk_rid"))
+                            except Exception:
+                                pass
+
                         async with PENDING_LOCK:
                             PENDING.pop(tid, None)
                         dirty = True
@@ -1072,6 +1229,17 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                 # Phase 2: BE after TP1 filled
                 if bool(st.get("armed", False)) and (not bool(st.get("be_done", False))):
+                    # If position already closed (SL/manual), finalize and free risk
+                    pos_total = await _get_position_total(trader, sym, direction)
+                    if pos_total >= 0 and pos_total <= 0:
+                        await _risk_close_trade(trader, sym, direction, reason="position_closed_before_tp1")
+                        async with PENDING_LOCK:
+                            PENDING.pop(tid, None)
+                        dirty = True
+                        await send_telegram(_mk_exec_msg("DONE", sym, tid, reason="position_closed"))
+                        continue
+
+
                     tp1_order_id = st.get("tp1_order_id")
                     if not tp1_order_id or tp1_order_id == "ok":
                         continue
@@ -1093,7 +1261,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                     qty_rem = _q_qty_floor(max(0.0, qty_total - qty_tp1), qty_step)
                     if qty_rem <= 0:
-                        await _risk_release_pending(st, sym, direction, tid, reason="DONE:tp1_full_close")
+                        await _risk_close_trade(trader, sym, direction, reason="tp1_full_close")
                         async with PENDING_LOCK:
                             PENDING.pop(tid, None)
                         dirty = True
@@ -1151,9 +1319,9 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                     await send_telegram(_mk_exec_msg("BE_OK", sym, tid, be=be_q, planId=new_plan, runner_qty=qty_rem))
 
-                    await _risk_release_pending(st, sym, direction, tid, reason="BE_OK")
-                    async with PENDING_LOCK:
-                        PENDING.pop(tid, None)
+                    # keep monitoring runner until position is fully closed
+                    st["runner_monitor"] = True
+                    st["runner_qty"] = qty_rem
                     dirty = True
                     continue
 
@@ -1310,6 +1478,8 @@ async def start_scanner() -> None:
         leverage=float(LEVERAGE),
         margin_mode="isolated",
     )
+
+    await _bootstrap_risk_open_positions(trader)
 
     _ensure_watcher(trader)
 
