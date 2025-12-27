@@ -268,6 +268,108 @@ def has_liquidity_zone(df: pd.DataFrame, direction: str, lookback: int = 200) ->
 # TREND via EMA 20/50 (LTF & HTF)
 # =====================================================================
 
+
+def liquidity_sweep_details(
+    df: pd.DataFrame,
+    direction: str,
+    lookback: int = 160,
+    tol_atr: float = 0.12,
+    wick_ratio_min: float = 0.55,
+) -> Dict[str, Any]:
+    """
+    "Stop hunt" / liquidity sweep detector (simple, desk-style).
+
+    - LONG: price sweeps below an equal-low level, then *reclaims* (close back above).
+    - SHORT: price sweeps above an equal-high level, then *rejects* (close back below).
+
+    Returns:
+        {
+          "ok": bool,
+          "direction": "LONG"/"SHORT",
+          "level": float | None,           # equal-high/low level
+          "sweep_extreme": float | None,   # wick extreme (low/high)
+          "reclaim_close": float | None,
+          "wick_ratio": float,
+          "body_ratio": float,
+          "kind": "EQ_LOW_SWEEP"|"EQ_HIGH_SWEEP"|None
+        }
+    """
+    out: Dict[str, Any] = {
+        "ok": False,
+        "direction": str(direction).upper(),
+        "level": None,
+        "sweep_extreme": None,
+        "reclaim_close": None,
+        "wick_ratio": 0.0,
+        "body_ratio": 0.0,
+        "kind": None,
+    }
+    if df is None or getattr(df, "empty", True) or len(df) < 60:
+        return out
+
+    d = str(direction).upper()
+    if d not in {"LONG", "SHORT"}:
+        return out
+
+    need_cols = {"open", "high", "low", "close"}
+    if not need_cols.issubset(set(map(str.lower, df.columns))):
+        # columns likely already lower, but stay safe
+        pass
+
+    dfw = df.tail(int(max(80, lookback))).copy()
+
+    atr = _atr(dfw, period=14)
+    atr_last = float(atr.iloc[-1]) if atr is not None and len(atr) else 0.0
+    tol = float(tol_atr) * max(atr_last, 1e-12)
+
+    # Identify EQ levels (most recent first)
+    eq_highs, eq_lows = detect_equal_levels(dfw, lookback=int(max(60, lookback)), tol_atr=float(tol_atr))
+
+    last = dfw.iloc[-1]
+    o = float(last.get("open", 0.0))
+    h = float(last.get("high", 0.0))
+    l = float(last.get("low", 0.0))
+    c = float(last.get("close", 0.0))
+    rng = max(h - l, 1e-12)
+    body = abs(c - o)
+
+    out["reclaim_close"] = c
+    out["body_ratio"] = float(body / rng)
+
+    if d == "LONG":
+        if not eq_lows:
+            return out
+        lvl = float(eq_lows[0].get("level", 0.0))
+        if lvl <= 0:
+            return out
+
+        lower_wick = max(min(o, c) - l, 0.0)
+        out["wick_ratio"] = float(lower_wick / rng)
+        out["level"] = lvl
+        out["sweep_extreme"] = l
+
+        if (l < (lvl - tol)) and (c > (lvl + tol * 0.25)) and (out["wick_ratio"] >= float(wick_ratio_min)):
+            out["ok"] = True
+            out["kind"] = "EQ_LOW_SWEEP"
+        return out
+
+    # SHORT
+    if not eq_highs:
+        return out
+    lvl = float(eq_highs[0].get("level", 0.0))
+    if lvl <= 0:
+        return out
+
+    upper_wick = max(h - max(o, c), 0.0)
+    out["wick_ratio"] = float(upper_wick / rng)
+    out["level"] = lvl
+    out["sweep_extreme"] = h
+
+    if (h > (lvl + tol)) and (c < (lvl - tol * 0.25)) and (out["wick_ratio"] >= float(wick_ratio_min)):
+        out["ok"] = True
+        out["kind"] = "EQ_HIGH_SWEEP"
+    return out
+
 def _trend_from_ema(close: pd.Series, fast: int = 20, slow: int = 50) -> str:
     """
     Desk bias from EMA20/EMA50 with slope + spread threshold.
