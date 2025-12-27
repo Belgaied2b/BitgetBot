@@ -25,17 +25,6 @@ from stops import protective_stop_long, protective_stop_short
 from tp_clamp import compute_tp1
 from institutional_data import compute_full_institutional_analysis
 
-# Optional desk context (macro + options). Non-blocking if unavailable.
-try:
-    from macro_data import score_macro_alignment  # type: ignore
-except Exception:
-    score_macro_alignment = None  # type: ignore
-
-try:
-    from options_data import score_options_context  # type: ignore
-except Exception:
-    score_options_context = None  # type: ignore
-
 from settings import (
     MIN_INST_SCORE,
     RR_MIN_STRICT,
@@ -357,6 +346,7 @@ class SignalAnalyzer:
 
         struct = analyze_structure(df_h1)
         bias = str(struct.get("trend", "")).upper()
+        liq_sweep = {"ok": False}
         LOGGER.info("[EVAL_PRE] %s STRUCT trend=%s bos=%s choch=%s cos=%s",
                     symbol, bias, struct.get("bos"), struct.get("choch"), struct.get("cos"))
 
@@ -421,6 +411,18 @@ class SignalAnalyzer:
         discount, premium = compute_premium_discount(df_h1)
         LOGGER.info("[EVAL_PRE] %s PREMIUM=%s DISCOUNT=%s", symbol, premium, discount)
 
+        # Liquidity sweep (stop hunt) context — can unlock early entries like a desk
+        liq_sweep = liquidity_sweep_details(df_h1, bias, lookback=180)
+        if isinstance(liq_sweep, dict) and liq_sweep.get("ok"):
+            LOGGER.info(
+                "[EVAL_PRE] %s LIQ_SWEEP ok=True kind=%s level=%s wick=%.2f body=%.2f",
+                symbol,
+                liq_sweep.get("kind"),
+                liq_sweep.get("level"),
+                float(liq_sweep.get("wick_ratio") or 0.0),
+                float(liq_sweep.get("body_ratio") or 0.0),
+            )
+
         entry_pick = _pick_entry(df_h1, struct, bias)
         entry = float(entry_pick["entry_used"])
         entry_type = str(entry_pick["entry_type"])
@@ -465,57 +467,6 @@ class SignalAnalyzer:
         LOGGER.info("[INST_RAW] %s score=%s eff=%s override=%s available=%s binance_symbol=%s",
                     symbol, inst_score, inst_score_eff, inst_override, available, binance_symbol)
 
-        # ---- Desk context (macro + options) — bonus only (never blocks) ----
-        desk_plus_score = 0
-        macro_res = None
-        options_res = None
-
-        macro_ctx = None
-        options_ctx = None
-        try:
-            if isinstance(macro, dict):
-                macro_ctx = macro.get("macro") or macro.get("global") or macro
-                options_ctx = macro.get("options")
-            else:
-                macro_ctx = macro
-        except Exception:
-            macro_ctx = macro
-
-        if score_macro_alignment and macro_ctx is not None:
-            try:
-                macro_res = score_macro_alignment(macro_ctx, bias=bias, symbol=symbol)  # type: ignore
-                if int(macro_res.get("score") or 0) > 0:
-                    desk_plus_score += 1
-            except Exception:
-                macro_res = {"ok": False, "score": 0, "regime": "unknown", "reason": "macro_exc"}
-
-        if score_options_context and options_ctx is not None:
-            try:
-                options_res = score_options_context(options_ctx, bias=bias)  # type: ignore
-                if int(options_res.get("score") or 0) > 0:
-                    desk_plus_score += 1
-            except Exception:
-                options_res = {"ok": False, "score": 0, "regime": "unknown", "reason": "options_exc"}
-
-        if desk_plus_score:
-            inst_score_eff = int(inst_score_eff) + int(desk_plus_score)
-            inst_score_eff = max(0, min(6, inst_score_eff))
-
-        # attach for logs / telegram
-        try:
-            inst["desk_plus_score"] = int(desk_plus_score)
-            if macro_res is not None:
-                inst["macro_ctx"] = macro_res
-            if options_res is not None:
-                inst["options_ctx"] = options_res
-        except Exception:
-            pass
-
-        LOGGER.info("[DESK_CTX] %s desk_plus=%s inst_eff=%s macro=%s options=%s",
-                    symbol, desk_plus_score, inst_score_eff,
-                    (macro_res or {}).get("regime") if isinstance(macro_res, dict) else None,
-                    (options_res or {}).get("regime") if isinstance(options_res, dict) else None)
-
         if not bypass_inst and inst_override:
             LOGGER.warning("[INST_OVERRIDE] %s %s", symbol, inst_override)
 
@@ -530,6 +481,46 @@ class SignalAnalyzer:
         exits = _compute_exits(df_h1, entry, bias, tick=tick)
         sl = float(exits["sl"])
         tp1 = float(exits["tp1"])
+        rr = _safe_rr(entry, sl, tp1, bias)
+
+        # Desk SL hygiene: reduce stop-hunts around clear liquidity (EQ levels / sweeps)
+        try:
+            atr14 = float(true_atr(df_h1, 14).iloc[-1]) if len(df_h1) >= 20 else 0.0
+        except Exception:
+            atr14 = 0.0
+        buf = max((atr14 * 0.08) if atr14 > 0 else 0.0, float(tick) * 2.0)
+
+        # Sweep-based adjustment (if present)
+        try:
+            if isinstance(liq_sweep, dict) and liq_sweep.get("ok"):
+                ext = float(liq_sweep.get("sweep_extreme") or 0.0)
+                if ext > 0 and buf > 0:
+                    if bias == "LONG":
+                        sl = min(sl, ext - buf)
+                    else:
+                        sl = max(sl, ext + buf)
+        except Exception:
+            pass
+
+        # Equal-level liquidity adjustment (push SL beyond nearest EQ pool)
+        try:
+            eq_highs, eq_lows = detect_equal_levels(df_h1, lookback=180, tol_atr=0.10)
+            if bias == "LONG" and eq_lows:
+                lvl = float(eq_lows[0].get("level") or 0.0)
+                if lvl > 0 and lvl < entry and sl > (lvl - buf):
+                    sl = min(sl, lvl - buf)
+            elif bias == "SHORT" and eq_highs:
+                lvl = float(eq_highs[0].get("level") or 0.0)
+                if lvl > 0 and lvl > entry and sl < (lvl + buf):
+                    sl = max(sl, lvl + buf)
+        except Exception:
+            pass
+
+        if sl <= 0:
+            LOGGER.info("[EVAL_REJECT] %s sl_invalid_after_liq_adj sl=%s", symbol, sl)
+            return {"valid": False, "reject_reason": "sl_invalid_after_liq_adj"}
+
+        exits["sl"] = sl
         rr = _safe_rr(entry, sl, tp1, bias)
 
         LOGGER.info("[EVAL_PRE] %s EXITS entry=%s sl=%s tp1=%s tick=%s RR=%s raw_rr=%s entry_type=%s",
@@ -598,27 +589,64 @@ class SignalAnalyzer:
             good_inst = inst_score_eff >= INST_SCORE_DESK_PRIORITY
             good_rr = float(rr) >= RR_MIN_DESK_PRIORITY
 
-            # ✅ FIX: composite threshold must be direction-aware
-            # Here comp_score is "bullishness" (0=very bearish, 100=very bullish).
             comp_thr = 65.0
-            comp_thr_short = 100.0 - comp_thr  # 35.0
-
             if bias == "LONG":
                 good_comp = (comp_score >= comp_thr) and (comp_label in ("STRONG_BULLISH", "BULLISH", "SLIGHT_BULLISH"))
-                comp_rule = f">={comp_thr:.1f}"
             else:
-                good_comp = (comp_score <= comp_thr_short) and (comp_label in ("STRONG_BEARISH", "BEARISH", "SLIGHT_BEARISH"))
-                comp_rule = f"<={comp_thr_short:.1f}"
+                good_comp = (comp_score >= comp_thr) and (comp_label in ("STRONG_BEARISH", "BEARISH", "SLIGHT_BEARISH"))
 
             inst_continuation_ok = bool(good_inst and good_rr and good_comp)
 
             inst_continuation_reason = (
                 f"good_inst={good_inst}({inst_score_eff}>={INST_SCORE_DESK_PRIORITY}) "
                 f"good_rr={good_rr}({float(rr):.3f}>={RR_MIN_DESK_PRIORITY}) "
-                f"good_comp={good_comp}({comp_score:.1f},{comp_label},thr={comp_rule})"
+                f"good_comp={good_comp}({comp_score:.1f},{comp_label},thr={comp_thr})"
             )
 
-            LOGGER.info("[EVAL_PRE] %s INST_CONTINUATION_CHECK %s ok=%s",
+            
+        # --- Setup 1.5: LIQ_SWEEP (stop-hunt reclaim) ---
+        liq_sweep_ok = bool(isinstance(liq_sweep, dict) and liq_sweep.get("ok")) and (inst_eff >= MIN_INST_SCORE) and (rr >= MIN_RR_DESK)
+        if liq_sweep_ok:
+            # keep it simple: don't take a sweep against clear composite momentum
+            if bias == "LONG":
+                liq_sweep_ok = ("BEAR" not in str(comp_label).upper())
+            else:
+                liq_sweep_ok = ("BULL" not in str(comp_label).upper())
+
+        LOGGER.info(
+            "[EVAL_PRE] %s LIQ_SWEEP_CHECK ok=%s inst_eff=%s rr=%.3f comp=%s",
+            symbol,
+            liq_sweep_ok,
+            inst_eff,
+            rr,
+            comp_label,
+        )
+
+        if DESK_EV_MODE and liq_sweep_ok:
+            setup_type = "LIQ_SWEEP"
+            side = "BUY" if bias == "LONG" else "SELL"
+            entry_type = str(entry_pick.get("entry_type") or entry_pick.get("type") or "LIMIT")
+
+            LOGGER.info("[EVAL] %s VALID RR=%s SETUP=%s bias=%s inst_eff=%s", symbol, rr, setup_type, bias, inst_eff)
+
+            return {
+                "symbol": symbol,
+                "valid": True,
+                "side": side,
+                "setup_type": setup_type,
+                "entry_type": entry_type,
+                "entry": entry,
+                "sl": sl,
+                "tp1": tp1,
+                "rr": rr,
+                "inst_score_eff": int(inst_eff),
+                "institutional": inst,
+                "structure": struct,
+                "entry_pick": entry_pick,
+                "liquidity_sweep": liq_sweep,
+            }
+
+        LOGGER.info("[EVAL_PRE] %s INST_CONTINUATION_CHECK %s ok=%s",
                         symbol, inst_continuation_reason, inst_continuation_ok)
 
         if DESK_EV_MODE and inst_continuation_ok:
