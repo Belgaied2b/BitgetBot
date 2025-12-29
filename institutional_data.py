@@ -1,170 +1,97 @@
 # =====================================================================
-# institutional_data.py — Ultra Desk OI + CVD Engine (Binance Futures)
+# institutional_data.py — Ultra Desk OI + CVD Engine (Binance Futures) (Desk v4)
 # =====================================================================
-# Fournit un score institutionnel basé sur:
-#   - Open Interest (OI) via /fapi/v1/openInterest
-#   - CVD proxy via klines 1h (takerBuyBaseAssetVolume) /fapi/v1/klines
-#   - Funding via premiumIndex /fapi/v1/premiumIndex
-#
-# API principale:
-#   async def compute_full_institutional_analysis(symbol: str, bias: str) -> dict
-#
-# Retour:
-#   {
-#       "institutional_score": int (0..4),
-#       "binance_symbol": str | None,
-#       "available": bool,
-#       "oi": float | None,
-#       "oi_slope": float | None,
-#       "cvd_slope": float | None,          # scale ~ [-3..+3] (compatible seuils 0.2 / 1.0 / 1.5)
-#       "funding_rate": float | None,
-#       "funding_regime": str,
-#       "crowding_regime": str,
-#       "flow_regime": str,
-#       "warnings": list[str],
-#   }
+# ✅ Session aiohttp réutilisée (moins lourd)
+# ✅ Cache exchangeInfo + klines + premiumIndex
+# ✅ CVD slope robuste (linear regression) + normalisation
+# ✅ OI slope: snapshot history (simple & efficace)
+# ✅ Score insti plus "desk" (moins de 0 partout, mais reste exigeant)
 # =====================================================================
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import aiohttp
+import numpy as np
 
 LOGGER = logging.getLogger(__name__)
-
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
 
 # ---------------------------------------------------------------------
-# Cache léger pour éviter de spammer l'API
+# Light caches
 # ---------------------------------------------------------------------
-
 _KLINES_CACHE: Dict[Tuple[str, str], Tuple[float, List[List[Any]]]] = {}
 _FUNDING_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-
-# Historique OI: symbol -> (timestamp_sec, oi_value)
 _OI_HISTORY: Dict[str, Tuple[float, float]] = {}
 
 _BINANCE_SYMBOLS: Optional[Set[str]] = None
 _BINANCE_SYMBOLS_TS: float = 0.0
 
-# TTLs (secondes)
 KLINES_TTL = 60.0
 FUNDING_TTL = 60.0
-BINANCE_SYMBOLS_TTL = 900.0  # 15 minutes
+BINANCE_SYMBOLS_TTL = 900.0
 
-# Rate limit soft (binance)
-_HTTP_SEM = asyncio.Semaphore(8)
-
-# Global HTTP session (réutilisée)
+# ---------------------------------------------------------------------
+# Shared session (reuse)
+# ---------------------------------------------------------------------
 _SESSION: Optional[aiohttp.ClientSession] = None
 _SESSION_LOCK = asyncio.Lock()
-
-_UA = "desk-bot/inst/1.0"
-_SYMBOL_SAN_RE = re.compile(r"[^A-Z0-9]+")
 
 
 async def _get_session() -> aiohttp.ClientSession:
     global _SESSION
     async with _SESSION_LOCK:
-        if _SESSION is not None and (not _SESSION.closed):
+        if _SESSION is not None and not _SESSION.closed:
             return _SESSION
-        timeout = aiohttp.ClientTimeout(total=10)
-        connector = aiohttp.TCPConnector(limit=50, limit_per_host=20, ttl_dns_cache=300)
-        _SESSION = aiohttp.ClientSession(
-            timeout=timeout,
-            connector=connector,
-            headers={"User-Agent": _UA, "Accept": "application/json"},
-        )
+        timeout = aiohttp.ClientTimeout(total=12)
+        connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+        _SESSION = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return _SESSION
 
 
-async def close_http_session() -> None:
-    """Optionnel: à appeler si tu veux fermer proprement la session à l'arrêt."""
-    global _SESSION
-    try:
-        if _SESSION is not None and (not _SESSION.closed):
-            await _SESSION.close()
-    finally:
-        _SESSION = None
-
-
-# =====================================================================
-# Helpers HTTP (avec retries soft)
-# =====================================================================
-
-async def _http_get(
-    session: aiohttp.ClientSession,
-    path: str,
-    params: Optional[Dict[str, Any]] = None,
-    *,
-    retries: int = 2,
-) -> Any:
+async def _http_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     url = BINANCE_FAPI_BASE + path
-    params = params or {}
-
-    for k in range(retries + 1):
-        try:
-            async with _HTTP_SEM:
-                async with session.get(url, params=params) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-
-                    txt = await resp.text()
-                    # 429 / 5xx -> retry soft
-                    if resp.status in (418, 429, 500, 502, 503, 504) and k < retries:
-                        ra = resp.headers.get("Retry-After")
-                        sleep_s = float(ra) if ra and ra.replace(".", "", 1).isdigit() else (0.25 * (2 ** k))
-                        sleep_s = min(3.0, max(0.15, sleep_s))
-                        LOGGER.warning("[INST] HTTP %s GET %s retry=%s sleep=%.2fs params=%s resp=%s",
-                                       resp.status, path, k + 1, sleep_s, params, txt[:220])
-                        await asyncio.sleep(sleep_s)
-                        continue
-
-                    LOGGER.warning("[INST] HTTP %s GET %s params=%s resp=%s", resp.status, path, params, txt[:240])
-                    return None
-
-        except asyncio.TimeoutError:
-            if k < retries:
-                await asyncio.sleep(0.2 * (2 ** k))
-                continue
-            LOGGER.error("[INST] Timeout GET %s params=%s", path, params)
-            return None
-        except Exception as e:
-            if k < retries:
-                await asyncio.sleep(0.2 * (2 ** k))
-                continue
-            LOGGER.error("[INST] Exception GET %s params=%s: %s", path, params, e)
-            return None
-
-    return None
+    session = await _get_session()
+    try:
+        async with session.get(url, params=params) as resp:
+            if resp.status != 200:
+                txt = await resp.text()
+                LOGGER.warning("[INST] HTTP %s GET %s params=%s resp=%s", resp.status, path, params, txt[:200])
+                return None
+            return await resp.json()
+    except asyncio.TimeoutError:
+        LOGGER.error("[INST] Timeout GET %s params=%s", path, params)
+        return None
+    except Exception as e:
+        LOGGER.error("[INST] Exception GET %s params=%s: %s", path, params, e)
+        return None
 
 
 # =====================================================================
-# Symboles Binance Futures (cache exchangeInfo)
+# Binance symbols (exchangeInfo) cache
 # =====================================================================
 
-async def _get_binance_symbols(session: aiohttp.ClientSession) -> Set[str]:
+async def _get_binance_symbols() -> Set[str]:
     global _BINANCE_SYMBOLS, _BINANCE_SYMBOLS_TS
-
     now = time.time()
+
     if _BINANCE_SYMBOLS is not None and (now - _BINANCE_SYMBOLS_TS) < BINANCE_SYMBOLS_TTL:
         return _BINANCE_SYMBOLS
 
-    data = await _http_get(session, "/fapi/v1/exchangeInfo", params=None, retries=2)
+    data = await _http_get("/fapi/v1/exchangeInfo")
     symbols: Set[str] = set()
 
     if not isinstance(data, dict) or "symbols" not in data:
-        LOGGER.warning("[INST] Unable to fetch Binance exchangeInfo, keeping old symbols cache")
+        LOGGER.warning("[INST] Unable to fetch exchangeInfo, keeping old cache")
         if _BINANCE_SYMBOLS is None:
             _BINANCE_SYMBOLS = set()
         return _BINANCE_SYMBOLS
 
-    for s in data["symbols"]:
+    for s in data.get("symbols", []):
         try:
             if s.get("status") != "TRADING":
                 continue
@@ -188,39 +115,8 @@ async def _get_binance_symbols(session: aiohttp.ClientSession) -> Set[str]:
 # Symbol mapping Bitget -> Binance
 # =====================================================================
 
-def _normalize_bitget_symbol(symbol: str) -> str:
-    """
-    Rend le symbol "propre" pour tenter un mapping Binance:
-    - retire suffixes type _UMCBL, _DMCBL, -PERP, -SWAP, etc.
-    - garde uniquement A-Z0-9
-    """
-    s = str(symbol or "").upper().strip()
-    if not s:
-        return s
-
-    # split sur séparateurs fréquents
-    for sep in ("_", "-", ":"):
-        if sep in s:
-            s = s.split(sep)[0]
-
-    # nettoyage
-    s = _SYMBOL_SAN_RE.sub("", s)
-
-    # certains brokers ajoutent USDTM / USDTPERP etc
-    s = s.replace("USDTM", "USDT").replace("USDTPERP", "USDT").replace("USDT_PERP", "USDT")
-    return s
-
-
 def _map_symbol_to_binance(symbol: str, binance_symbols: Set[str]) -> Optional[str]:
-    """
-    Map Bitget -> Binance futures USDT perp.
-    - direct: BTCUSDT -> BTCUSDT
-    - 1000TOKENUSDT -> TOKENUSDT
-    - normalisation suffixes
-    """
-    s = _normalize_bitget_symbol(symbol)
-    if not s:
-        return None
+    s = str(symbol).upper()
 
     if s in binance_symbols:
         return s
@@ -230,14 +126,15 @@ def _map_symbol_to_binance(symbol: str, binance_symbols: Set[str]) -> Optional[s
         if alt in binance_symbols:
             return alt
 
+    # sometimes exchanges use suffixes or variants; keep it conservative
     return None
 
 
 # =====================================================================
-# Fetch klines 1h Binance (pour CVD)
+# Klines 1h (CVD)
 # =====================================================================
 
-async def _fetch_klines_1h(session: aiohttp.ClientSession, binance_symbol: str, limit: int = 120) -> Optional[List[List[Any]]]:
+async def _fetch_klines_1h(binance_symbol: str, limit: int = 120) -> Optional[List[List[Any]]]:
     cache_key = (binance_symbol, "1h")
     now = time.time()
 
@@ -248,7 +145,7 @@ async def _fetch_klines_1h(session: aiohttp.ClientSession, binance_symbol: str, 
             return data
 
     params = {"symbol": binance_symbol, "interval": "1h", "limit": int(limit)}
-    data = await _http_get(session, "/fapi/v1/klines", params=params, retries=2)
+    data = await _http_get("/fapi/v1/klines", params=params)
     if not isinstance(data, list) or len(data) == 0:
         return None
 
@@ -257,10 +154,10 @@ async def _fetch_klines_1h(session: aiohttp.ClientSession, binance_symbol: str, 
 
 
 # =====================================================================
-# Funding (premiumIndex)
+# Funding / premiumIndex
 # =====================================================================
 
-async def _fetch_funding(session: aiohttp.ClientSession, binance_symbol: str) -> Optional[Dict[str, Any]]:
+async def _fetch_funding(binance_symbol: str) -> Optional[Dict[str, Any]]:
     now = time.time()
     cached = _FUNDING_CACHE.get(binance_symbol)
     if cached is not None:
@@ -269,7 +166,7 @@ async def _fetch_funding(session: aiohttp.ClientSession, binance_symbol: str) ->
             return data
 
     params = {"symbol": binance_symbol}
-    data = await _http_get(session, "/fapi/v1/premiumIndex", params=params, retries=2)
+    data = await _http_get("/fapi/v1/premiumIndex", params=params)
     if not isinstance(data, dict) or "symbol" not in data:
         return None
 
@@ -278,26 +175,22 @@ async def _fetch_funding(session: aiohttp.ClientSession, binance_symbol: str) ->
 
 
 # =====================================================================
-# Open Interest snapshot
+# Open interest snapshot
 # =====================================================================
 
-async def _fetch_open_interest(session: aiohttp.ClientSession, binance_symbol: str) -> Optional[float]:
+async def _fetch_open_interest(binance_symbol: str) -> Optional[float]:
     params = {"symbol": binance_symbol}
-    data = await _http_get(session, "/fapi/v1/openInterest", params=params, retries=2)
+    data = await _http_get("/fapi/v1/openInterest", params=params)
     if not isinstance(data, dict) or "openInterest" not in data:
         return None
     try:
-        return float(data["openInterest"])
+        oi = float(data["openInterest"])
+        return oi if np.isfinite(oi) else None
     except Exception:
         return None
 
 
 def _compute_oi_slope(binance_symbol: str, new_oi: Optional[float]) -> Optional[float]:
-    """
-    Slope simple vs dernier snapshot:
-      (new - old) / old
-    Si pas d'historique => 0.0
-    """
     if new_oi is None:
         return None
 
@@ -309,47 +202,64 @@ def _compute_oi_slope(binance_symbol: str, new_oi: Optional[float]) -> Optional[
     if old_oi <= 0:
         return 0.0
 
-    return float((new_oi - old_oi) / old_oi)
+    slope = (float(new_oi) - float(old_oi)) / float(old_oi)
+    return float(slope) if np.isfinite(slope) else 0.0
 
 
 # =====================================================================
-# CVD proxy depuis klines
+# CVD slope robust
 # =====================================================================
 
-def _compute_cvd_slope_from_klines(klines: List[List[Any]], window: int = 40) -> Optional[float]:
+def _compute_cvd_slope_from_klines(klines: List[List[Any]], window: int = 48) -> Optional[float]:
     """
-    Proxy flow: delta = 2*takerBuyBase - totalVol  (base asset units)
-    On calcule:
-      ratio = sum(delta) / sum(vol)  ∈ [-1..+1]
-    Puis on scale pour coller à tes seuils:
-      cvd_slope = ratio * 3.0  ∈ [-3..+3]
+    Build CVD from:
+      delta = (takerBuyBase - (vol - takerBuyBase)) = 2*takerBuyBase - vol
+    Then compute linear-regression slope over last `window`.
+    Normalize slope by mean(abs(cvd)) to keep scale stable.
     """
-    if not klines or len(klines) < window + 5:
+    try:
+        if not klines or len(klines) < window + 10:
+            return None
+
+        sub = klines[-(window + 10):]
+        cvd_vals: List[float] = []
+        cvd = 0.0
+
+        for item in sub:
+            try:
+                vol = float(item[5])
+                taker_buy = float(item[9])
+                if not (np.isfinite(vol) and np.isfinite(taker_buy)):
+                    continue
+            except Exception:
+                continue
+
+            delta = 2.0 * taker_buy - vol
+            cvd += delta
+            cvd_vals.append(float(cvd))
+
+        if len(cvd_vals) < window:
+            return None
+
+        y = np.array(cvd_vals[-window:], dtype=float)
+        x = np.arange(len(y), dtype=float)
+
+        # linear regression slope
+        x_mean = x.mean()
+        y_mean = y.mean()
+        denom = np.sum((x - x_mean) ** 2)
+        if denom <= 1e-12:
+            return 0.0
+
+        slope = float(np.sum((x - x_mean) * (y - y_mean)) / denom)
+
+        scale = float(np.mean(np.abs(y))) + 1e-8
+        norm = slope / scale  # typical scale ~ [-0.2, 0.2] in practice
+        if not np.isfinite(norm):
+            return 0.0
+        return float(norm)
+    except Exception:
         return None
-
-    sub = klines[-window:]
-    sum_delta = 0.0
-    sum_vol = 0.0
-
-    for item in sub:
-        try:
-            vol = float(item[5])
-            taker_buy = float(item[9])
-        except Exception:
-            continue
-
-        if vol <= 0:
-            continue
-
-        delta = 2.0 * taker_buy - vol
-        sum_delta += delta
-        sum_vol += vol
-
-    if sum_vol <= 1e-12:
-        return None
-
-    ratio = sum_delta / sum_vol  # [-1..1]
-    return float(ratio * 3.0)
 
 
 # =====================================================================
@@ -375,18 +285,18 @@ def _classify_crowding(bias: str, funding_rate: Optional[float]) -> str:
     if funding_rate is None:
         return "unknown"
     fr = float(funding_rate)
-    b = (bias or "").upper()
+    b = str(bias).upper()
     if b == "LONG":
-        if fr <= -0.001:
-            return "short_crowded_favorable"
         if fr >= 0.001:
             return "long_crowded_risky"
+        if fr <= -0.001:
+            return "short_crowded_favorable"
         return "balanced"
     if b == "SHORT":
-        if fr >= 0.001:
-            return "long_crowded_favorable"
         if fr <= -0.001:
             return "short_crowded_risky"
+        if fr >= 0.001:
+            return "long_crowded_favorable"
         return "balanced"
     return "unknown"
 
@@ -395,19 +305,20 @@ def _classify_flow(cvd_slope: Optional[float]) -> str:
     if cvd_slope is None:
         return "unknown"
     x = float(cvd_slope)
-    if x >= 1.0:
+    # with our normalization, typical strong move ~ 0.12+
+    if x >= 0.14:
         return "strong_buy"
-    if x >= 0.2:
+    if x >= 0.06:
         return "buy"
-    if x <= -1.0:
+    if x <= -0.14:
         return "strong_sell"
-    if x <= -0.2:
+    if x <= -0.06:
         return "sell"
     return "neutral"
 
 
 # =====================================================================
-# Score institutionnel global (0..4)
+# Institutional score (0..4) — more desk-friendly distribution
 # =====================================================================
 
 def _score_institutional(
@@ -417,68 +328,67 @@ def _score_institutional(
     funding_rate: Optional[float],
 ) -> int:
     """
-    Score 0..4:
-      - CVD directionnel (0..2)
-      - OI slope (0..1)
-      - Funding contrarian (0..1)
+    Score in [0..4]
+      - CVD (main): up to +2
+      - OI confirm: +1
+      - Funding contrarian: +1
     """
-    b = (bias or "").upper()
+    b = str(bias).upper()
     score = 0
 
-    # CVD directionnel
+    # CVD direction
     if cvd_slope is not None:
         x = float(cvd_slope)
         if b == "LONG":
-            if x >= 1.0:
+            if x >= 0.14:
                 score += 2
-            elif x >= 0.2:
+            elif x >= 0.06:
                 score += 1
         elif b == "SHORT":
-            if x <= -1.0:
+            if x <= -0.14:
                 score += 2
-            elif x <= -0.2:
+            elif x <= -0.06:
                 score += 1
 
-    # OI slope
+    # OI confirm
     if oi_slope is not None:
-        x = float(oi_slope)
-        if b == "LONG" and x > 0.01:
+        y = float(oi_slope)
+        if b == "LONG" and y >= 0.004:
             score += 1
-        elif b == "SHORT" and x < -0.01:
+        elif b == "SHORT" and y <= -0.004:
             score += 1
 
-    # Funding contrarian
+    # Funding contrarian (when it helps the bias)
     if funding_rate is not None:
         fr = float(funding_rate)
-        if b == "LONG" and fr < -0.0005:
+        if b == "LONG" and fr <= -0.0005:
             score += 1
-        elif b == "SHORT" and fr > 0.0005:
+        elif b == "SHORT" and fr >= 0.0005:
             score += 1
 
-    return int(max(0, min(4, score)))
+    score = max(0, min(4, score))
+    return int(score)
 
 
 # =====================================================================
-# API PRINCIPALE
+# MAIN API
 # =====================================================================
 
 async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[str, Any]:
     """
-    Score institutionnel via Binance USDT-M futures (free endpoints).
-    Si symbole non mappé -> available=False + score=0 (le reste de ta pipeline peut bypass).
+    Binance Futures USDT-M institutional snapshot (free endpoints).
+    Returns dict with stable keys used by analyze_signal.py.
     """
-    bias = (bias or "").upper()
-
+    bias = str(bias).upper()
     warnings: List[str] = []
+
     oi_value: Optional[float] = None
     oi_slope: Optional[float] = None
     cvd_slope: Optional[float] = None
     funding_rate: Optional[float] = None
 
-    session = await _get_session()
-
-    # 0) symbol list + mapping
-    binance_symbols = await _get_binance_symbols(session)
+    # symbol mapping
+    binance_symbols = await _get_binance_symbols()
     binance_symbol = _map_symbol_to_binance(symbol, binance_symbols)
 
     if binance_symbol is None:
@@ -496,23 +406,16 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
             "warnings": ["symbol_not_mapped_to_binance"],
         }
 
-    # 1) Fetch en parallèle
-    kl_task = _fetch_klines_1h(session, binance_symbol, limit=120)
-    oi_task = _fetch_open_interest(session, binance_symbol)
-    fu_task = _fetch_funding(session, binance_symbol)
-
-    klines, oi_value, funding_data = await asyncio.gather(kl_task, oi_task, fu_task, return_exceptions=False)
-
-    # CVD slope
+    # 1) Klines -> CVD
+    klines = await _fetch_klines_1h(binance_symbol, limit=140)
     if not klines:
         warnings.append("no_klines")
         cvd_slope = None
     else:
-        cvd_slope = _compute_cvd_slope_from_klines(klines, window=40)
-        if cvd_slope is None:
-            warnings.append("cvd_unavailable")
+        cvd_slope = _compute_cvd_slope_from_klines(klines, window=48)
 
-    # OI slope
+    # 2) OI snapshot + slope
+    oi_value = await _fetch_open_interest(binance_symbol)
     if oi_value is None:
         warnings.append("no_oi")
         oi_slope = None
@@ -520,13 +423,17 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
         oi_slope = _compute_oi_slope(binance_symbol, oi_value)
         _OI_HISTORY[binance_symbol] = (time.time(), float(oi_value))
 
-    # Funding
-    if not isinstance(funding_data, dict):
+    # 3) Funding
+    funding_data = await _fetch_funding(binance_symbol)
+    if funding_data is None:
         warnings.append("no_funding")
         funding_rate = None
     else:
         try:
             funding_rate = float(funding_data.get("lastFundingRate", "0"))
+            if not np.isfinite(funding_rate):
+                funding_rate = None
+                warnings.append("funding_nan")
         except Exception:
             funding_rate = None
             warnings.append("funding_parse_error")
@@ -542,12 +449,7 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
         funding_rate=funding_rate,
     )
 
-    # available = on a au moins une info exploitable
-    available = any([
-        oi_value is not None,
-        cvd_slope is not None,
-        funding_rate is not None,
-    ])
+    available = any([oi_value is not None, cvd_slope is not None, funding_rate is not None])
 
     return {
         "institutional_score": int(inst_score),
