@@ -1,17 +1,39 @@
+
 # =====================================================================
-# institutional_data.py — Ultra Desk OI + CVD Engine (Binance Futures)
+# institutional_data.py — Ultra Desk OI + CVD + Tape + Orderbook Engine
+#   (Binance USDT-M Futures, free endpoints only)
 # =====================================================================
 # Objectif :
-#   - Score institutionnel pour TOUTES les cryptos (quand Binance couvre)
-#   - Basé sur:
-#       * Open Interest snapshot + slope (delta vs last snapshot)
-#       * CVD proxy à partir des klines (taker buy volume) => ratio stable [-1..+1]
-#       * Funding (premiumIndex.lastFundingRate)
-#   - Cache TTL pour limiter l'API
-#   - Fail-safe: jamais crash, retourne un dict exploitable
+#   - Fournir un score institutionnel pour TOUTES les cryptos (si couvertes
+#     par Binance USDT-M Perpetual) basé sur :
+#       * Open Interest (snapshot + hist slope)
+#       * CVD (klines 1h via takerBuyBaseAssetVolume)
+#       * Tape (aggTrades, delta 1m/5m)
+#       * Funding (premiumIndex + fundingRate history)
+#       * Basis (mark-index spread)
+#       * Orderbook imbalance (depth)
+#       * (Optionnel) Liquidations (allForceOrders) — best effort, no key
 #
-# API:
-#   async def compute_full_institutional_analysis(symbol: str, bias: str) -> dict
+# API principale :
+#
+#   async def compute_full_institutional_analysis(symbol: str, bias: str) -> dict:
+#       bias: "LONG" ou "SHORT"
+#
+# Retour minimal compatible:
+#   {
+#       "institutional_score": int,
+#       "binance_symbol": str | None,
+#       "available": bool,
+#       "oi": float | None,
+#       "oi_slope": float | None,
+#       "cvd_slope": float | None,
+#       "funding_rate": float | None,
+#       "funding_regime": str,
+#       "crowding_regime": str,
+#       "flow_regime": str,
+#       "warnings": list[str],
+#       ... (extra fields)
+#   }
 # =====================================================================
 
 from __future__ import annotations
@@ -22,90 +44,83 @@ import time
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import aiohttp
+import numpy as np
 
 LOGGER = logging.getLogger(__name__)
 
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
 
 # ---------------------------------------------------------------------
-# Cache léger
+# Cache léger pour éviter de spammer l'API
 # ---------------------------------------------------------------------
 
-# Cache klines: (symbol, interval) -> (ts_sec, data)
-_KLINES_CACHE: Dict[Tuple[str, str], Tuple[float, List[List[Any]]]] = {}
-
-# Cache funding / premiumIndex: symbol -> (ts_sec, data)
+# Cache generic: (key) -> (timestamp, data)
+_KLINES_CACHE: Dict[Tuple[str, str], Tuple[float, Any]] = {}
+_DEPTH_CACHE: Dict[Tuple[str, int], Tuple[float, Any]] = {}
+_TRADES_CACHE: Dict[Tuple[str, int], Tuple[float, Any]] = {}
 _FUNDING_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_FUNDING_HIST_CACHE: Dict[str, Tuple[float, Any]] = {}
+_OI_CACHE: Dict[str, Tuple[float, Any]] = {}
+_OI_HIST_CACHE: Dict[str, Tuple[float, Any]] = {}
+_FORCE_CACHE: Dict[str, Tuple[float, Any]] = {}
 
-# Historique OI: symbol -> (ts_sec, oi_value)
+# Last OI snapshot for slope
 _OI_HISTORY: Dict[str, Tuple[float, float]] = {}
 
 # Cache symboles Binance Futures USDT-perp
 _BINANCE_SYMBOLS: Optional[Set[str]] = None
 _BINANCE_SYMBOLS_TS: float = 0.0
 
-# TTLs (sec)
+# TTLs (seconds)
 KLINES_TTL = 60.0
+DEPTH_TTL = 6.0
+TRADES_TTL = 6.0
 FUNDING_TTL = 60.0
-BINANCE_SYMBOLS_TTL = 900.0  # 15 min
-
-# Limiteur global (évite bursts)
-_HTTP_SEM = asyncio.Semaphore(20)
-
-# Session HTTP globale (réutilisée)
-_SESSION: Optional[aiohttp.ClientSession] = None
-_SESSION_LOCK = asyncio.Lock()
-
-
-# =====================================================================
-# Session
-# =====================================================================
-
-async def _get_session() -> aiohttp.ClientSession:
-    global _SESSION
-    async with _SESSION_LOCK:
-        if _SESSION is None or _SESSION.closed:
-            timeout = aiohttp.ClientTimeout(total=10)
-            connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
-            _SESSION = aiohttp.ClientSession(timeout=timeout, connector=connector)
-        return _SESSION
+FUNDING_HIST_TTL = 300.0
+OI_TTL = 60.0
+OI_HIST_TTL = 300.0
+FORCE_TTL = 120.0
+BINANCE_SYMBOLS_TTL = 900.0
 
 
 # =====================================================================
 # Helpers HTTP
 # =====================================================================
 
-async def _http_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+async def _http_get(
+    session: aiohttp.ClientSession,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Any:
     url = BINANCE_FAPI_BASE + path
-    session = await _get_session()
-    async with _HTTP_SEM:
-        try:
-            async with session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    txt = await resp.text()
-                    LOGGER.warning("[INST] HTTP %s GET %s params=%s resp=%s", resp.status, path, params, txt[:250])
-                    return None
-                return await resp.json()
-        except asyncio.TimeoutError:
-            LOGGER.error("[INST] Timeout GET %s params=%s", path, params)
-            return None
-        except Exception as e:
-            LOGGER.error("[INST] Exception GET %s params=%s: %s", path, params, e)
-            return None
+    try:
+        async with session.get(url, params=params, timeout=10) as resp:
+            if resp.status != 200:
+                txt = await resp.text()
+                # Binance sometimes returns HTML on bans; keep small
+                LOGGER.warning("[INST] HTTP %s GET %s params=%s resp=%s", resp.status, path, params, (txt or "")[:200])
+                return None
+            return await resp.json()
+    except asyncio.TimeoutError:
+        LOGGER.error("[INST] Timeout GET %s params=%s", path, params)
+        return None
+    except Exception as e:
+        LOGGER.error("[INST] Exception GET %s params=%s: %s", path, params, e)
+        return None
 
 
 # =====================================================================
-# Binance symbols (exchangeInfo) cached
+# Symboles Binance Futures (cache exchangeInfo)
 # =====================================================================
 
-async def _get_binance_symbols() -> Set[str]:
+async def _get_binance_symbols(session: aiohttp.ClientSession) -> Set[str]:
     global _BINANCE_SYMBOLS, _BINANCE_SYMBOLS_TS
 
     now = time.time()
     if _BINANCE_SYMBOLS is not None and (now - _BINANCE_SYMBOLS_TS) < BINANCE_SYMBOLS_TTL:
         return _BINANCE_SYMBOLS
 
-    data = await _http_get("/fapi/v1/exchangeInfo", params=None)
+    data = await _http_get(session, "/fapi/v1/exchangeInfo", params=None)
     symbols: Set[str] = set()
 
     if not isinstance(data, dict) or "symbols" not in data:
@@ -114,7 +129,7 @@ async def _get_binance_symbols() -> Set[str]:
             _BINANCE_SYMBOLS = set()
         return _BINANCE_SYMBOLS
 
-    for s in data.get("symbols", []) or []:
+    for s in data.get("symbols", []):
         try:
             if s.get("status") != "TRADING":
                 continue
@@ -122,7 +137,7 @@ async def _get_binance_symbols() -> Set[str]:
                 continue
             if s.get("quoteAsset") != "USDT":
                 continue
-            sym = str(s.get("symbol", "")).upper().strip()
+            sym = str(s.get("symbol", "")).upper()
             if sym:
                 symbols.add(sym)
         except Exception:
@@ -135,59 +150,218 @@ async def _get_binance_symbols() -> Set[str]:
 
 
 # =====================================================================
-# Symbol mapping (Bitget -> Binance)
+# Symbol mapping Bitget/KuCoin -> Binance
 # =====================================================================
 
-def _normalize_symbol(symbol: str) -> str:
-    s = (symbol or "").upper().strip()
-    # remove separators sometimes used
-    s = s.replace("-", "").replace("_", "").replace("/", "")
-    # common suffix artifacts (if any)
-    s = s.replace("PERP", "")
-    return s
-
-
 def _map_symbol_to_binance(symbol: str, binance_symbols: Set[str]) -> Optional[str]:
-    s = _normalize_symbol(symbol)
+    """
+    Map symbol (ex: 'BTCUSDT') to Binance USDT-M perp.
+    Handles:
+      - direct
+      - 1000TOKENUSDT -> TOKENUSDT
+      - TOKENUSDT_UMCBL / BTCUSDTM / BTC-USDT -> BTCUSDT
+    """
+    s = (symbol or "").upper().replace("-", "").replace("_", "")
+    s = s.replace("UMCBL", "").replace("USDTM", "USDT")
 
-    # direct
     if s in binance_symbols:
         return s
 
-    # 1000TOKENUSDT -> TOKENUSDT
     if s.startswith("1000"):
         alt = s[4:]
         if alt in binance_symbols:
             return alt
 
-    # sometimes exchanges include "USDT" twice or weird forms
-    # keep it minimal: return None if not found
     return None
 
 
 # =====================================================================
-# Fetch endpoints
+# Fetch klines 1h Binance (for CVD)
 # =====================================================================
 
-async def _fetch_klines_1h(binance_symbol: str, limit: int = 120) -> Optional[List[List[Any]]]:
+async def _fetch_klines_1h(session: aiohttp.ClientSession, binance_symbol: str, limit: int = 120) -> Optional[List[List[Any]]]:
     cache_key = (binance_symbol, "1h")
     now = time.time()
+
     cached = _KLINES_CACHE.get(cache_key)
     if cached is not None:
         ts, data = cached
         if now - ts < KLINES_TTL:
-            return data
+            return data  # type: ignore
 
     params = {"symbol": binance_symbol, "interval": "1h", "limit": int(limit)}
-    data = await _http_get("/fapi/v1/klines", params=params)
-    if not isinstance(data, list) or len(data) == 0:
+    data = await _http_get(session, "/fapi/v1/klines", params=params)
+    if not isinstance(data, list) or not data:
         return None
 
     _KLINES_CACHE[cache_key] = (now, data)
     return data
 
 
-async def _fetch_funding(binance_symbol: str) -> Optional[Dict[str, Any]]:
+# =====================================================================
+# Fetch orderbook depth (imbalance)
+# =====================================================================
+
+async def _fetch_depth(session: aiohttp.ClientSession, binance_symbol: str, limit: int = 100) -> Optional[Dict[str, Any]]:
+    cache_key = (binance_symbol, int(limit))
+    now = time.time()
+
+    cached = _DEPTH_CACHE.get(cache_key)
+    if cached is not None:
+        ts, data = cached
+        if now - ts < DEPTH_TTL:
+            return data  # type: ignore
+
+    params = {"symbol": binance_symbol, "limit": int(limit)}
+    data = await _http_get(session, "/fapi/v1/depth", params=params)
+    if not isinstance(data, dict) or "bids" not in data or "asks" not in data:
+        return None
+
+    _DEPTH_CACHE[cache_key] = (now, data)
+    return data
+
+
+def _compute_orderbook_imbalance(depth: Dict[str, Any], band_bps: float = 25.0) -> Optional[float]:
+    """
+    Imbalance in [-1,+1] computed within +/- band_bps around mid.
+    band_bps=25 => 0.25%
+    """
+    try:
+        bids = depth.get("bids") or []
+        asks = depth.get("asks") or []
+        if not bids or not asks:
+            return None
+
+        b0p = float(bids[0][0])
+        a0p = float(asks[0][0])
+        if not (np.isfinite(b0p) and np.isfinite(a0p)) or a0p <= 0 or b0p <= 0:
+            return None
+        mid = (b0p + a0p) / 2.0
+        if mid <= 0:
+            return None
+
+        band = float(band_bps) / 10000.0
+        lo = mid * (1.0 - band)
+        hi = mid * (1.0 + band)
+
+        bid_val = 0.0
+        ask_val = 0.0
+
+        for p, q in bids:
+            pf = float(p)
+            if pf < lo:
+                break
+            bid_val += pf * float(q)
+
+        for p, q in asks:
+            pf = float(p)
+            if pf > hi:
+                break
+            ask_val += pf * float(q)
+
+        den = bid_val + ask_val
+        if den <= 0:
+            return None
+        return float((bid_val - ask_val) / den)
+    except Exception:
+        return None
+
+
+def _classify_orderbook(imb: Optional[float]) -> str:
+    if imb is None:
+        return "unknown"
+    x = float(imb)
+    if x >= 0.35:
+        return "strong_bid"
+    if x >= 0.12:
+        return "bid"
+    if x <= -0.35:
+        return "strong_ask"
+    if x <= -0.12:
+        return "ask"
+    return "balanced"
+
+
+# =====================================================================
+# Fetch aggTrades (tape delta)
+# =====================================================================
+
+async def _fetch_agg_trades(session: aiohttp.ClientSession, binance_symbol: str, limit: int = 1000) -> Optional[List[Dict[str, Any]]]:
+    cache_key = (binance_symbol, int(limit))
+    now = time.time()
+
+    cached = _TRADES_CACHE.get(cache_key)
+    if cached is not None:
+        ts, data = cached
+        if now - ts < TRADES_TTL:
+            return data  # type: ignore
+
+    params = {"symbol": binance_symbol, "limit": int(limit)}
+    data = await _http_get(session, "/fapi/v1/aggTrades", params=params)
+    if not isinstance(data, list) or not data:
+        return None
+
+    _TRADES_CACHE[cache_key] = (now, data)
+    return data
+
+
+def _compute_tape_delta(trades: List[Dict[str, Any]], window_sec: int = 300) -> Optional[float]:
+    """
+    Returns normalized taker delta in [-1,+1] over last window_sec.
+    For aggTrades:
+      - "m" (isBuyerMaker) == True  => seller initiated (taker sells)
+      - "m" == False               => buyer initiated (taker buys)
+    """
+    try:
+        if not trades:
+            return None
+
+        now_ms = int(time.time() * 1000)
+        cutoff = now_ms - int(window_sec) * 1000
+
+        buy = 0.0
+        sell = 0.0
+        for t in reversed(trades):
+            ts = int(t.get("T") or 0)
+            if ts < cutoff:
+                break
+            qty = float(t.get("q") or 0.0)
+            if qty <= 0:
+                continue
+            is_buyer_maker = bool(t.get("m", False))
+            if is_buyer_maker:
+                sell += qty
+            else:
+                buy += qty
+
+        den = buy + sell
+        if den <= 0:
+            return None
+        return float((buy - sell) / den)
+    except Exception:
+        return None
+
+
+def _classify_tape(delta: Optional[float]) -> str:
+    if delta is None:
+        return "unknown"
+    x = float(delta)
+    if x >= 0.35:
+        return "strong_buy"
+    if x >= 0.12:
+        return "buy"
+    if x <= -0.35:
+        return "strong_sell"
+    if x <= -0.12:
+        return "sell"
+    return "neutral"
+
+
+# =====================================================================
+# Funding / premiumIndex + funding history
+# =====================================================================
+
+async def _fetch_premium_index(session: aiohttp.ClientSession, binance_symbol: str) -> Optional[Dict[str, Any]]:
     now = time.time()
     cached = _FUNDING_CACHE.get(binance_symbol)
     if cached is not None:
@@ -195,7 +369,8 @@ async def _fetch_funding(binance_symbol: str) -> Optional[Dict[str, Any]]:
         if now - ts < FUNDING_TTL:
             return data
 
-    data = await _http_get("/fapi/v1/premiumIndex", params={"symbol": binance_symbol})
+    params = {"symbol": binance_symbol}
+    data = await _http_get(session, "/fapi/v1/premiumIndex", params=params)
     if not isinstance(data, dict) or "symbol" not in data:
         return None
 
@@ -203,85 +378,53 @@ async def _fetch_funding(binance_symbol: str) -> Optional[Dict[str, Any]]:
     return data
 
 
-async def _fetch_open_interest(binance_symbol: str) -> Optional[float]:
-    data = await _http_get("/fapi/v1/openInterest", params={"symbol": binance_symbol})
-    if not isinstance(data, dict) or "openInterest" not in data:
+async def _fetch_funding_history(session: aiohttp.ClientSession, binance_symbol: str, limit: int = 30) -> Optional[List[Dict[str, Any]]]:
+    now = time.time()
+    cached = _FUNDING_HIST_CACHE.get(binance_symbol)
+    if cached is not None:
+        ts, data = cached
+        if now - ts < FUNDING_HIST_TTL:
+            return data  # type: ignore
+
+    params = {"symbol": binance_symbol, "limit": int(limit)}
+    data = await _http_get(session, "/fapi/v1/fundingRate", params=params)
+    if not isinstance(data, list) or not data:
         return None
-    try:
-        return float(data["openInterest"])
-    except Exception:
-        return None
+
+    _FUNDING_HIST_CACHE[binance_symbol] = (now, data)
+    return data
 
 
-def _compute_oi_slope(binance_symbol: str, new_oi: Optional[float]) -> Optional[float]:
-    if new_oi is None:
-        return None
-
-    prev = _OI_HISTORY.get(binance_symbol)
-    if prev is None:
-        return 0.0  # neutral but valid
-
-    _, old_oi = prev
-    if old_oi <= 0:
-        return 0.0
-
-    slope = (float(new_oi) - float(old_oi)) / float(old_oi)
-    return float(slope)
-
-
-# =====================================================================
-# CVD proxy (stable): ratio = sum(delta)/sum(volume) over window => [-1..+1]
-# =====================================================================
-
-def _compute_cvd_ratio_from_klines(klines: List[List[Any]], window: int = 40) -> Optional[float]:
+def _compute_funding_stats(funding_hist: Optional[List[Dict[str, Any]]]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     """
-    delta per candle = 2*takerBuyBase - totalVolume
-    ratio over window = sum(delta) / sum(volume)  -> stable [-1..+1]
+    Returns: (mean, std, zscore_last)
     """
     try:
-        if not klines or len(klines) < window + 5:
-            return None
-
-        sub = klines[-window:]
-        sum_delta = 0.0
-        sum_vol = 0.0
-
-        for item in sub:
+        if not funding_hist:
+            return None, None, None
+        rates = []
+        for x in funding_hist[-24:]:
             try:
-                vol = float(item[5])
-                taker_buy = float(item[9])
+                rates.append(float(x.get("fundingRate")))
             except Exception:
                 continue
-
-            if not (vol >= 0.0):
-                continue
-
-            delta = 2.0 * taker_buy - vol
-            sum_delta += delta
-            sum_vol += max(vol, 0.0)
-
-        if sum_vol <= 1e-12:
-            return None
-
-        ratio = sum_delta / sum_vol
-        # clamp
-        if ratio > 1.0:
-            ratio = 1.0
-        if ratio < -1.0:
-            ratio = -1.0
-        return float(ratio)
+        if len(rates) < 5:
+            return None, None, None
+        mean = float(np.mean(rates))
+        std = float(np.std(rates)) if float(np.std(rates)) > 1e-12 else 0.0
+        last = float(rates[-1])
+        z = float((last - mean) / std) if std > 0 else None
+        return mean, std if std > 0 else None, z
     except Exception:
-        return None
+        return None, None, None
 
 
-# =====================================================================
-# Funding regimes / crowding / flow
-# =====================================================================
-
-def _classify_funding(funding_rate: Optional[float]) -> str:
+def _classify_funding(funding_rate: Optional[float], z: Optional[float] = None) -> str:
     if funding_rate is None:
         return "unknown"
     fr = float(funding_rate)
+    if z is not None and abs(float(z)) >= 2.2:
+        return "extreme"
     if fr <= -0.0015:
         return "very_negative"
     if fr <= -0.0005:
@@ -293,263 +436,646 @@ def _classify_funding(funding_rate: Optional[float]) -> str:
     return "very_positive"
 
 
-def _classify_crowding(bias: str, funding_rate: Optional[float]) -> str:
-    if funding_rate is None:
+def _classify_basis(basis_pct: Optional[float]) -> str:
+    if basis_pct is None:
         return "unknown"
-    fr = float(funding_rate)
-    b = (bias or "").upper()
+    b = float(basis_pct)
+    if b >= 0.002:
+        return "contango_strong"
+    if b >= 0.0006:
+        return "contango"
+    if b <= -0.002:
+        return "backwardation_strong"
+    if b <= -0.0006:
+        return "backwardation"
+    return "flat"
 
-    # Desk logic:
-    # - if you're LONG and funding is very positive -> longs crowded -> risky
-    # - if you're LONG and funding is negative -> shorts crowded -> favorable
+
+def _classify_crowding(bias: str, funding_rate: Optional[float], basis_pct: Optional[float], funding_z: Optional[float]) -> str:
+    """
+    Crowding regime: combine funding + basis (and optional zscore).
+    """
+    if funding_rate is None and basis_pct is None:
+        return "unknown"
+
+    b = (bias or "").upper()
+    fr = float(funding_rate) if funding_rate is not None else 0.0
+    bs = float(basis_pct) if basis_pct is not None else 0.0
+
+    crowded_long = (fr >= 0.001) or (bs >= 0.0015) or (funding_z is not None and funding_z >= 2.0)
+    crowded_short = (fr <= -0.001) or (bs <= -0.0015) or (funding_z is not None and funding_z <= -2.0)
+
     if b == "LONG":
-        if fr >= 0.0012:
+        if crowded_long:
             return "long_crowded_risky"
-        if fr <= -0.0006:
+        if crowded_short:
             return "short_crowded_favorable"
         return "balanced"
     if b == "SHORT":
-        if fr <= -0.0012:
-            return "short_crowded_risky"
-        if fr >= 0.0006:
+        if crowded_long:
             return "long_crowded_favorable"
+        if crowded_short:
+            return "short_crowded_risky"
         return "balanced"
     return "unknown"
 
 
-def _classify_flow(cvd_ratio: Optional[float]) -> str:
-    if cvd_ratio is None:
-        return "unknown"
-    x = float(cvd_ratio)
-    if x >= 0.25:
-        return "strong_buy"
-    if x >= 0.10:
-        return "buy"
-    if x <= -0.25:
-        return "strong_sell"
-    if x <= -0.10:
-        return "sell"
-    return "neutral"
+# =====================================================================
+# Open Interest (snapshot + hist)
+# =====================================================================
+
+async def _fetch_open_interest(session: aiohttp.ClientSession, binance_symbol: str) -> Optional[float]:
+    now = time.time()
+    cached = _OI_CACHE.get(binance_symbol)
+    if cached is not None:
+        ts, data = cached
+        if now - ts < OI_TTL:
+            return data  # type: ignore
+
+    params = {"symbol": binance_symbol}
+    data = await _http_get(session, "/fapi/v1/openInterest", params=params)
+    if not isinstance(data, dict) or "openInterest" not in data:
+        return None
+    try:
+        oi = float(data["openInterest"])
+    except Exception:
+        return None
+
+    _OI_CACHE[binance_symbol] = (now, oi)
+    return oi
+
+
+async def _fetch_open_interest_hist(session: aiohttp.ClientSession, binance_symbol: str, period: str = "5m", limit: int = 30) -> Optional[List[Dict[str, Any]]]:
+    """
+    Binance futures data endpoint (still under fapi host).
+    """
+    now = time.time()
+    cached = _OI_HIST_CACHE.get(binance_symbol)
+    if cached is not None:
+        ts, data = cached
+        if now - ts < OI_HIST_TTL:
+            return data  # type: ignore
+
+    params = {"symbol": binance_symbol, "period": period, "limit": int(limit)}
+    data = await _http_get(session, "/futures/data/openInterestHist", params=params)
+    if not isinstance(data, list) or not data:
+        return None
+
+    _OI_HIST_CACHE[binance_symbol] = (now, data)
+    return data
+
+
+def _compute_oi_slope(binance_symbol: str, new_oi: Optional[float]) -> Optional[float]:
+    if new_oi is None:
+        return None
+    prev = _OI_HISTORY.get(binance_symbol)
+    if prev is None:
+        return 0.0
+    _, old_oi = prev
+    if old_oi <= 0:
+        return 0.0
+    return float((float(new_oi) - float(old_oi)) / float(old_oi))
+
+
+def _compute_oi_hist_slope(oi_hist: Optional[List[Dict[str, Any]]]) -> Optional[float]:
+    """
+    Uses openInterestHist to compute a smoother slope over last ~N points.
+    Returns ratio per window: (last - first)/|first|
+    """
+    try:
+        if not oi_hist or len(oi_hist) < 8:
+            return None
+        xs = []
+        for x in oi_hist[-20:]:
+            try:
+                xs.append(float(x.get("sumOpenInterest") or x.get("openInterest") or x.get("sumOpenInterestValue")))
+            except Exception:
+                continue
+        if len(xs) < 6:
+            return None
+        a = float(xs[0])
+        b = float(xs[-1])
+        den = abs(a) if abs(a) > 1e-12 else max(abs(b), 1e-12)
+        return float((b - a) / den)
+    except Exception:
+        return None
 
 
 # =====================================================================
-# Institutional score (desk): more usable, less "always 0"
+# CVD from klines (taker buy base)
+# =====================================================================
+
+def _compute_cvd_slope_from_klines(klines: List[List[Any]], window: int = 40) -> Optional[float]:
+    """
+    delta = 2 * takerBuyBase - totalVolume
+    cumulate delta; slope on last window.
+    """
+    if not klines or len(klines) < window + 6:
+        return None
+
+    sub = klines[-(window + 6):]
+    cvd = 0.0
+    cvs: List[float] = []
+
+    for item in sub:
+        try:
+            vol = float(item[5])
+            taker_buy = float(item[9])
+        except Exception:
+            continue
+
+        delta = 2.0 * taker_buy - vol
+        cvd += delta
+        cvs.append(cvd)
+
+    if len(cvs) < window:
+        return None
+
+    seg = cvs[-window:]
+    start = float(seg[0])
+    end = float(seg[-1])
+    den = abs(start) if abs(start) > 1e-12 else max(abs(end), 1e-12)
+    return float((end - start) / den)
+
+
+# =====================================================================
+# Liquidations (best effort)
+# =====================================================================
+
+async def _fetch_force_orders(session: aiohttp.ClientSession, binance_symbol: str, limit: int = 50) -> Optional[List[Dict[str, Any]]]:
+    """
+    NOTE: This endpoint is public on Binance Futures docs, but in some regions it may be restricted.
+    We do best-effort and swallow failures.
+    """
+    now = time.time()
+    cached = _FORCE_CACHE.get(binance_symbol)
+    if cached is not None:
+        ts, data = cached
+        if now - ts < FORCE_TTL:
+            return data  # type: ignore
+
+    params = {"symbol": binance_symbol, "limit": int(limit)}
+    data = await _http_get(session, "/fapi/v1/allForceOrders", params=params)
+    if not isinstance(data, list) or not data:
+        return None
+
+    _FORCE_CACHE[binance_symbol] = (now, data)
+    return data
+
+
+def _compute_liquidation_intensity(force_orders: Optional[List[Dict[str, Any]]], window_sec: int = 900) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Computes liquidation intensity (notional proxy) in last window_sec and bias.
+    Returns: (intensity, bias) where intensity roughly in [0..] and bias in {"buy_liq","sell_liq","mixed"}
+    """
+    try:
+        if not force_orders:
+            return None, None
+
+        now_ms = int(time.time() * 1000)
+        cutoff = now_ms - int(window_sec) * 1000
+
+        buy_qty = 0.0
+        sell_qty = 0.0
+        for x in reversed(force_orders):
+            ts = int(x.get("time") or x.get("T") or 0)
+            if ts < cutoff:
+                break
+            qty = float(x.get("origQty") or x.get("q") or 0.0)
+            side = str(x.get("side") or "").upper()
+            if qty <= 0:
+                continue
+            if side == "BUY":
+                buy_qty += qty
+            elif side == "SELL":
+                sell_qty += qty
+
+        total = buy_qty + sell_qty
+        if total <= 0:
+            return None, None
+
+        bias = "mixed"
+        if buy_qty > 1.6 * sell_qty:
+            bias = "buy_liq"
+        elif sell_qty > 1.6 * buy_qty:
+            bias = "sell_liq"
+
+        # normalize by total (0..1-ish)
+        intensity = float(total)
+        return intensity, bias
+    except Exception:
+        return None, None
+
+
+# =====================================================================
+# Institutional scoring
 # =====================================================================
 
 def _score_institutional(
     bias: str,
+    *,
     oi_slope: Optional[float],
-    cvd_ratio: Optional[float],
+    oi_hist_slope: Optional[float],
+    cvd_slope: Optional[float],
+    tape_5m: Optional[float],
     funding_rate: Optional[float],
-    crowding_regime: str,
-) -> int:
+    funding_z: Optional[float],
+    basis_pct: Optional[float],
+    ob_25bps: Optional[float],
+) -> Tuple[int, Dict[str, int], Dict[str, Any]]:
     """
-    Score integer [0..4], desk-friendly.
-    - Main driver: CVD ratio (stable)
-    - OI slope: confirmation (even small)
-    - Funding: contrarian / crowding-aware
+    Score in [0..4] (compatible with MIN_INST_SCORE=2).
+    Adds more "paths" to reach 2 without weakening logic:
+      - Flow (CVD + Tape) = 0..2
+      - OI trend          = 0..1
+      - Crowding          = 0..1 (funding/basis contrarian)
+      - Microstructure    = 0..1 (orderbook)
+    Then clamp to 4.
     """
     b = (bias or "").upper()
-    score = 0.0
+    comp: Dict[str, int] = {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0}
+    meta: Dict[str, Any] = {}
 
-    # ---- CVD ratio (stable) ----
-    if cvd_ratio is not None:
-        x = float(cvd_ratio)
-
+    # Flow: combine tape + cvd
+    flow_points = 0
+    flow_votes = 0
+    if tape_5m is not None:
+        x = float(tape_5m)
         if b == "LONG":
-            if x >= 0.25:
-                score += 2.0
-            elif x >= 0.10:
-                score += 1.0
-            elif x <= -0.25:
-                score -= 1.0
-            elif x <= -0.10:
-                score -= 0.5
+            if x >= 0.35:
+                flow_points += 2
+                flow_votes += 2
+            elif x >= 0.12:
+                flow_points += 1
+                flow_votes += 1
+        else:
+            if x <= -0.35:
+                flow_points += 2
+                flow_votes += 2
+            elif x <= -0.12:
+                flow_points += 1
+                flow_votes += 1
 
-        elif b == "SHORT":
-            if x <= -0.25:
-                score += 2.0
-            elif x <= -0.10:
-                score += 1.0
-            elif x >= 0.25:
-                score -= 1.0
-            elif x >= 0.10:
-                score -= 0.5
+    if cvd_slope is not None:
+        x = float(cvd_slope)
+        if b == "LONG":
+            if x >= 1.0:
+                flow_points += 2
+                flow_votes += 2
+            elif x >= 0.2:
+                flow_points += 1
+                flow_votes += 1
+        else:
+            if x <= -1.0:
+                flow_points += 2
+                flow_votes += 2
+            elif x <= -0.2:
+                flow_points += 1
+                flow_votes += 1
 
-    # ---- OI slope (confirmation) ----
+    # normalize flow: if both are strong -> 2, else if one ok -> 1
+    if flow_points >= 3:
+        comp["flow"] = 2
+    elif flow_points >= 1:
+        comp["flow"] = 1
+    else:
+        comp["flow"] = 0
+
+    # OI: snapshot slope OR hist slope aligned
+    oi_ok = False
     if oi_slope is not None:
-        o = float(oi_slope)
+        x = float(oi_slope)
+        if b == "LONG" and x >= 0.008:
+            oi_ok = True
+        if b == "SHORT" and x <= -0.008:
+            oi_ok = True
+    if not oi_ok and oi_hist_slope is not None:
+        x = float(oi_hist_slope)
+        if b == "LONG" and x >= 0.012:
+            oi_ok = True
+        if b == "SHORT" and x <= -0.012:
+            oi_ok = True
+    if oi_ok:
+        comp["oi"] = 1
 
-        # thresholds are SMALL on purpose (OI moves slowly on 1h)
-        strong_thr = 0.008   # 0.8%
-        mild_thr = 0.002     # 0.2%
-        contra_thr = 0.004
-
-        if b == "LONG":
-            if o >= strong_thr:
-                score += 1.0
-            elif o >= mild_thr:
-                score += 0.5
-            elif o <= -contra_thr:
-                score -= 0.5
-
-        elif b == "SHORT":
-            if o <= -strong_thr:
-                score += 1.0
-            elif o <= -mild_thr:
-                score += 0.5
-            elif o >= contra_thr:
-                score -= 0.5
-
-    # ---- Funding / crowding ----
+    # Crowding contrarian: funding/basis extreme opposite side helps
     if funding_rate is not None:
         fr = float(funding_rate)
+        if b == "LONG" and fr < -0.0005:
+            comp["crowding"] += 1
+        if b == "SHORT" and fr > 0.0005:
+            comp["crowding"] += 1
 
-        # contrarian bonus small
-        if b == "LONG":
-            if fr <= -0.0005:
-                score += 0.8
-            elif fr >= 0.0015:
-                score -= 0.5
-        elif b == "SHORT":
-            if fr >= 0.0005:
-                score += 0.8
-            elif fr <= -0.0015:
-                score -= 0.5
+    # bonus if zscore extreme in favor
+    if funding_z is not None:
+        z = float(funding_z)
+        if b == "LONG" and z <= -1.6:
+            comp["crowding"] = max(comp["crowding"], 1)
+        if b == "SHORT" and z >= 1.6:
+            comp["crowding"] = max(comp["crowding"], 1)
 
-    # If clearly crowded risky, dampen a bit (avoid chasing crowded side)
-    cr = (crowding_regime or "").lower()
-    if "risky" in cr:
-        score -= 0.4
+    # basis contrarian
+    if basis_pct is not None:
+        bs = float(basis_pct)
+        if b == "LONG" and bs < -0.0006:
+            comp["crowding"] = max(comp["crowding"], 1)
+        if b == "SHORT" and bs > 0.0006:
+            comp["crowding"] = max(comp["crowding"], 1)
 
-    # clamp + convert to int (round)
-    score_i = int(round(score))
-    if score_i < 0:
-        score_i = 0
-    if score_i > 4:
-        score_i = 4
-    return score_i
+    # Orderbook: aligned imbalance
+    if ob_25bps is not None:
+        x = float(ob_25bps)
+        if b == "LONG" and x >= 0.12:
+            comp["orderbook"] = 1
+        if b == "SHORT" and x <= -0.12:
+            comp["orderbook"] = 1
+
+    total = int(comp["flow"] + comp["oi"] + comp["crowding"] + comp["orderbook"])
+    total = max(0, min(4, total))
+    meta["raw_components_sum"] = int(comp["flow"] + comp["oi"] + comp["crowding"] + comp["orderbook"])
+    return total, comp, meta
+
+
+def _classify_flow(cvd_slope: Optional[float], tape_5m: Optional[float]) -> str:
+    # prefer tape if available, fallback to cvd
+    if tape_5m is not None:
+        return _classify_tape(tape_5m)
+    if cvd_slope is None:
+        return "unknown"
+    x = float(cvd_slope)
+    if x >= 1.0:
+        return "strong_buy"
+    if x >= 0.2:
+        return "buy"
+    if x <= -1.0:
+        return "strong_sell"
+    if x <= -0.2:
+        return "sell"
+    return "neutral"
 
 
 # =====================================================================
 # API PRINCIPALE
 # =====================================================================
 
-async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[str, Any]:
-    """
-    Retourne un dict stable. Jamais crash.
 
-    Important:
-      - "available" = True si on a au moins 1 source exploitable (klines OR oi OR funding)
-      - "institutional_score" = [0..4]
+async def compute_full_institutional_analysis(symbol: str, bias: str, *, include_liquidations: bool = False) -> Dict[str, Any]:
+    """
+    Institutional analysis for a given symbol (Bitget/KuCoin format) using Binance USDT-M Futures.
+
+    Performance note (important for scanning):
+      - Stage 1 (always): openInterest + premiumIndex + aggTrades + depth
+      - Stage 2 (only if needed): klines (CVD) + oiHist + fundingHist
+      - Stage 3 (optional): liquidations (allForceOrders) if include_liquidations=True
+
+    If not mapped => available=False, score=0 (pipeline continues).
     """
     bias = (bias or "").upper()
+
     warnings: List[str] = []
+    binance_symbol: Optional[str] = None
 
     oi_value: Optional[float] = None
     oi_slope: Optional[float] = None
-    cvd_ratio: Optional[float] = None
+    oi_hist_slope: Optional[float] = None
+
+    cvd_slope: Optional[float] = None
+
     funding_rate: Optional[float] = None
+    funding_mean: Optional[float] = None
+    funding_std: Optional[float] = None
+    funding_z: Optional[float] = None
 
-    # 0) symbol list + mapping
-    try:
-        binance_symbols = await _get_binance_symbols()
+    basis_pct: Optional[float] = None
+
+    tape_1m: Optional[float] = None
+    tape_5m: Optional[float] = None
+
+    ob_10: Optional[float] = None
+    ob_25: Optional[float] = None
+
+    liq_intensity: Optional[float] = None
+    liq_bias: Optional[str] = None
+
+    async with aiohttp.ClientSession() as session:
+        # 0) symbols list
+        binance_symbols = await _get_binance_symbols(session)
         binance_symbol = _map_symbol_to_binance(symbol, binance_symbols)
-    except Exception as e:
-        binance_symbol = None
-        warnings.append(f"exchangeInfo_error:{e}")
 
-    if binance_symbol is None:
-        return {
-            "institutional_score": 0,
-            "binance_symbol": None,
-            "available": False,
-            "oi": None,
-            "oi_slope": None,
-            "cvd_slope": None,          # kept key for compatibility (we store ratio here)
-            "cvd_ratio": None,          # new explicit key
-            "funding_rate": None,
-            "funding_regime": "unknown",
-            "crowding_regime": "unknown",
-            "flow_regime": "unknown",
-            "warnings": warnings or ["symbol_not_mapped_to_binance"],
-        }
+        if binance_symbol is None:
+            return {
+                "institutional_score": 0,
+                "binance_symbol": None,
+                "available": False,
+                "oi": None,
+                "oi_slope": None,
+                "cvd_slope": None,
+                "funding_rate": None,
+                "funding_regime": "unknown",
+                "crowding_regime": "unknown",
+                "flow_regime": "unknown",
+                "warnings": ["symbol_not_mapped_to_binance"],
+            }
 
-    # 1) klines -> CVD ratio
-    try:
-        klines = await _fetch_klines_1h(binance_symbol, limit=140)
-        if not klines:
-            warnings.append("no_klines")
-            cvd_ratio = None
-        else:
-            cvd_ratio = _compute_cvd_ratio_from_klines(klines, window=40)
-            if cvd_ratio is None:
-                warnings.append("cvd_ratio_none")
-    except Exception as e:
-        warnings.append(f"klines_error:{e}")
-        cvd_ratio = None
+        # -------------------------
+        # Stage 1 (cheap, always)
+        # -------------------------
+        tasks1 = [
+            _fetch_open_interest(session, binance_symbol),
+            _fetch_premium_index(session, binance_symbol),
+            _fetch_agg_trades(session, binance_symbol, limit=1000),
+            _fetch_depth(session, binance_symbol, limit=100),
+        ]
+        oi_value, prem, trades, depth = await asyncio.gather(*tasks1, return_exceptions=True)
 
-    # 2) OI snapshot + slope (vs last snapshot)
-    try:
-        oi_value = await _fetch_open_interest(binance_symbol)
+        # Unwrap exceptions
+        if isinstance(oi_value, Exception):
+            warnings.append(f"oi_exc:{type(oi_value).__name__}")
+            oi_value = None
+        if isinstance(prem, Exception):
+            warnings.append(f"premium_exc:{type(prem).__name__}")
+            prem = None
+        if isinstance(trades, Exception):
+            warnings.append(f"trades_exc:{type(trades).__name__}")
+            trades = None
+        if isinstance(depth, Exception):
+            warnings.append(f"depth_exc:{type(depth).__name__}")
+            depth = None
+
+        # OI slope
         if oi_value is None:
             warnings.append("no_oi")
-            oi_slope = None
         else:
             oi_slope = _compute_oi_slope(binance_symbol, oi_value)
             _OI_HISTORY[binance_symbol] = (time.time(), float(oi_value))
-    except Exception as e:
-        warnings.append(f"oi_error:{e}")
-        oi_value = None
-        oi_slope = None
 
-    # 3) funding
-    try:
-        funding_data = await _fetch_funding(binance_symbol)
-        if funding_data is None:
-            warnings.append("no_funding")
-            funding_rate = None
-        else:
+        # PremiumIndex => funding + basis
+        if isinstance(prem, dict):
             try:
-                funding_rate = float(funding_data.get("lastFundingRate", "0") or 0.0)
+                funding_rate = float(prem.get("lastFundingRate", "0"))
             except Exception:
                 funding_rate = None
                 warnings.append("funding_parse_error")
-    except Exception as e:
-        warnings.append(f"funding_error:{e}")
-        funding_rate = None
 
-    funding_regime = _classify_funding(funding_rate)
-    crowding_regime = _classify_crowding(bias, funding_rate)
-    flow_regime = _classify_flow(cvd_ratio)
+            try:
+                mark = float(prem.get("markPrice", "0"))
+                index = float(prem.get("indexPrice", "0"))
+                if index > 0:
+                    basis_pct = (mark - index) / index
+            except Exception:
+                basis_pct = None
+        else:
+            warnings.append("no_premiumIndex")
 
-    # Score
-    inst_score = _score_institutional(
-        bias=bias,
+        # Tape delta
+        if isinstance(trades, list) and trades:
+            tape_1m = _compute_tape_delta(trades, window_sec=60)
+            tape_5m = _compute_tape_delta(trades, window_sec=300)
+        else:
+            warnings.append("no_trades")
+
+        # Orderbook imbalance
+        if isinstance(depth, dict):
+            ob_10 = _compute_orderbook_imbalance(depth, band_bps=10.0)
+            ob_25 = _compute_orderbook_imbalance(depth, band_bps=25.0)
+        else:
+            warnings.append("no_depth")
+
+        # Early scoring (without hist/cvd)
+        inst_score_early, comp_early, meta_early = _score_institutional(
+            bias,
+            oi_slope=oi_slope,
+            oi_hist_slope=None,
+            cvd_slope=None,
+            tape_5m=tape_5m,
+            funding_rate=funding_rate,
+            funding_z=None,
+            basis_pct=basis_pct,
+            ob_25bps=ob_25,
+        )
+
+        # Decide if we need Stage 2:
+        # - if early score already >=2
+        # - OR tape is strong (abs>=0.35) and ob supports -> good microstructure
+        strong_tape = tape_5m is not None and abs(float(tape_5m)) >= 0.35
+        strong_ob_support = ob_25 is not None and ((float(ob_25) >= 0.12) if bias == "LONG" else (float(ob_25) <= -0.12))
+        need_stage2 = not (inst_score_early >= 2 or (strong_tape and strong_ob_support))
+
+        klines = None
+        oi_hist = None
+        funding_hist = None
+        force_orders = None
+
+        if need_stage2:
+            tasks2 = [
+                _fetch_klines_1h(session, binance_symbol, limit=120),
+                _fetch_open_interest_hist(session, binance_symbol, period="5m", limit=30),
+                _fetch_funding_history(session, binance_symbol, limit=30),
+            ]
+            klines, oi_hist, funding_hist = await asyncio.gather(*tasks2, return_exceptions=True)
+
+            if isinstance(klines, Exception):
+                warnings.append(f"klines_exc:{type(klines).__name__}")
+                klines = None
+            if isinstance(oi_hist, Exception):
+                warnings.append(f"oi_hist_exc:{type(oi_hist).__name__}")
+                oi_hist = None
+            if isinstance(funding_hist, Exception):
+                warnings.append(f"funding_hist_exc:{type(funding_hist).__name__}")
+                funding_hist = None
+
+            if isinstance(klines, list) and klines:
+                cvd_slope = _compute_cvd_slope_from_klines(klines, window=40)
+            else:
+                warnings.append("no_klines")
+
+            if isinstance(oi_hist, list) and oi_hist:
+                oi_hist_slope = _compute_oi_hist_slope(oi_hist)
+            else:
+                warnings.append("no_oi_hist")
+
+            if isinstance(funding_hist, list) and funding_hist:
+                funding_mean, funding_std, funding_z = _compute_funding_stats(funding_hist)
+            else:
+                warnings.append("no_funding_hist")
+
+        # Stage 3 (optional)
+        if include_liquidations:
+            try:
+                force_orders = await _fetch_force_orders(session, binance_symbol, limit=50)
+            except Exception:
+                force_orders = None
+
+            if isinstance(force_orders, list) and force_orders:
+                liq_intensity, liq_bias = _compute_liquidation_intensity(force_orders, window_sec=900)
+            else:
+                warnings.append("no_force_orders")
+
+    funding_regime = _classify_funding(funding_rate, z=funding_z)
+    basis_regime = _classify_basis(basis_pct)
+    crowding_regime = _classify_crowding(bias, funding_rate, basis_pct, funding_z)
+    flow_regime = _classify_flow(cvd_slope, tape_5m)
+    ob_regime = _classify_orderbook(ob_25)
+
+    inst_score, components, score_meta = _score_institutional(
+        bias,
         oi_slope=oi_slope,
-        cvd_ratio=cvd_ratio,
+        oi_hist_slope=oi_hist_slope,
+        cvd_slope=cvd_slope,
+        tape_5m=tape_5m,
         funding_rate=funding_rate,
-        crowding_regime=crowding_regime,
+        funding_z=funding_z,
+        basis_pct=basis_pct,
+        ob_25bps=ob_25,
     )
 
-    available = any([
-        (oi_value is not None),
-        (cvd_ratio is not None),
-        (funding_rate is not None),
-    ])
+    # keep early meta for debugging
+    score_meta = dict(score_meta or {})
+    score_meta["early_score"] = int(inst_score_early)
+    score_meta["early_components"] = comp_early
+    score_meta["early_meta"] = meta_early
+
+    available = any(
+        [
+            oi_value is not None,
+            oi_hist_slope is not None,
+            cvd_slope is not None,
+            funding_rate is not None,
+            tape_5m is not None,
+            ob_25 is not None,
+        ]
+    )
 
     return {
+        # --- required ---
         "institutional_score": int(inst_score),
         "binance_symbol": binance_symbol,
         "available": bool(available),
         "oi": oi_value,
         "oi_slope": oi_slope,
-        # compatibility: old code reads cvd_slope -> we store ratio here
-        "cvd_slope": cvd_ratio,
-        "cvd_ratio": cvd_ratio,
+        "cvd_slope": cvd_slope,
         "funding_rate": funding_rate,
         "funding_regime": funding_regime,
         "crowding_regime": crowding_regime,
         "flow_regime": flow_regime,
         "warnings": warnings,
+
+        # --- extra (desk) ---
+        "oi_hist_slope": oi_hist_slope,
+        "tape_delta_1m": tape_1m,
+        "tape_delta_5m": tape_5m,
+        "tape_regime": _classify_tape(tape_5m),
+        "basis_pct": basis_pct,
+        "basis_regime": basis_regime,
+        "orderbook_imb_10bps": ob_10,
+        "orderbook_imb_25bps": ob_25,
+        "orderbook_regime": ob_regime,
+        "funding_mean": funding_mean,
+        "funding_std": funding_std,
+        "funding_z": funding_z,
+        "liquidation_intensity": liq_intensity,
+        "liquidation_bias": liq_bias,
+        "score_components": components,
+        "score_meta": score_meta,
     }
+
