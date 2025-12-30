@@ -36,6 +36,7 @@ from settings import (
     STOP_TRIGGER_TYPE_SL,
     BE_FEE_BUFFER_TICKS,
     POSITION_MODE,
+    MIN_INST_SCORE,  # ✅ hard gate
 )
 
 from bitget_client import get_client
@@ -67,6 +68,12 @@ MAX_CONCURRENT_ANALYZE = 6  # limite Binance/institutional
 
 TP1_CLOSE_PCT = 0.50
 WATCH_INTERVAL_S = 3.0
+
+# --------------------------
+# Institutional hard gate
+# --------------------------
+INST_HARD_GATE_SCORE = int(os.getenv("INST_HARD_GATE_SCORE", str(int(MIN_INST_SCORE))))
+ALLOW_INST_BYPASS = bool(int(os.getenv("ALLOW_INST_BYPASS", "0")))
 
 # Entry watcher policy
 # TTL before cancelling an unfilled entry order (seconds)
@@ -162,6 +169,11 @@ def _pending_serializable(state: Dict[str, Any]) -> Dict[str, Any]:
         "inst_score",
         "runner_monitor",
         "runner_qty",
+        "atr",
+        "pd_mid",
+        "last_price_ts",
+        "last_price",
+        "last_heavy_ts",
     ]
     out: Dict[str, Any] = {}
     for k in keep:
@@ -462,6 +474,35 @@ def _order_state(detail: Dict[str, Any]) -> str:
         return "unknown"
 
 
+def _order_filled_qty(detail: Dict[str, Any]) -> float:
+    """Best-effort filled qty extractor (handles partial fill cases)."""
+    try:
+        if not isinstance(detail, dict):
+            return 0.0
+        data = detail.get("data") or {}
+        keys = ("filledSize", "filledQty", "dealSize", "dealQuantity", "baseVolume", "accBaseVolume")
+        for k in keys:
+            v = data.get(k)
+            if v is None:
+                continue
+            q = _safe_float(v, 0.0)
+            if q > 0:
+                return q
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def _order_any_fill(trader: BitgetTrader, detail: Dict[str, Any]) -> bool:
+    """Treat 'filled' OR any positive filled qty as filled context (partial fill safety)."""
+    try:
+        if trader.is_filled(detail):
+            return True
+    except Exception:
+        pass
+    return _order_filled_qty(detail) > 0
+
+
 async def _get_tick_cached(trader: BitgetTrader, symbol: str) -> float:
     sym = str(symbol).upper()
     async with TICK_LOCK:
@@ -476,6 +517,7 @@ async def _get_tick_cached(trader: BitgetTrader, symbol: str) -> float:
         if t > 0:
             TICK_CACHE[sym] = t
     return t
+
 
 def _calc_atr14(df: pd.DataFrame, period: int = 14) -> float:
     """Compute ATR (simple rolling mean of TR) and return last value."""
@@ -510,15 +552,20 @@ def _pd_mid(df: pd.DataFrame, lookback: int = 80) -> float:
 
 
 def _entry_ttl_s(entry_type: str, setup: str) -> int:
+    """
+    TTL based primarily on entry_type (OTE/FVG/RAID/MARKET).
+    setup is a fallback (RAID/SWEEP setups).
+    """
     et = str(entry_type or "").upper()
     sp = str(setup or "").upper()
+
     if "MARKET" in et:
         return int(ENTRY_TTL_MARKET_S)
-    if "OTE" in sp:
+    if "OTE" in et:
         return int(ENTRY_TTL_OTE_S)
-    if "FVG" in sp:
+    if "FVG" in et:
         return int(ENTRY_TTL_FVG_S)
-    if "RAID" in sp or "SWEEP" in sp:
+    if ("RAID" in et) or ("RAID" in sp) or ("SWEEP" in sp):
         return int(ENTRY_TTL_RAID_S)
     return int(ENTRY_TTL_DEFAULT_S)
 
@@ -604,6 +651,52 @@ async def _invalidation_check(client, symbol: str, direction: str, entry_price: 
     return True, "", {"mid": mid}
 
 
+async def _risk_close_trade(trader: BitgetTrader, symbol: str, direction: str, reason: str, pnl_override: Optional[float] = None) -> None:
+    # kept from original
+    async def _fetch_last_closed_pnl():
+        sym = str(symbol).upper()
+        hold = "long" if str(direction).upper() == "LONG" else "short"
+        try:
+            resp = await trader.client._request(
+                "GET",
+                "/api/v2/mix/position/history-position",
+                params={
+                    "symbol": sym,
+                    "productType": trader.product_type,
+                    "limit": "20",
+                },
+                auth=True,
+            )
+        except Exception:
+            return 0.0
+
+        if not _is_ok(resp):
+            return 0.0
+
+        data = resp.get("data") or {}
+        lst = data.get("list") if isinstance(data, dict) else None
+        if not isinstance(lst, list):
+            return 0.0
+
+        for row in lst:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("holdSide") or "").lower() != hold:
+                continue
+            pnl = row.get("pnl")
+            if pnl is None:
+                pnl = row.get("netProfit")
+            return _safe_float(pnl, 0.0)
+        return 0.0
+
+    pnl = float(pnl_override) if pnl_override is not None else await _fetch_last_closed_pnl()
+    try:
+        RISK.register_closed(symbol, direction, pnl)
+    except Exception:
+        pass
+    desk_log(logging.INFO, "RISK_CLOSE", symbol, "-", side=direction, pnl=pnl, reason=reason)
+
+
 async def _cancel_pending_entry(
     trader: BitgetTrader,
     tid: str,
@@ -615,7 +708,6 @@ async def _cancel_pending_entry(
     sym = str(st.get("symbol") or "").upper()
     direction = str(st.get("direction") or "")
     try:
-        # Cancel entry order (best effort)
         oid = st.get("entry_order_id")
         coid = st.get("entry_client_oid")
         if oid or coid:
@@ -641,18 +733,10 @@ async def _cancel_pending_entry(
 
     await send_telegram(_mk_exec_msg("ENTRY_CANCEL", sym, tid, reason=reason, **kv))
 
-# =====================================================================
-# Position / PnL helpers (risk close + bootstrap)
-# =====================================================================
-
-def _hold_side(direction: str) -> str:
-    return "long" if str(direction).upper() == "LONG" else "short"
-
 
 async def _get_position_total(trader: BitgetTrader, symbol: str, direction: str) -> float:
-    """Return current position total (base units) for the requested side."""
     sym = str(symbol).upper()
-    hold = _hold_side(direction)
+    hold = "long" if str(direction).upper() == "LONG" else "short"
     try:
         resp = await trader.client._request(
             "GET",
@@ -676,7 +760,6 @@ async def _get_position_total(trader: BitgetTrader, symbol: str, direction: str)
     if not isinstance(data, list):
         return 0.0
 
-    # prefer side match
     for row in data:
         if not isinstance(row, dict):
             continue
@@ -687,114 +770,104 @@ async def _get_position_total(trader: BitgetTrader, symbol: str, direction: str)
         if tot != 0:
             return abs(tot)
 
-    # fallback: any total in the payload
     for row in data:
         if isinstance(row, dict):
             tot = _safe_float(row.get("total"), 0.0)
             if tot != 0:
                 return abs(tot)
 
-    # fallback single row
     if len(data) == 1 and isinstance(data[0], dict):
         return _safe_float(data[0].get("total"), 0.0)
 
     return 0.0
 
 
-async def _fetch_last_closed_pnl(trader: BitgetTrader, symbol: str, direction: str) -> float:
-    """Fetch last realized pnl for symbol+side from position history."""
+async def _cancel_protection_orders(trader: BitgetTrader, symbol: str, st: Dict[str, Any]) -> None:
     sym = str(symbol).upper()
-    hold = _hold_side(direction)
-    try:
-        resp = await trader.client._request(
-            "GET",
-            "/api/v2/mix/position/history-position",
-            params={
-                "symbol": sym,
-                "productType": trader.product_type,
-                "limit": "20",
-            },
-            auth=True,
-        )
-    except Exception:
-        return 0.0
 
-    if not _is_ok(resp):
-        return 0.0
-
-    data = resp.get("data") or {}
-    lst = data.get("list") if isinstance(data, dict) else None
-    if not isinstance(lst, list):
-        return 0.0
-
-    for row in lst:
-        if not isinstance(row, dict):
-            continue
-        if str(row.get("holdSide") or "").lower() != hold:
-            continue
-        pnl = row.get("pnl")
-        if pnl is None:
-            pnl = row.get("netProfit")
-        return _safe_float(pnl, 0.0)
-
-    return 0.0
-
-
-async def _risk_close_trade(trader: BitgetTrader, symbol: str, direction: str, reason: str, pnl_override: Optional[float] = None) -> None:
-    pnl = float(pnl_override) if pnl_override is not None else await _fetch_last_closed_pnl(trader, symbol, direction)
-    try:
-        RISK.register_closed(symbol, direction, pnl)
-    except Exception:
-        pass
-    desk_log(logging.INFO, "RISK_CLOSE", symbol, "-", side=direction, pnl=pnl, reason=reason)
-
-
-async def _bootstrap_risk_open_positions(trader: BitgetTrader) -> None:
-    """On boot, seed risk with existing exchange positions (so caps work after restart)."""
-    try:
-        resp = await trader.client._request(
-            "GET",
-            "/api/v2/mix/position/all-position",
-            params={
-                "productType": trader.product_type,
-                "marginCoin": trader.margin_coin,
-            },
-            auth=True,
-        )
-    except Exception as e:
-        logger.warning("[BOOT] risk bootstrap failed: %s", e)
-        return
-
-    if not _is_ok(resp):
-        return
-
-    data = resp.get("data") or []
-    if not isinstance(data, list):
-        return
-
-    added = 0
-    for row in data:
-        if not isinstance(row, dict):
-            continue
-        total = _safe_float(row.get("total"), 0.0)
-        if total <= 0:
-            continue
-        sym = str(row.get("symbol") or "").upper()
-        if not sym:
-            continue
-        hs = str(row.get("holdSide") or "").lower()
-        direction = "LONG" if hs == "long" else "SHORT"
-        mark = _safe_float(row.get("markPrice"), 0.0) or _safe_float(row.get("openPriceAvg"), 0.0)
-        notional = abs(total) * float(mark)
-        risk_used = RISK.risk_for_this_trade()
+    # cancel TP1 limit
+    tp1_id = st.get("tp1_order_id")
+    if tp1_id and tp1_id not in ("ok", ""):
         try:
-            RISK.register_open(sym, direction, notional, risk_used)
-            added += 1
+            await asyncio.wait_for(trader.cancel_order(sym, order_id=str(tp1_id), client_oid=None), timeout=ORDER_TIMEOUT_S)
         except Exception:
             pass
 
-    if added:
-        logger.info("[BOOT] risk bootstrap: registered %d open positions from exchange", added)
+    # cancel SL plan
+    sl_plan = st.get("sl_plan_id")
+    if sl_plan and sl_plan not in ("ok", ""):
+        try:
+            await asyncio.wait_for(trader.cancel_plan_orders(sym, [str(sl_plan)]), timeout=ORDER_TIMEOUT_S)
+        except Exception:
+            pass
+
+
+async def _emergency_flatten(
+    trader: BitgetTrader,
+    symbol: str,
+    tid: str,
+    direction: str,
+    qty: float,
+    reason: str,
+    **kv: Any,
+) -> None:
+    """
+    Best-effort flatten: place an aggressive reduce-only LIMIT close near last price.
+    (Works even if you don't have a native market-close helper in BitgetTrader.)
+    """
+    sym = str(symbol).upper()
+    direction = str(direction).upper()
+    close_side = _close_side_from_direction(direction)
+
+    # cancel protections first (avoid conflicts)
+    try:
+        await _cancel_protection_orders(trader, sym, kv.get("state") or {})
+    except Exception:
+        pass
+
+    last = await _get_last_price(trader, sym)
+    if last <= 0:
+        last = _safe_float(kv.get("last_price"), 0.0)
+
+    tick_meta = await _get_tick_cached(trader, sym)
+    tick_used = _sanitize_tick(sym, float(last or 1.0), tick_meta, tid)
+
+    # aggressive price (cross spread)
+    slip = max(5.0 * tick_used, float(last) * 0.001) if last > 0 else 5.0 * tick_used
+    px_raw = (float(last) - slip) if direction == "LONG" else (float(last) + slip)
+    px_q = _q_entry(px_raw, tick_used, close_side)
+
+    qty_use = float(qty or 0.0)
+    if qty_use <= 0:
+        # fallback from position
+        pos_total = await _get_position_total(trader, sym, direction)
+        if pos_total > 0:
+            qty_use = float(pos_total)
+
+    if qty_use <= 0:
+        await send_telegram(_mk_exec_msg("FLATTEN_FAIL", sym, tid, reason=reason, err="no_qty", **kv))
+        return
+
+    try:
+        resp = await asyncio.wait_for(
+            trader.place_limit(
+                symbol=sym,
+                side=close_side.lower(),
+                price=px_q,
+                size=qty_use,
+                client_oid=_oid("flat", tid, 0),
+                trade_side="close",
+                reduce_only=True,
+                tick_hint=tick_used,
+                debug_tag="FLATTEN",
+            ),
+            timeout=ORDER_TIMEOUT_S,
+        )
+    except Exception as e:
+        resp = {"code": "EXC", "msg": str(e)}
+
+    desk_log(logging.WARNING, "FLATTEN", sym, tid, reason=reason, price=px_q, qty=qty_use, code=resp.get("code"), msg=resp.get("msg"))
+    await send_telegram(_mk_exec_msg("FLATTEN", sym, tid, reason=reason, price=px_q, qty=qty_use, code=resp.get("code"), msg=resp.get("msg"), **kv))
 
 
 # =====================================================================
@@ -903,6 +976,15 @@ async def analyze_symbol(sym: str, client, analyze_sem: asyncio.Semaphore, stats
         comp = result.get("composite") or {}
         comp_score = float(comp.get("score") or result.get("composite_score") or 0.0)
 
+        # ✅ HARD GATE: institutional first
+        if (not ALLOW_INST_BYPASS) and (inst_score_eff < int(INST_HARD_GATE_SCORE)):
+            await stats.inc("rejects", 1)
+            await stats.add_reason("inst_hard_gate")
+            if await stats.take_reject_debug_slot():
+                desk_log(logging.INFO, "REJ", sym, tid, fetch_ms=fetch_ms, analyze_ms=analyze_ms,
+                         reason="inst_hard_gate", inst=inst_score_eff, gate=INST_HARD_GATE_SCORE)
+            return None
+
         desk_log(logging.INFO, "EXITS", sym, tid, side=side, entry=entry, sl=sl, tp1=tp1, rr=rr,
                  setup=setup, entry_type=entry_type, inst=inst_score_eff, comp=comp_score, fetch_ms=fetch_ms, analyze_ms=analyze_ms)
 
@@ -926,7 +1008,7 @@ async def analyze_symbol(sym: str, client, analyze_sem: asyncio.Semaphore, stats
         mid_pd = _pd_mid(df_h1, 80)
 
         fp_alert = make_fingerprint(
-            sym, side, q_entry_fp, q_sl_fp, q_tp1_fp,
+            str(sym).upper(), side, q_entry_fp, q_sl_fp, q_tp1_fp,
             extra=f"{setup}|{entry_type}|{pos_mode}",
             precision=10
         )
@@ -997,9 +1079,14 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     entry_type = str(candidate.get("entry_type") or "MARKET")
     inst_score = int(candidate.get("inst_score") or 0)
 
+    # ✅ safety: enforce inst gate again (in case someone calls execute_candidate directly)
+    if (not ALLOW_INST_BYPASS) and inst_score < int(INST_HARD_GATE_SCORE):
+        await stats.add_reason("exec_skip:inst_hard_gate")
+        await send_telegram(_mk_exec_msg("EXEC_SKIPPED", sym, tid, reason="inst_hard_gate", inst=inst_score, gate=INST_HARD_GATE_SCORE))
+        return
+
     notional = float(MARGIN_USDT) * float(LEVERAGE)
     post_only_entry = str(entry_type).upper() != "MARKET"
-
 
     # avoid stacking same symbol+direction while a previous trade is still pending/managed
     try:
@@ -1144,7 +1231,6 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     except Exception:
         pass
 
-
     # mark trade dedup ONLY after entry accepted
     TRADE_GUARD.mark(fp_trade)
 
@@ -1223,9 +1309,10 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                 if not sym:
                     continue
 
+                now = time.time()
+
                 direction = str(st.get("direction") or "")
-                # Always recompute (older pending_state.json may contain the legacy opposite side)
-                close_side = _close_side_from_direction(direction)
+                close_side = _close_side_from_direction(direction)  # recompute (safety)
                 pos_mode = str(st.get("pos_mode") or "one_way")
 
                 entry = float(st.get("entry") or 0.0)
@@ -1235,12 +1322,23 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                 qty_step = float(st.get("qty_step") or 1.0)
                 min_qty = float(st.get("min_qty") or 0.0)
 
+                # ---- quick price refresh (runaway logic)
+                last_price_ts = float(st.get("last_price_ts") or 0.0)
+                if (now - last_price_ts) >= float(PRICE_CHECK_INTERVAL_S):
+                    px = await _get_last_price(trader, sym)
+                    if px > 0:
+                        st["last_price"] = float(px)
+                        st["last_price_ts"] = now
+                        dirty = True
+
+                last_price = float(st.get("last_price") or 0.0)
+
                 last_fail = float(st.get("last_arm_fail_ts") or 0.0)
-                if last_fail > 0 and (time.time() - last_fail) < ARM_COOLDOWN_S:
+                if last_fail > 0 and (now - last_fail) < ARM_COOLDOWN_S:
                     continue
 
                 freeze_until = float(st.get("freeze_until") or 0.0)
-                if freeze_until > time.time():
+                if freeze_until > now:
                     continue
                 if freeze_until > 0:
                     st["freeze_until"] = 0.0
@@ -1250,9 +1348,9 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                 if attempts >= ARM_MAX_ATTEMPTS:
                     freeze_s = int(os.getenv("ARM_FREEZE_SECONDS", "900"))
                     freeze_s = max(60, int(freeze_s))
-                    st["freeze_until"] = time.time() + float(freeze_s)
+                    st["freeze_until"] = now + float(freeze_s)
                     st["arm_attempts"] = 0
-                    st["last_arm_fail_ts"] = time.time()
+                    st["last_arm_fail_ts"] = now
                     desk_log(logging.ERROR, "ARM_FREEZE", sym, tid, attempts=attempts, freeze_s=freeze_s)
                     dirty = True
                     await send_telegram(_mk_exec_msg("ARM_FREEZE", sym, tid, attempts=attempts, freeze_s=freeze_s))
@@ -1269,7 +1367,12 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         await send_telegram(_mk_exec_msg("DONE", sym, tid, reason="position_closed"))
                     continue
 
+                # ==========================================================
+                # PRE-FILL WATCH (cancel if no pullback / runaway / invalid)
+                # ==========================================================
                 if not bool(st.get("armed", False)):
+
+                    # Always check order detail first (avoids cancelling right on fill)
                     try:
                         detail = await asyncio.wait_for(
                             trader.get_order_detail(sym, order_id=st.get("entry_order_id"), client_oid=st.get("entry_client_oid")),
@@ -1277,16 +1380,16 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         )
                     except Exception as e:
                         st["arm_attempts"] = attempts + 1
-                        st["last_arm_fail_ts"] = time.time()
+                        st["last_arm_fail_ts"] = now
                         desk_log(logging.WARNING, "ARM", sym, tid, step="detail_exc", err=str(e))
                         dirty = True
                         continue
 
                     state = _order_state(detail)
+
                     if state in {"cancelled", "canceled", "rejected", "fail", "failed", "expired"}:
                         desk_log(logging.WARNING, "ARM_DROP", sym, tid, reason=f"entry_state={state}")
 
-                        # risk cleanup: entry cancelled / rejected
                         if bool(st.get("risk_confirmed", False)):
                             await _risk_close_trade(trader, sym, direction, reason=f"entry_state={state}", pnl_override=0.0)
                         else:
@@ -1300,17 +1403,97 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         dirty = True
                         continue
 
-                    if not trader.is_filled(detail):
+                    # Not filled yet → TTL/runaway/structure invalidation
+                    if not _order_any_fill(trader, detail):
+                        created_ts = float(st.get("created_ts") or now)
+                        age = now - created_ts
+
+                        ttl = _entry_ttl_s(str(st.get("entry_type") or "MARKET"), str(st.get("setup") or ""))
+                        if age >= float(ttl):
+                            await _cancel_pending_entry(trader, tid, st, reason="ttl_no_pullback", age=age, ttl=ttl, state=state)
+                            dirty = True
+                            continue
+
+                        # runaway cancel (prevents chasing if price runs away)
+                        atr = float(st.get("atr") or 0.0)
+                        if atr > 0 and last_price > 0:
+                            mult = float(_runaway_mult(str(st.get("entry_type") or "MARKET")))
+                            dist_ok = True
+                            if str(direction).upper() == "LONG":
+                                # price moved too high above entry
+                                if (last_price - entry) >= (mult * atr):
+                                    dist_ok = False
+                            else:
+                                # price moved too low below entry
+                                if (entry - last_price) >= (mult * atr):
+                                    dist_ok = False
+
+                            if not dist_ok:
+                                await _cancel_pending_entry(
+                                    trader, tid, st,
+                                    reason="runaway_no_pullback",
+                                    last_price=last_price,
+                                    entry=entry,
+                                    atr=atr,
+                                    mult=mult,
+                                )
+                                dirty = True
+                                continue
+
+                        # heavy structure invalidation check (throttled)
+                        last_heavy = float(st.get("last_heavy_ts") or 0.0)
+                        if (now - last_heavy) >= float(HEAVY_CHECK_INTERVAL_S):
+                            ok, why, meta = await _invalidation_check(trader.client, sym, direction, entry)
+                            st["last_heavy_ts"] = now
+                            dirty = True
+                            if not ok:
+                                await _cancel_pending_entry(trader, tid, st, reason=why, **(meta or {}))
+                                dirty = True
+                                continue
+
+                        continue  # still pending
+
+                    # If partially filled: cancel remaining entry (safety)
+                    filled_qty = _order_filled_qty(detail)
+                    if filled_qty > 0 and (not trader.is_filled(detail)):
+                        try:
+                            await asyncio.wait_for(trader.cancel_order(sym, order_id=st.get("entry_order_id"), client_oid=st.get("entry_client_oid")), timeout=ORDER_TIMEOUT_S)
+                        except Exception:
+                            pass
+
+                    # ==========================================================
+                    # POST-FILL HARD CONFIRM (structure)
+                    # ==========================================================
+                    ok, why, meta = await _invalidation_check(trader.client, sym, direction, entry)
+                    if not ok:
+                        # flatten immediately, free risk, remove pending
+                        await _emergency_flatten(
+                            trader,
+                            sym,
+                            tid,
+                            direction,
+                            qty=float(filled_qty or st.get("qty_total") or 0.0),
+                            reason=why,
+                            last_price=last_price,
+                            **(meta or {}),
+                        )
+                        await _risk_close_trade(trader, sym, direction, reason=f"postfill_{why}", pnl_override=0.0)
+                        async with PENDING_LOCK:
+                            PENDING.pop(tid, None)
+                        dirty = True
                         continue
 
+                    # ==========================================================
+                    # ARM (place SL / TP1) - original logic continues
+                    # ==========================================================
                     qty_total = float(st.get("qty_total") or 0.0)
                     if qty_total <= 0:
                         data = (detail.get("data") or {})
-                        qty_total = float(data.get("size") or data.get("quantity") or data.get("qty") or 0.0)
+                        qty_total = float(data.get("size") or data.get("quantity") or data.get("qty") or filled_qty or 0.0)
 
                     if qty_total <= 0:
                         st["arm_attempts"] = attempts + 1
-                        st["last_arm_fail_ts"] = time.time()
+                        st["last_arm_fail_ts"] = now
                         desk_log(logging.WARNING, "ARM", sym, tid, step="no_qty_from_fill")
                         dirty = True
                         continue
@@ -1319,7 +1502,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     pos_total = await _get_position_total(trader, sym, direction)
                     if pos_total == 0:
                         desk_log(logging.INFO, "ARM_WAIT_POS", sym, tid, step="pos_not_ready")
-                        st["last_arm_fail_ts"] = time.time()
+                        st["last_arm_fail_ts"] = now
                         dirty = True
                         continue
                     if pos_total > 0:
@@ -1381,14 +1564,13 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                         if not _is_ok(sl_resp):
                             code2 = str(sl_resp.get("code", ""))
-                            # 22002 = No position to close -> wait for position visibility
                             if code2 == "22002":
-                                st["last_arm_fail_ts"] = time.time()
+                                st["last_arm_fail_ts"] = now
                                 dirty = True
                                 desk_log(logging.WARNING, "SL_WAIT_POS", sym, tid, code=code2, msg=sl_resp.get("msg"))
                                 continue
                             st["arm_attempts"] = attempts + 1
-                            st["last_arm_fail_ts"] = time.time()
+                            st["last_arm_fail_ts"] = now
                             desk_log(logging.ERROR, "SL_FAIL", sym, tid, code=sl_resp.get("code"), msg=sl_resp.get("msg"), dbg=sl_resp.get("_debug"))
                             await send_telegram(_mk_exec_msg("SL_FAIL", sym, tid, code=sl_resp.get("code"), msg=sl_resp.get("msg")))
                             continue
@@ -1402,7 +1584,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         dirty = True
                         await send_telegram(_mk_exec_msg("SL_OK", sym, tid, sl=q_sl, planId=sl_plan_id))
 
-                    # 2) TP1  (tradeSide=close)
+                    # 2) TP1
                     if not st.get("tp1_order_id") and (not bool(st.get("tp1_inflight", False))):
                         st["tp1_inflight"] = True
                         dirty = True
@@ -1430,9 +1612,8 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                         code = str(tp1_resp.get("code", ""))
 
-                        # Soft-handle: position not ready yet (avoid spam)
                         if (not _is_ok(tp1_resp)) and code == "22002":
-                            st["last_arm_fail_ts"] = time.time()
+                            st["last_arm_fail_ts"] = now
                             dirty = True
                             desk_log(logging.WARNING, "TP1_WAIT_POS", sym, tid, code=code, msg=tp1_resp.get("msg"))
                             continue
@@ -1455,13 +1636,13 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                             st["qty_tp1"] = req_qty2
                             st["qty_rem"] = rem2
                             st["arm_attempts"] = attempts + 1
-                            st["last_arm_fail_ts"] = time.time()
+                            st["last_arm_fail_ts"] = now
                             dirty = True
                             continue
 
                         if not _is_ok(tp1_resp):
                             st["arm_attempts"] = attempts + 1
-                            st["last_arm_fail_ts"] = time.time()
+                            st["last_arm_fail_ts"] = now
                             dirty = True
                             desk_log(logging.ERROR, "TP1_FAIL", sym, tid, code=tp1_resp.get("code"), msg=tp1_resp.get("msg"), dbg=tp1_resp.get("_debug"))
                             await send_telegram(_mk_exec_msg("TP1_FAIL", sym, tid, code=tp1_resp.get("code"), msg=tp1_resp.get("msg")))
@@ -1477,8 +1658,35 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         dirty = True
                     continue
 
-                # Phase 2: BE after TP1 filled
+                # ==========================================================
+                # POST-ARM WATCH (structure can invalidate → flatten)
+                # ==========================================================
                 if bool(st.get("armed", False)) and (not bool(st.get("be_done", False))):
+                    # heavy invalidation check (throttled)
+                    last_heavy = float(st.get("last_heavy_ts") or 0.0)
+                    if (now - last_heavy) >= float(HEAVY_CHECK_INTERVAL_S):
+                        ok, why, meta = await _invalidation_check(trader.client, sym, direction, entry)
+                        st["last_heavy_ts"] = now
+                        dirty = True
+                        if not ok:
+                            # cancel SL/TP1 then flatten
+                            await _cancel_protection_orders(trader, sym, st)
+                            await _emergency_flatten(
+                                trader,
+                                sym,
+                                tid,
+                                direction,
+                                qty=float(st.get("qty_total") or 0.0),
+                                reason=f"armed_{why}",
+                                last_price=last_price,
+                                **(meta or {}),
+                            )
+                            await _risk_close_trade(trader, sym, direction, reason=f"armed_{why}", pnl_override=0.0)
+                            async with PENDING_LOCK:
+                                PENDING.pop(tid, None)
+                            dirty = True
+                            continue
+
                     # If position already closed (SL/manual), finalize and free risk
                     pos_total = await _get_position_total(trader, sym, direction)
                     if pos_total >= 0 and pos_total <= 0:
@@ -1489,7 +1697,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         await send_telegram(_mk_exec_msg("DONE", sym, tid, reason="position_closed"))
                         continue
 
-
+                    # ---- original TP1->BE logic (unchanged) ----
                     tp1_order_id = st.get("tp1_order_id")
                     if not tp1_order_id or tp1_order_id == "ok":
                         continue
@@ -1497,7 +1705,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     try:
                         tp1_detail = await asyncio.wait_for(trader.get_order_detail(sym, order_id=tp1_order_id), timeout=DETAIL_TIMEOUT_S)
                     except Exception as e:
-                        st["last_arm_fail_ts"] = time.time()
+                        st["last_arm_fail_ts"] = now
                         dirty = True
                         desk_log(logging.WARNING, "BE", sym, tid, step="tp1_detail_exc", err=str(e))
                         continue
@@ -1552,7 +1760,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         sl_be_resp = {"code": "EXC", "msg": str(e)}
 
                     if not _is_ok(sl_be_resp):
-                        st["last_arm_fail_ts"] = time.time()
+                        st["last_arm_fail_ts"] = now
                         dirty = True
                         await send_telegram(_mk_exec_msg("BE_FAIL", sym, tid, code=sl_be_resp.get("code"), msg=sl_be_resp.get("msg")))
                         continue
@@ -1623,7 +1831,6 @@ async def scan_once(client, trader: BitgetTrader) -> None:
     async def _worker(sym: str):
         return await analyze_symbol(sym, client, analyze_sem, stats, macro_ctx)
 
-
     results = await asyncio.gather(*[_worker(sym) for sym in symbols], return_exceptions=True)
 
     candidates: List[Dict[str, Any]] = []
@@ -1656,7 +1863,6 @@ async def scan_once(client, trader: BitgetTrader) -> None:
     elif ALERT_MODE == "NONE":
         alert_list = []
     else:
-        # fallback safe
         alert_list = ranked[: max(0, int(MAX_ALERTS_PER_SCAN))]
 
     # Send alerts sequentially (no race)
@@ -1723,6 +1929,53 @@ async def scan_once(client, trader: BitgetTrader) -> None:
     )
 
 
+async def _bootstrap_risk_open_positions(trader: BitgetTrader) -> None:
+    try:
+        resp = await trader.client._request(
+            "GET",
+            "/api/v2/mix/position/all-position",
+            params={
+                "productType": trader.product_type,
+                "marginCoin": trader.margin_coin,
+            },
+            auth=True,
+        )
+    except Exception as e:
+        logger.warning("[BOOT] risk bootstrap failed: %s", e)
+        return
+
+    if not _is_ok(resp):
+        return
+
+    data = resp.get("data") or []
+    if not isinstance(data, list):
+        return
+
+    added = 0
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        total = _safe_float(row.get("total"), 0.0)
+        if total <= 0:
+            continue
+        sym = str(row.get("symbol") or "").upper()
+        if not sym:
+            continue
+        hs = str(row.get("holdSide") or "").lower()
+        direction = "LONG" if hs == "long" else "SHORT"
+        mark = _safe_float(row.get("markPrice"), 0.0) or _safe_float(row.get("openPriceAvg"), 0.0)
+        notional = abs(total) * float(mark)
+        risk_used = RISK.risk_for_this_trade()
+        try:
+            RISK.register_open(sym, direction, notional, risk_used)
+            added += 1
+        except Exception:
+            pass
+
+    if added:
+        logger.info("[BOOT] risk bootstrap: registered %d open positions from exchange", added)
+
+
 async def start_scanner() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 
@@ -1730,7 +1983,8 @@ async def start_scanner() -> None:
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         await send_telegram(
-            f"✅ *Bot démarré* \\(ALERT_MODE={_tg_escape(ALERT_MODE)} MAX_ALERTS_PER_SCAN={MAX_ALERTS_PER_SCAN} MAX_ORDERS_PER_SCAN={MAX_ORDERS_PER_SCAN}\\)"
+            f"✅ *Bot démarré* \\(ALERT_MODE={_tg_escape(ALERT_MODE)} MAX_ALERTS_PER_SCAN={MAX_ALERTS_PER_SCAN} MAX_ORDERS_PER_SCAN={MAX_ORDERS_PER_SCAN}\\)\n"
+            f"inst_gate: `{_tg_escape(str(INST_HARD_GATE_SCORE))}` bypass: `{_tg_escape(str(int(ALLOW_INST_BYPASS)))}`"
         )
     else:
         logger.warning("Telegram disabled: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
@@ -1749,8 +2003,8 @@ async def start_scanner() -> None:
     _ensure_watcher(trader)
 
     logger.info(
-        "🚀 Scanner started | interval=%s min | dry_run=%s | max_orders_per_scan=%s | alert_mode=%s | max_alerts_per_scan=%s",
-        SCAN_INTERVAL_MIN, DRY_RUN, MAX_ORDERS_PER_SCAN, ALERT_MODE, MAX_ALERTS_PER_SCAN
+        "🚀 Scanner started | interval=%s min | dry_run=%s | max_orders_per_scan=%s | alert_mode=%s | max_alerts_per_scan=%s | inst_gate=%s bypass=%s",
+        SCAN_INTERVAL_MIN, DRY_RUN, MAX_ORDERS_PER_SCAN, ALERT_MODE, MAX_ALERTS_PER_SCAN, INST_HARD_GATE_SCORE, int(ALLOW_INST_BYPASS)
     )
 
     while True:
