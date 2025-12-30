@@ -1,4 +1,3 @@
-
 # =====================================================================
 # institutional_data.py — Ultra Desk OI + CVD + Tape + Orderbook Engine
 #   (Binance USDT-M Futures, free endpoints only)
@@ -63,6 +62,7 @@ _FUNDING_HIST_CACHE: Dict[str, Tuple[float, Any]] = {}
 _OI_CACHE: Dict[str, Tuple[float, Any]] = {}
 _OI_HIST_CACHE: Dict[str, Tuple[float, Any]] = {}
 _FORCE_CACHE: Dict[str, Tuple[float, Any]] = {}
+_LSR_CACHE: Dict[Tuple[str, str, str, int], Tuple[float, Any]] = {}
 
 # Last OI snapshot for slope
 _OI_HISTORY: Dict[str, Tuple[float, float]] = {}
@@ -916,6 +916,24 @@ async def compute_full_institutional_analysis(symbol: str, bias: str, *, include
             except Exception:
                 funding_rate = None
                 warnings.append("funding_parse_error")
+
+
+        # fetch ratios (best effort)
+        try:
+            lsr_g = await _fetch_lsr(session, "/futures/data/globalLongShortAccountRatio", binance_symbol, period="1h", limit=30)
+            lsr_global_last, lsr_global_slope = _extract_lsr_stats(lsr_g)
+        except Exception:
+            pass
+        try:
+            lsr_t = await _fetch_lsr(session, "/futures/data/topLongShortAccountRatio", binance_symbol, period="1h", limit=30)
+            lsr_top_last, lsr_top_slope = _extract_lsr_stats(lsr_t)
+        except Exception:
+            pass
+        try:
+            tk = await _fetch_lsr(session, "/futures/data/takerlongshortRatio", binance_symbol, period="1h", limit=30)
+            taker_ls_last, taker_ls_slope = _extract_lsr_stats(tk)
+        except Exception:
+            pass
 
             try:
                 mark = float(prem.get("markPrice", "0"))
