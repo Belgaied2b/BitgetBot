@@ -524,6 +524,7 @@ class BitgetTrader:
         client_oid: Optional[str] = None,
         trade_side: str = "open",
         reduce_only: bool = False,
+        post_only: bool = False,
         tick_hint: Optional[float] = None,
         debug_tag: str = "ENTRY",
     ) -> Dict[str, Any]:
@@ -555,7 +556,10 @@ class BitgetTrader:
             "price": price_str,
             "side": s,
             "orderType": "limit",
-            "timeInForceValue": "normal",
+            # Bitget v2 expects `force` (gtc / post_only / ioc ...). We also keep
+            # `timeInForceValue` for backward compatibility with older payloads.
+            "force": "post_only" if post_only else "gtc",
+            "timeInForceValue": "post_only" if post_only else "normal",
             "clientOid": oid,
             "tradeSide": (trade_side or "open").lower(),
         }
@@ -810,6 +814,26 @@ class BitgetTrader:
             resp["qty"] = float(q_qty)
             resp["_debug"] = {"debug_tag": debug_tag, "trigger_str": trig_str, "tick_used": float(tick_used), "clientOid": oid}
         return resp
+
+    
+    async def cancel_order(
+        self,
+        symbol: str,
+        order_id: Optional[str] = None,
+        client_oid: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Cancel a normal (non-plan) order by orderId or clientOid."""
+        sym = self._symbol(symbol)
+        payload: Dict[str, Any] = {
+            "symbol": sym,
+            "productType": self.product_type,
+            "marginCoin": self.margin_coin,
+        }
+        if order_id:
+            payload["orderId"] = str(order_id)
+        if client_oid:
+            payload["clientOid"] = str(client_oid)
+        return await self._call("POST", "/api/v2/mix/order/cancel-order", payload=payload, auth=True, timeout=6)
 
     async def cancel_plan_orders(self, symbol: str, order_ids: List[str]) -> Dict[str, Any]:
         sym = (symbol or "").upper()
