@@ -45,79 +45,13 @@ LOGGER = logging.getLogger(__name__)
 
 REQUIRED_COLS = ("open", "high", "low", "close", "volume")
 
-# =====================================================================
-# Institutional hard gate policy (prio #1)
-#  - gate by "2/3 indicators OK" (OI/Funding/CVD) OR by eff score, whichever is higher
-#  - RR gate is enforced later at setup selection (INST_PRIORITY)
-# =====================================================================
-
-INST_MIN_OK = int(os.getenv("INST_MIN_OK", "2"))          # 2 indicateurs sur 3
-RR_MIN_INST = float(os.getenv("RR_MIN_INST", "1.2"))      # RR minimal pour setup "INST_PRIORITY"
-
-
-def _inst_ok_count(inst: Dict[str, Any]) -> int:
-    """
-    Compte combien de signaux institutionnels (OI/Funding/CVD) sont OK.
-    Supporte plusieurs formats de retour (components, flags au top-level, etc.)
-    """
-    if not isinstance(inst, dict):
-        return 0
-
-    comps = inst.get("components")
-    comps = comps if isinstance(comps, dict) else {}
-
-    def _b(v: Any) -> Optional[bool]:
-        if v is None:
-            return None
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, (int, float)):
-            return bool(int(v))
-        s = str(v).strip().lower()
-        if s in ("true", "yes", "ok", "1"):
-            return True
-        if s in ("false", "no", "ko", "0"):
-            return False
-        return None
-
-    oi_ok = _b(inst.get("oi_ok"))
-    if oi_ok is None:
-        oi_ok = _b(comps.get("oi_ok"))
-    if oi_ok is None:
-        oi_ok = _b(inst.get("open_interest_ok") or inst.get("openInterest_ok") or inst.get("openInterestOk"))
-    if oi_ok is None:
-        oi_ok = _b(comps.get("open_interest_ok") or comps.get("openInterest_ok") or comps.get("openInterestOk"))
-
-    fund_ok = _b(inst.get("funding_ok"))
-    if fund_ok is None:
-        fund_ok = _b(comps.get("funding_ok"))
-    if fund_ok is None:
-        fund_ok = _b(inst.get("funding_rate_ok") or inst.get("fundingRate_ok") or inst.get("fundingRateOk"))
-    if fund_ok is None:
-        fund_ok = _b(comps.get("funding_rate_ok") or comps.get("fundingRate_ok") or comps.get("fundingRateOk"))
-
-    cvd_ok = _b(inst.get("cvd_ok"))
-    if cvd_ok is None:
-        cvd_ok = _b(comps.get("cvd_ok"))
-    if cvd_ok is None:
-        cvd_ok = _b(inst.get("delta_ok") or inst.get("cvd_delta_ok"))
-    if cvd_ok is None:
-        cvd_ok = _b(comps.get("delta_ok") or comps.get("cvd_delta_ok"))
-
-    n = 0
-    if oi_ok is True:
-        n += 1
-    if fund_ok is True:
-        n += 1
-    if cvd_ok is True:
-        n += 1
-    return n
+# Optional: allow technical fallback if Binance is banned/down (default False)
+ALLOW_TECH_FALLBACK_WHEN_INST_DOWN = str(os.getenv("ALLOW_TECH_FALLBACK_WHEN_INST_DOWN", "0")).strip() == "1"
 
 
 # =====================================================================
 # Base helpers
 # =====================================================================
-
 def _ensure_ohlcv(df: pd.DataFrame) -> bool:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return False
@@ -169,10 +103,8 @@ def compute_premium_discount(df: pd.DataFrame, lookback: int = 80) -> Tuple[bool
 
 
 # =====================================================================
-# Composite momentum helpers (score direction-aware)
-#   - composite_score is in [0..100] with 0=strong bearish, 100=strong bullish.
+# Composite helpers
 # =====================================================================
-
 def _composite_bias_ok(bias: str, score: float, label: str, thr: float = 65.0) -> bool:
     try:
         b = (bias or "").upper()
@@ -180,25 +112,33 @@ def _composite_bias_ok(bias: str, score: float, label: str, thr: float = 65.0) -
         lab = str(label or "").upper()
 
         if b == "LONG":
-            # bullish = high score
             return (s >= thr) or ("BULL" in lab and s >= (thr - 5.0))
         if b == "SHORT":
-            # bearish = low score
             return (s <= (100.0 - thr)) or ("BEAR" in lab and s <= (100.0 - thr + 5.0))
         return False
     except Exception:
         return False
 
 
-def _composite_bias_fallback(score: float, label: str) -> Optional[str]:
-    """Fallback bias when structure trend is RANGE and REQUIRE_STRUCTURE=False."""
+def _composite_bias_fallback(score: float, label: str, mom: str) -> Optional[str]:
+    """
+    More permissive fallback to reduce `no_bias_fallback_for_inst`.
+    """
     try:
         s = float(score)
         lab = str(label or "").upper()
+        m = str(mom or "").upper()
 
-        if (s >= 60.0) or ("BULL" in lab and s >= 55.0):
+        # hard momentum wins
+        if m in ("STRONG_BULLISH", "BULLISH"):
             return "LONG"
-        if (s <= 40.0) or ("BEAR" in lab and s <= 45.0):
+        if m in ("STRONG_BEARISH", "BEARISH"):
+            return "SHORT"
+
+        # composite
+        if (s >= 58.0) or ("BULL" in lab and s >= 55.0):
+            return "LONG"
+        if (s <= 42.0) or ("BEAR" in lab and s <= 45.0):
             return "SHORT"
         return None
     except Exception:
@@ -213,11 +153,11 @@ def _safe_rr(entry: float, sl: float, tp1: float, bias: str) -> Optional[float]:
         if not (np.isfinite(entry) and np.isfinite(sl) and np.isfinite(tp1)):
             return None
 
-        bias = (bias or "").upper()
-        if bias == "LONG":
+        b = (bias or "").upper()
+        if b == "LONG":
             risk = entry - sl
             reward = tp1 - entry
-        elif bias == "SHORT":
+        elif b == "SHORT":
             risk = sl - entry
             reward = entry - tp1
         else:
@@ -267,11 +207,11 @@ def _entry_pullback_ok(entry: float, entry_mkt: float, bias: str, atr: float) ->
             return True
         entry = float(entry)
         entry_mkt = float(entry_mkt)
-        bias = (bias or "").upper()
+        b = (bias or "").upper()
 
-        if bias == "LONG":
+        if b == "LONG":
             return (entry_mkt - entry) >= 0.25 * atr
-        if bias == "SHORT":
+        if b == "SHORT":
             return (entry - entry_mkt) >= 0.25 * atr
         return True
     except Exception:
@@ -281,7 +221,6 @@ def _entry_pullback_ok(entry: float, entry_mkt: float, bias: str, atr: float) ->
 # =====================================================================
 # Zone parsing / FVG entry
 # =====================================================================
-
 def _parse_zone_bounds(z: Dict[str, Any]) -> Optional[Tuple[float, float, str]]:
     try:
         a = z.get("low")
@@ -319,7 +258,7 @@ def _pick_fvg_entry(
 
     best_mid = None
     best_dist = 1e18
-    bias = (bias or "").upper()
+    b = (bias or "").upper()
 
     for z in zones:
         parsed = _parse_zone_bounds(z)
@@ -327,16 +266,13 @@ def _pick_fvg_entry(
             continue
         zl, zh, zdir = parsed
 
-        # Filter direction if present
-        if bias == "LONG" and zdir and "bear" in zdir:
+        if b == "LONG" and zdir and "bear" in zdir:
             continue
-        if bias == "SHORT" and zdir and "bull" in zdir:
+        if b == "SHORT" and zdir and "bull" in zdir:
             continue
 
         mid = (zl + zh) / 2.0
         dist = abs(float(entry_mkt) - mid)
-
-        # If price currently inside zone, dist=0
         if zl <= float(entry_mkt) <= zh:
             dist = 0.0
 
@@ -347,14 +283,11 @@ def _pick_fvg_entry(
     if best_mid is None:
         return None, "no_fvg_parse"
 
-    # Prefer "better side" for pullback limits:
-    #  - LONG  -> zone midpoint should be <= market (or inside zone)
-    #  - SHORT -> zone midpoint should be >= market (or inside zone)
     try:
         if atr > 0 and best_dist > 0:
-            if bias == "LONG" and float(best_mid) > float(entry_mkt) + 0.1 * atr:
+            if b == "LONG" and float(best_mid) > float(entry_mkt) + 0.1 * atr:
                 return None, "fvg_not_better_side_long"
-            if bias == "SHORT" and float(best_mid) < float(entry_mkt) - 0.1 * atr:
+            if b == "SHORT" and float(best_mid) < float(entry_mkt) - 0.1 * atr:
                 return None, "fvg_not_better_side_short"
     except Exception:
         pass
@@ -367,17 +300,16 @@ def _pick_fvg_entry(
 
 def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[str, Any]:
     """
-    Desk entry priority:
+    Entry priority:
       1) RAID→DISPLACEMENT→FVG (si dispo)
       2) OTE (si in-zone)
-      3) OTE pullback (même si pas in-zone)
-      4) FVG general (best)
+      3) OTE pullback
+      4) FVG general
       5) fallback = market close
     """
     entry_mkt = _last_close(df_h1)
     atr = _atr(df_h1, 14)
 
-    # 1) RAID->DISPLACEMENT->FVG (from structure_utils.analyze_structure)
     raid = struct.get("raid_displacement") or {}
     try:
         if isinstance(raid, dict) and raid.get("ok") and raid.get("entry") is not None:
@@ -397,7 +329,7 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
     except Exception:
         pass
 
-    # 2) OTE
+    # OTE
     ote_entry = None
     ote_in_zone = False
     ote_note = "ote_unavailable"
@@ -446,11 +378,10 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
             "atr": atr,
         }
 
-    # OTE pullback (not yet in-zone): if we have valid bounds, place the LIMIT at OTE mid
+    # OTE pullback (même si pas in-zone)
     if ote_entry is not None and (not ote_in_zone):
         try:
             dist = abs(float(entry_mkt) - float(ote_entry))
-            # only if OTE is on "better side" (buy lower / sell higher)
             if bias == "LONG" and float(ote_entry) <= float(entry_mkt) and (atr <= 0 or dist <= 4.0 * atr):
                 return {
                     "entry_used": float(ote_entry),
@@ -474,7 +405,7 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
         except Exception:
             pass
 
-    # 3) FVG
+    # FVG
     fvg_entry, fvg_note = _pick_fvg_entry(struct, entry_mkt, bias, atr, max_dist_atr=4.0)
     if fvg_entry is not None:
         return {
@@ -487,7 +418,7 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
             "atr": atr,
         }
 
-    # 4) fallback
+    # fallback
     return {
         "entry_used": float(entry_mkt),
         "entry_type": "MARKET",
@@ -500,40 +431,51 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
 
 
 # =====================================================================
-# Institutional soft override (desk)
+# Institutional gate helpers
 # =====================================================================
+def _inst_ok_count(inst: Dict[str, Any]) -> int:
+    comp = inst.get("score_components") or {}
+    try:
+        return int(sum(1 for v in comp.values() if int(v) > 0))
+    except Exception:
+        return 0
 
-def _desk_inst_score_eff(inst: Dict[str, Any], bias: str, base_score: int) -> Tuple[int, Optional[str]]:
+
+def _desk_inst_gate_override(inst: Dict[str, Any], bias: str, gate: int) -> Tuple[int, Optional[str]]:
     """
-    Desk override: évite inst_score=0 quand le flow est clairement fort.
-    On ne force PAS si régime crowded.
+    If flow is clearly strong and crowding is not risky, allow bumping gate to MIN_INST_SCORE.
     """
     try:
-        if base_score >= MIN_INST_SCORE:
-            return base_score, None
+        if gate >= int(MIN_INST_SCORE):
+            return gate, None
 
-        bias = (bias or "").upper()
+        b = (bias or "").upper()
         flow = str(inst.get("flow_regime") or "").lower()
         crowd = str(inst.get("crowding_regime") or "").lower()
-        cvd = float(inst.get("cvd_slope") or 0.0)
+        cvd = inst.get("cvd_slope")
+        cvd = float(cvd) if cvd is not None else 0.0
 
-        if "crowd" in crowd or "over" in crowd or "risky" in crowd:
-            return base_score, None
+        if "risky" in crowd or "crowded" in crowd:
+            return gate, None
 
-        if bias == "LONG" and flow == "strong_buy" and cvd >= 1.0:
-            return MIN_INST_SCORE, "override_flow_cvd_strong_buy"
-        if bias == "SHORT" and flow == "strong_sell" and cvd <= -1.0:
-            return MIN_INST_SCORE, "override_flow_cvd_strong_sell"
-
-        return base_score, None
+        if b == "LONG" and flow == "strong_buy" and cvd >= 0.2:
+            return int(MIN_INST_SCORE), "override_flow_strong_buy"
+        if b == "SHORT" and flow == "strong_sell" and cvd <= -0.2:
+            return int(MIN_INST_SCORE), "override_flow_strong_sell"
+        return gate, None
     except Exception:
-        return base_score, None
+        return gate, None
+
+
+def _reject(reason: str, **extra: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"valid": False, "reject_reason": reason}
+    out.update(extra)
+    return out
 
 
 # =====================================================================
 # Analyzer
 # =====================================================================
-
 class SignalAnalyzer:
     def __init__(self, *args, **kwargs):
         pass
@@ -550,17 +492,13 @@ class SignalAnalyzer:
 
         if not _ensure_ohlcv(df_h1) or len(df_h1) < 80:
             LOGGER.info("[EVAL_REJECT] %s bad_df_h1", symbol)
-            return {"valid": False, "reject_reason": "bad_df_h1"}
+            return _reject("bad_df_h1")
 
         if not _ensure_ohlcv(df_h4) or len(df_h4) < 80:
             LOGGER.info("[EVAL_REJECT] %s bad_df_h4", symbol)
-            return {"valid": False, "reject_reason": "bad_df_h4"}
+            return _reject("bad_df_h4")
 
-        # Structure first (for context), but DO NOT reject before institutional hard-gate
-        struct = analyze_structure(df_h1)
-        bias = str(struct.get("trend", "")).upper()
-
-        # Momentum/composite for fallback bias + later confirmations
+        # ---- cheap direction hints first ----
         mom = institutional_momentum(df_h1)
         comp = composite_momentum(df_h1)
         vol_reg = volatility_regime(df_h1)
@@ -569,31 +507,61 @@ class SignalAnalyzer:
         comp_score = float(comp.get("score", 50.0)) if isinstance(comp, dict) else 50.0
         comp_label = str(comp.get("label", "NEUTRAL")) if isinstance(comp, dict) else "NEUTRAL"
 
+        # ---- structure ----
+        struct = analyze_structure(df_h1)
+        bias = str(struct.get("trend", "")).upper()
+
+        # Fallback bias if range
+        if bias not in ("LONG", "SHORT"):
+            fb = _composite_bias_fallback(comp_score, comp_label, mom)
+            if fb is not None:
+                bias = fb
+                LOGGER.info("[EVAL_PRE] %s bias_fallback_for_inst=%s", symbol, bias)
+            else:
+                LOGGER.info("[EVAL_REJECT] %s no_bias_fallback_for_inst", symbol)
+                return _reject("no_bias_fallback_for_inst", structure=struct, momentum=mom, composite=comp)
+
         LOGGER.info(
             "[EVAL_PRE] %s STRUCT trend=%s bos=%s choch=%s cos=%s",
-            symbol, bias, struct.get("bos"), struct.get("choch"), struct.get("cos")
+            symbol, str(struct.get("trend", "")).upper(), struct.get("bos"), struct.get("choch"), struct.get("cos")
         )
         LOGGER.info("[EVAL_PRE] %s MOMENTUM=%s", symbol, mom)
         LOGGER.info("[EVAL_PRE] %s MOMENTUM_COMPOSITE score=%.2f label=%s", symbol, comp_score, comp_label)
         LOGGER.info("[EVAL_PRE] %s VOL_REGIME=%s EXTENSION=%s", symbol, vol_reg, ext_sig)
 
-        # Fallback bias (only to call institutional in the right direction)
-        if bias not in ("LONG", "SHORT"):
-            fb = _composite_bias_fallback(comp_score, comp_label)
-            if mom in ("BULLISH", "STRONG_BULLISH") or fb == "LONG":
-                bias = "LONG"
-                LOGGER.info("[EVAL_PRE] %s bias_fallback_for_inst=LONG", symbol)
-            elif mom in ("BEARISH", "STRONG_BEARISH") or fb == "SHORT":
-                bias = "SHORT"
-                LOGGER.info("[EVAL_PRE] %s bias_fallback_for_inst=SHORT", symbol)
-            else:
-                # no clear bias => cannot do institutional correctly
-                LOGGER.info("[EVAL_REJECT] %s no_bias_fallback_for_inst", symbol)
-                return {"valid": False, "reject_reason": "no_bias_fallback", "structure": struct, "momentum": mom, "composite": comp}
+        # ===============================================================
+        # PRE-FILTERS (cheap) BEFORE institutional call (anti-ban)
+        # ===============================================================
+        bos_flag = bool(struct.get("bos", False))
 
-        # =================================================================
-        # INSTITUTIONAL — HARD GATE (priority #1)
-        # =================================================================
+        # If you require structure, range was already handled by fallback; so still ok.
+        # But if REQUIRE_STRUCTURE and original trend was RANGE, you can veto:
+        if REQUIRE_STRUCTURE and str(struct.get("trend", "")).upper() not in ("LONG", "SHORT"):
+            LOGGER.info("[EVAL_REJECT] %s no_clear_trend_range", symbol)
+            return _reject("no_clear_trend_range", structure=struct, momentum=mom, composite=comp)
+
+        if REQUIRE_HTF_ALIGN and bias in ("LONG", "SHORT"):
+            if not htf_trend_ok(df_h4, bias):
+                LOGGER.info("[EVAL_REJECT] %s htf_veto", symbol)
+                return _reject("htf_veto", structure=struct)
+
+        # In non-desk mode, BOS is mandatory → reject early to avoid Binance spam
+        if (not DESK_EV_MODE) and (not bos_flag):
+            LOGGER.info("[EVAL_REJECT] %s no_bos", symbol)
+            return _reject("no_bos", structure=struct, momentum=mom, composite=comp)
+
+        # Momentum gating (cheap)
+        if REQUIRE_MOMENTUM:
+            if bias == "LONG" and mom not in ("BULLISH", "STRONG_BULLISH"):
+                LOGGER.info("[EVAL_REJECT] %s momentum_not_bullish", symbol)
+                return _reject("momentum_not_bullish", structure=struct)
+            if bias == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
+                LOGGER.info("[EVAL_REJECT] %s momentum_not_bearish", symbol)
+                return _reject("momentum_not_bearish", structure=struct)
+
+        # ===============================================================
+        # 1) INSTITUTIONAL — HARD GATE (but called only for candidates)
+        # ===============================================================
         try:
             inst = await compute_full_institutional_analysis(symbol, bias)
         except Exception as e:
@@ -602,166 +570,108 @@ class SignalAnalyzer:
                 "binance_symbol": None,
                 "available": False,
                 "warnings": [f"inst_exception:{e}"],
+                "score_components": {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0},
             }
 
         inst_score = int(inst.get("institutional_score") or 0)
         available = bool(inst.get("available", False))
         binance_symbol = inst.get("binance_symbol")
 
-        inst_score_eff, inst_override = _desk_inst_score_eff(inst, bias, inst_score)
-        inst_ok_count = _inst_ok_count(inst)
-        inst_gate = max(int(inst_score_eff), int(inst_ok_count))
+        ok_count = _inst_ok_count(inst)
+        gate = int(ok_count)
+        gate, override = _desk_inst_gate_override(inst, bias, gate)
 
         LOGGER.info(
-            "[INST_RAW] %s score=%s eff=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s",
-            symbol, inst_score, inst_score_eff, inst_ok_count, inst_gate, inst_override, available, binance_symbol, bias
+            "[INST_RAW] %s score=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s",
+            symbol, inst_score, ok_count, gate, override, available, binance_symbol, bias
         )
 
-        if inst_override:
-            LOGGER.warning("[INST_OVERRIDE] %s %s", symbol, inst_override)
-
-        # HARD GATE: must be available + mapped + gate>=2 and score_eff>=MIN_INST_SCORE
         if (not available) or (binance_symbol is None):
-            LOGGER.info("[EVAL_REJECT] %s inst_unavailable", symbol)
-            return {"valid": False, "reject_reason": "inst_unavailable", "structure": struct, "institutional": inst}
+            if ALLOW_TECH_FALLBACK_WHEN_INST_DOWN:
+                LOGGER.warning("[INST_DOWN] %s tech_fallback_enabled", symbol)
+            else:
+                LOGGER.info("[EVAL_REJECT] %s inst_unavailable", symbol)
+                return _reject("inst_unavailable", institutional=inst, structure=struct, momentum=mom, composite=comp)
 
-        if inst_gate < int(INST_MIN_OK):
-            LOGGER.info("[EVAL_REJECT] %s inst_components_low gate=%s < %s", symbol, inst_gate, INST_MIN_OK)
-            return {"valid": False, "reject_reason": "inst_components_low", "inst_gate": inst_gate, "structure": struct, "institutional": inst}
+        if (not ALLOW_TECH_FALLBACK_WHEN_INST_DOWN) and gate < int(MIN_INST_SCORE):
+            LOGGER.info("[EVAL_REJECT] %s inst_components_low gate=%s < %s", symbol, gate, MIN_INST_SCORE)
+            return _reject("inst_components_low", institutional=inst, structure=struct, inst_gate=gate, ok_count=ok_count)
 
-        if int(inst_score_eff) < int(MIN_INST_SCORE):
-            LOGGER.info("[EVAL_REJECT] %s inst_score_low eff=%s < MIN_INST_SCORE=%s", symbol, inst_score_eff, MIN_INST_SCORE)
-            return {"valid": False, "reject_reason": "inst_score_low", "inst_score_eff": int(inst_score_eff), "structure": struct, "institutional": inst}
-
-        # =================================================================
-        # STRUCTURE CONFIRMATION (after inst hard-gate)
-        # =================================================================
-
-        # If structure trend is range and REQUIRE_STRUCTURE, reject now (post-inst gate)
-        struct_bias = str(struct.get("trend", "")).upper()
-        if struct_bias not in ("LONG", "SHORT"):
-            if REQUIRE_STRUCTURE:
-                LOGGER.info("[EVAL_REJECT] %s no_clear_trend_range", symbol)
-                return {"valid": False, "reject_reason": "no_clear_trend_range", "structure": struct, "institutional": inst}
-
-            # otherwise keep bias already decided (momentum fallback above)
-            LOGGER.info("[EVAL_PRE] %s structure_range_allowed bias=%s", symbol, bias)
-        else:
-            # prefer structure trend when it exists
-            bias = struct_bias
-
-        # HTF veto
-        if REQUIRE_HTF_ALIGN and bias in ("LONG", "SHORT"):
-            if not htf_trend_ok(df_h4, bias):
-                LOGGER.info("[EVAL_REJECT] %s htf_veto", symbol)
-                return {"valid": False, "reject_reason": "htf_veto", "structure": struct, "institutional": inst}
-
-        # BOS / quality
+        # ===============================================================
+        # 2) STRUCTURE / QUALITY / ENTRY / EXITS
+        # ===============================================================
         entry_mkt = _last_close(df_h1)
-        bos_flag = bool(struct.get("bos", False))
+
         bos_dir = struct.get("bos_direction", None)
-        bos_type = struct.get("bos_type", None)
-
-        # IMPORTANT: do NOT hard reject if no BOS (inst is the gate; structure will choose setup)
-        if (not DESK_EV_MODE) and (not bos_flag):
-            LOGGER.info("[EVAL_PRE] %s no_bos (inst hard-gate ok, will try non-BOS setups)", symbol)
-
-        oi_series = struct.get("oi_series", None)
-        LOGGER.info("[EVAL_PRE] %s OI_STRUCT has_oi=%s", symbol, oi_series is not None)
-
         bos_q = bos_quality_details(
             df_h1,
-            oi_series=oi_series,
+            oi_series=struct.get("oi_series", None),
             df_liq=df_h1,
             price=entry_mkt,
             direction=bos_dir,
         )
         bos_quality_ok = bool(bos_q.get("ok", True))
+
         LOGGER.info(
-            "[EVAL_PRE] %s BOS_QUALITY ok=%s score=%s reasons=%s bos_flag=%s bos_type=%s bos_dir=%s",
-            symbol, bos_quality_ok, bos_q.get("score"), bos_q.get("reasons"),
-            bos_flag, bos_type, bos_dir
+            "[EVAL_PRE] %s BOS_QUALITY ok=%s score=%s reasons=%s bos_flag=%s bos_dir=%s",
+            symbol, bos_quality_ok, bos_q.get("score"), bos_q.get("reasons"), bos_flag, bos_dir
         )
 
-        if REQUIRE_MOMENTUM:
-            if bias == "LONG" and mom not in ("BULLISH", "STRONG_BULLISH"):
-                LOGGER.info("[EVAL_REJECT] %s momentum_not_bullish", symbol)
-                return {"valid": False, "reject_reason": "momentum_not_bullish", "structure": struct, "institutional": inst}
-            if bias == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
-                LOGGER.info("[EVAL_REJECT] %s momentum_not_bearish", symbol)
-                return {"valid": False, "reject_reason": "momentum_not_bearish", "structure": struct, "institutional": inst}
+        if REQUIRE_BOS_QUALITY and not bos_quality_ok:
+            LOGGER.info("[EVAL_REJECT] %s bos_quality_low", symbol)
+            return _reject("bos_quality_low", institutional=inst, structure=struct, bos_quality=bos_q)
 
         premium, discount = compute_premium_discount(df_h1)
         LOGGER.info("[EVAL_PRE] %s PREMIUM=%s DISCOUNT=%s", symbol, premium, discount)
 
-        # Liquidity sweep context
         liq_sweep = liquidity_sweep_details(df_h1, bias, lookback=180)
-        if isinstance(liq_sweep, dict) and liq_sweep.get("ok"):
-            LOGGER.info(
-                "[EVAL_PRE] %s LIQ_SWEEP ok=True kind=%s level=%s wick=%.2f body=%.2f",
-                symbol,
-                liq_sweep.get("kind"),
-                liq_sweep.get("level"),
-                float(liq_sweep.get("wick_ratio") or 0.0),
-                float(liq_sweep.get("body_ratio") or 0.0),
-            )
 
-        # Entry pick (OTE/FVG/RAID)
         entry_pick = _pick_entry(df_h1, struct, bias)
         entry = float(entry_pick["entry_used"])
         entry_type = str(entry_pick["entry_type"])
-        note = str(entry_pick.get("note"))
         atr14 = float(entry_pick.get("atr") or _atr(df_h1, 14))
 
         LOGGER.info(
             "[EVAL_PRE] %s ENTRY_PICK type=%s entry_mkt=%s entry_used=%s in_zone=%s note=%s atr=%.6g",
-            symbol, entry_type, entry_pick.get("entry_mkt"), entry, entry_pick.get("in_zone"), note, atr14
+            symbol, entry_type, entry_pick.get("entry_mkt"), entry, entry_pick.get("in_zone"), entry_pick.get("note"), atr14
         )
 
-        # Extension hygiene (avoid chasing)
+        # Extension hygiene
         if ext_sig == "OVEREXTENDED_LONG" and bias == "LONG":
             if entry_type == "MARKET":
                 LOGGER.info("[EVAL_REJECT] %s overextended_long_market", symbol)
-                return {"valid": False, "reject_reason": "overextended_long_market", "structure": struct, "entry_pick": entry_pick, "institutional": inst}
+                return _reject("overextended_long_market", institutional=inst, structure=struct, entry_pick=entry_pick)
             if not _entry_pullback_ok(entry, entry_mkt, bias, atr14):
                 LOGGER.info("[EVAL_REJECT] %s overextended_long_no_pullback", symbol)
-                return {"valid": False, "reject_reason": "overextended_long_no_pullback", "structure": struct, "entry_pick": entry_pick, "institutional": inst}
+                return _reject("overextended_long_no_pullback", institutional=inst, structure=struct, entry_pick=entry_pick)
 
         if ext_sig == "OVEREXTENDED_SHORT" and bias == "SHORT":
             if entry_type == "MARKET":
                 LOGGER.info("[EVAL_REJECT] %s overextended_short_market", symbol)
-                return {"valid": False, "reject_reason": "overextended_short_market", "structure": struct, "entry_pick": entry_pick, "institutional": inst}
+                return _reject("overextended_short_market", institutional=inst, structure=struct, entry_pick=entry_pick)
             if not _entry_pullback_ok(entry, entry_mkt, bias, atr14):
                 LOGGER.info("[EVAL_REJECT] %s overextended_short_no_pullback", symbol)
-                return {"valid": False, "reject_reason": "overextended_short_no_pullback", "structure": struct, "entry_pick": entry_pick, "institutional": inst}
+                return _reject("overextended_short_no_pullback", institutional=inst, structure=struct, entry_pick=entry_pick)
 
         unfavorable_market = bool(entry_type == "MARKET" and ((bias == "LONG" and premium) or (bias == "SHORT" and discount)))
-
-        # Premium/discount guard ONLY for market-chasing
-        # In DESK_EV_MODE we can allow a momentum-breakout market entry if flow confirms.
-        if (not DESK_EV_MODE) and entry_type == "MARKET":
+        if unfavorable_market and (not DESK_EV_MODE):
             if bias == "LONG" and premium:
                 LOGGER.info("[EVAL_REJECT] %s long_in_premium_market", symbol)
-                return {"valid": False, "reject_reason": "long_in_premium_market", "structure": struct, "entry_pick": entry_pick, "institutional": inst}
+                return _reject("long_in_premium_market", institutional=inst, structure=struct, entry_pick=entry_pick)
             if bias == "SHORT" and discount:
                 LOGGER.info("[EVAL_REJECT] %s short_in_discount_market", symbol)
-                return {"valid": False, "reject_reason": "short_in_discount_market", "structure": struct, "entry_pick": entry_pick, "institutional": inst}
+                return _reject("short_in_discount_market", institutional=inst, structure=struct, entry_pick=entry_pick)
 
-        # Compute exits + RR first
         tick = estimate_tick_from_price(entry)
         exits = _compute_exits(df_h1, entry, bias, tick=tick)
         sl = float(exits["sl"])
         tp1 = float(exits["tp1"])
         rr = _safe_rr(entry, sl, tp1, bias)
 
-        # Desk SL hygiene (push SL beyond sweep / nearest EQ pool)
-        try:
-            atr_last = _atr(df_h1, 14)
-        except Exception:
-            atr_last = 0.0
+        # SL hygiene (push beyond sweep / eq levels)
+        atr_last = _atr(df_h1, 14)
         buf = max((atr_last * 0.08) if atr_last > 0 else 0.0, float(tick) * 2.0, entry * 0.0004)
 
-        # Sweep-based SL
         try:
             if isinstance(liq_sweep, dict) and liq_sweep.get("ok"):
                 ext = float(liq_sweep.get("sweep_extreme") or 0.0)
@@ -773,7 +683,6 @@ class SignalAnalyzer:
         except Exception:
             pass
 
-        # EQ-level SL
         try:
             lv = detect_equal_levels(df_h1.tail(200), max_window=200, tol_mult_atr=0.10)
             eq_highs = lv.get("eq_highs", []) or []
@@ -795,11 +704,9 @@ class SignalAnalyzer:
 
         if sl <= 0:
             LOGGER.info("[EVAL_REJECT] %s sl_invalid_after_liq_adj sl=%s", symbol, sl)
-            return {"valid": False, "reject_reason": "sl_invalid_after_liq_adj", "institutional": inst}
+            return _reject("sl_invalid_after_liq_adj", institutional=inst, structure=struct)
 
-        exits["sl"] = sl
         rr = _safe_rr(entry, sl, tp1, bias)
-
         LOGGER.info(
             "[EVAL_PRE] %s EXITS entry=%s sl=%s tp1=%s tick=%s RR=%s raw_rr=%s entry_type=%s",
             symbol, entry, sl, tp1, tick, rr, exits["rr_used"], entry_type
@@ -807,70 +714,27 @@ class SignalAnalyzer:
 
         if rr is None or rr <= 0:
             LOGGER.info("[EVAL_REJECT] %s rr_invalid", symbol)
-            return {"valid": False, "reject_reason": "rr_invalid", "structure": struct, "entry_pick": entry_pick, "institutional": inst}
+            return _reject("rr_invalid", institutional=inst, structure=struct, entry_pick=entry_pick)
 
-        # -----------------------------------------------------------------
-        # DESK "momentum breakout" permission for MARKET entries in bad location
-        # -----------------------------------------------------------------
-        if unfavorable_market and DESK_EV_MODE:
-            breakout_ok = False
-            try:
-                flow = str(inst.get("flow_regime") or "").lower()
-                tape = float(inst.get("tape_delta") or 0.0)
-                ob = float(inst.get("orderbook_imbalance") or 0.0)
-
-                # Require structure context OR strong momentum to avoid random chases
-                ctx_ok = bool(bos_flag or (mom in ("STRONG_BULLISH", "STRONG_BEARISH")))
-                not_overext = str(ext_sig or "").upper() not in ("OVEREXTENDED_LONG", "OVEREXTENDED_SHORT")
-
-                if not_overext and ctx_ok and (int(inst_score_eff) >= max(int(MIN_INST_SCORE), 2)):
-                    if bias == "LONG" and flow in ("strong_buy", "buy") and tape >= 0.25 and ob >= 0.05:
-                        breakout_ok = True
-                    if bias == "SHORT" and flow in ("strong_sell", "sell") and tape <= -0.25 and ob <= -0.05:
-                        breakout_ok = True
-            except Exception:
-                breakout_ok = False
-
-            if not breakout_ok:
-                if bias == "LONG" and premium and entry_type == "MARKET":
-                    LOGGER.info("[EVAL_REJECT] %s long_in_premium_market", symbol)
-                    return {"valid": False, "reject_reason": "long_in_premium_market", "structure": struct, "entry_pick": entry_pick, "institutional": inst}
-                if bias == "SHORT" and discount and entry_type == "MARKET":
-                    LOGGER.info("[EVAL_REJECT] %s short_in_discount_market", symbol)
-                    return {"valid": False, "reject_reason": "short_in_discount_market", "structure": struct, "entry_pick": entry_pick, "institutional": inst}
-            else:
-                LOGGER.info(
-                    "[EVAL_PRE] %s MARKET_BREAKOUT_ALLOWED flow=%s tape=%.3f ob=%.3f inst_eff=%s",
-                    symbol, str(inst.get("flow_regime")), float(inst.get("tape_delta") or 0.0),
-                    float(inst.get("orderbook_imbalance") or 0.0), int(inst_score_eff)
-                )
-
-        # =================================================================
-        # SETUPS (desk order) — inst already hard-gated
-        # =================================================================
-
+        # ===============================================================
+        # SETUPS
+        # ===============================================================
         can_bos = bool(bos_flag and ((not REQUIRE_BOS_QUALITY) or bos_quality_ok))
         can_raid = bool(isinstance(struct.get("raid_displacement"), dict) and struct["raid_displacement"].get("ok"))
         can_sweep = bool(isinstance(liq_sweep, dict) and liq_sweep.get("ok"))
 
-        # 1) BOS_STRICT (PRIMARY)
+        # 1) BOS_STRICT
         bos_ok = False
         bos_variant = "NO"
         if can_bos:
-            if float(rr) >= float(RR_MIN_STRICT):
+            if rr >= RR_MIN_STRICT:
                 bos_ok = True
                 bos_variant = "RR_STRICT"
-            elif float(rr) >= float(RR_MIN_TOLERATED_WITH_INST):
+            elif rr >= RR_MIN_TOLERATED_WITH_INST:
                 bos_ok = True
                 bos_variant = "RR_RELAX_WITH_INST"
 
-        LOGGER.info("[EVAL_PRE] %s BOS_STRICT_CHECK can_bos=%s rr=%.3f ok=%s variant=%s",
-                    symbol, can_bos, float(rr), bos_ok, bos_variant)
-
         if bos_ok:
-            setup_type = "BOS_STRICT"
-            LOGGER.info("[EVAL] %s VALID RR=%.3f SETUP=%s (%s) DESK_EV_MODE=%s",
-                        symbol, float(rr), setup_type, bos_variant, DESK_EV_MODE)
             return {
                 "valid": True,
                 "symbol": symbol,
@@ -878,19 +742,18 @@ class SignalAnalyzer:
                 "bias": bias,
                 "entry": entry,
                 "entry_type": entry_type,
-                "sl": sl,
-                "tp1": tp1,
+                "sl": float(sl),
+                "tp1": float(tp1),
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": setup_type,
+                "setup_type": "BOS_STRICT",
                 "setup_variant": bos_variant,
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
-                "inst_score_eff": int(inst_score_eff),
-                "inst_override": inst_override,
-                "inst_gate": int(inst_gate),
+                "inst_gate": int(gate),
+                "inst_ok_count": int(ok_count),
                 "momentum": mom,
                 "composite": comp,
                 "composite_score": comp_score,
@@ -901,30 +764,8 @@ class SignalAnalyzer:
                 "sl_meta": exits.get("sl_meta"),
             }
 
-        # 2) RAID_DISPLACEMENT
-        raid_ok = False
-        raid_reason = ""
-        if DESK_EV_MODE and can_raid:
-            raid_ok = float(rr) >= float(RR_MIN_DESK_PRIORITY)
-
-            if bias == "LONG":
-                if "BEAR" in comp_label.upper() and comp_score >= 70.0:
-                    raid_ok = False
-                    raid_reason = "comp_opposes_long"
-            else:
-                if "BULL" in comp_label.upper() and comp_score <= 30.0:
-                    raid_ok = False
-                    raid_reason = "comp_opposes_short"
-
-            if raid_ok and int(inst_score_eff) < 1:
-                raid_ok = False
-                raid_reason = "inst_too_weak_for_raid"
-
-        LOGGER.info("[EVAL_PRE] %s RAID_CHECK can_raid=%s ok=%s rr=%.3f reason=%s",
-                    symbol, can_raid, raid_ok, float(rr), raid_reason)
-
-        if DESK_EV_MODE and raid_ok:
-            setup_type = "RAID_DISPLACEMENT"
+        # 2) RAID_DISPLACEMENT (desk)
+        if DESK_EV_MODE and can_raid and float(rr) >= float(RR_MIN_DESK_PRIORITY):
             return {
                 "valid": True,
                 "symbol": symbol,
@@ -932,19 +773,18 @@ class SignalAnalyzer:
                 "bias": bias,
                 "entry": entry,
                 "entry_type": entry_type,
-                "sl": sl,
-                "tp1": tp1,
+                "sl": float(sl),
+                "tp1": float(tp1),
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": setup_type,
+                "setup_type": "RAID_DISPLACEMENT",
                 "setup_variant": str((struct.get("raid_displacement") or {}).get("note") or "raid_ok"),
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
-                "inst_score_eff": int(inst_score_eff),
-                "inst_override": inst_override,
-                "inst_gate": int(inst_gate),
+                "inst_gate": int(gate),
+                "inst_ok_count": int(ok_count),
                 "momentum": mom,
                 "composite": comp,
                 "composite_score": comp_score,
@@ -955,28 +795,8 @@ class SignalAnalyzer:
                 "liquidity_sweep": liq_sweep,
             }
 
-        # 3) LIQ_SWEEP
-        liq_ok = False
-        liq_reason = ""
-        if DESK_EV_MODE and can_sweep:
-            liq_ok = float(rr) >= float(RR_MIN_DESK_PRIORITY)
-
-            if bias == "LONG" and ("BEAR" in comp_label.upper()) and comp_score >= 75.0:
-                liq_ok = False
-                liq_reason = "comp_opposes_long"
-            if bias == "SHORT" and ("BULL" in comp_label.upper()) and comp_score <= 25.0:
-                liq_ok = False
-                liq_reason = "comp_opposes_short"
-
-            if liq_ok and int(inst_score_eff) < int(MIN_INST_SCORE):
-                liq_ok = False
-                liq_reason = "inst_low_for_sweep"
-
-        LOGGER.info("[EVAL_PRE] %s LIQ_SWEEP_CHECK can_sweep=%s ok=%s rr=%.3f reason=%s",
-                    symbol, can_sweep, liq_ok, float(rr), liq_reason)
-
-        if DESK_EV_MODE and liq_ok:
-            setup_type = "LIQ_SWEEP"
+        # 3) LIQ_SWEEP (desk)
+        if DESK_EV_MODE and can_sweep and float(rr) >= float(RR_MIN_DESK_PRIORITY):
             return {
                 "valid": True,
                 "symbol": symbol,
@@ -984,19 +804,18 @@ class SignalAnalyzer:
                 "bias": bias,
                 "entry": entry,
                 "entry_type": entry_type,
-                "sl": sl,
-                "tp1": tp1,
+                "sl": float(sl),
+                "tp1": float(tp1),
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": setup_type,
+                "setup_type": "LIQ_SWEEP",
                 "setup_variant": str(liq_sweep.get("kind") if isinstance(liq_sweep, dict) else "liq_ok"),
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
-                "inst_score_eff": int(inst_score_eff),
-                "inst_override": inst_override,
-                "inst_gate": int(inst_gate),
+                "inst_gate": int(gate),
+                "inst_ok_count": int(ok_count),
                 "momentum": mom,
                 "composite": comp,
                 "composite_score": comp_score,
@@ -1008,103 +827,40 @@ class SignalAnalyzer:
             }
 
         # 4) INST_CONTINUATION (desk)
-        inst_cont_ok = False
-        inst_cont_reason = ""
         if DESK_EV_MODE and bias in ("LONG", "SHORT"):
-            good_inst = int(inst_score_eff) >= int(INST_SCORE_DESK_PRIORITY)
+            good_inst = int(gate) >= int(INST_SCORE_DESK_PRIORITY)
             good_rr = float(rr) >= float(RR_MIN_DESK_PRIORITY)
-
-            comp_thr = 65.0
-            good_comp = _composite_bias_ok(bias, comp_score, comp_label, thr=comp_thr)
-
-            inst_cont_ok = bool(good_inst and good_rr and good_comp)
-            inst_cont_reason = (
-                f"good_inst={good_inst}({int(inst_score_eff)}>={int(INST_SCORE_DESK_PRIORITY)}) "
-                f"good_rr={good_rr}({float(rr):.3f}>={float(RR_MIN_DESK_PRIORITY)}) "
-                f"good_comp={good_comp}({comp_score:.1f},{comp_label},thr={comp_thr})"
-            )
-
-        LOGGER.info("[EVAL_PRE] %s INST_CONTINUATION_CHECK %s ok=%s", symbol, inst_cont_reason, inst_cont_ok)
-
-        if DESK_EV_MODE and inst_cont_ok:
-            setup_type = "INST_CONTINUATION"
-            LOGGER.info("[EVAL] %s VALID RR=%.3f SETUP=%s (DESK_EV_MODE=True)", symbol, float(rr), setup_type)
-            return {
-                "valid": True,
-                "symbol": symbol,
-                "side": "BUY" if bias == "LONG" else "SELL",
-                "bias": bias,
-                "entry": entry,
-                "entry_type": entry_type,
-                "sl": sl,
-                "tp1": tp1,
-                "tp2": None,
-                "rr": float(rr),
-                "qty": 1,
-                "setup_type": setup_type,
-                "setup_variant": "INST_CONTINUATION",
-                "structure": struct,
-                "bos_quality": bos_q,
-                "institutional": inst,
-                "inst_score_eff": int(inst_score_eff),
-                "inst_override": inst_override,
-                "inst_gate": int(inst_gate),
-                "momentum": mom,
-                "composite": comp,
-                "composite_score": comp_score,
-                "composite_label": comp_label,
-                "premium": premium,
-                "discount": discount,
-                "entry_pick": entry_pick,
-                "sl_meta": exits.get("sl_meta"),
-                "inst_continuation_reason": inst_cont_reason,
-            }
-
-        # 5) INST_PRIORITY — fallback final (2/3 inst already gated) + RR>=1.2 + comp align
-        inst_prio_ok = False
-        inst_prio_reason = ""
-        try:
-            rr_min_gate = max(float(RR_MIN_INST), float(RR_MIN_TOLERATED_WITH_INST))
-            good_rr = float(rr) >= rr_min_gate
             good_comp = _composite_bias_ok(bias, comp_score, comp_label, thr=65.0)
-            inst_prio_ok = bool(good_rr and good_comp)
-            inst_prio_reason = f"good_rr={good_rr}(rr={float(rr):.3f}>= {rr_min_gate}) good_comp={good_comp} comp={comp_score:.1f}/{comp_label}"
-        except Exception:
-            inst_prio_ok = False
 
-        LOGGER.info("[EVAL_PRE] %s INST_PRIORITY_CHECK %s ok=%s", symbol, inst_prio_reason, inst_prio_ok)
-
-        if inst_prio_ok:
-            setup_type = "INST_PRIORITY"
-            return {
-                "valid": True,
-                "symbol": symbol,
-                "side": "BUY" if bias == "LONG" else "SELL",
-                "bias": bias,
-                "entry": entry,
-                "entry_type": entry_type,
-                "sl": sl,
-                "tp1": tp1,
-                "tp2": None,
-                "rr": float(rr),
-                "qty": 1,
-                "setup_type": setup_type,
-                "setup_variant": "INST_2OF3",
-                "structure": struct,
-                "bos_quality": bos_q,
-                "institutional": inst,
-                "inst_score_eff": int(inst_score_eff),
-                "inst_override": inst_override,
-                "inst_gate": int(inst_gate),
-                "momentum": mom,
-                "composite": comp,
-                "composite_score": comp_score,
-                "composite_label": comp_label,
-                "premium": premium,
-                "discount": discount,
-                "entry_pick": entry_pick,
-                "liquidity_sweep": liq_sweep,
-            }
+            if good_inst and good_rr and good_comp:
+                return {
+                    "valid": True,
+                    "symbol": symbol,
+                    "side": "BUY" if bias == "LONG" else "SELL",
+                    "bias": bias,
+                    "entry": entry,
+                    "entry_type": entry_type,
+                    "sl": float(sl),
+                    "tp1": float(tp1),
+                    "tp2": None,
+                    "rr": float(rr),
+                    "qty": 1,
+                    "setup_type": "INST_CONTINUATION",
+                    "setup_variant": "INST_CONTINUATION",
+                    "structure": struct,
+                    "bos_quality": bos_q,
+                    "institutional": inst,
+                    "inst_gate": int(gate),
+                    "inst_ok_count": int(ok_count),
+                    "momentum": mom,
+                    "composite": comp,
+                    "composite_score": comp_score,
+                    "composite_label": comp_label,
+                    "premium": premium,
+                    "discount": discount,
+                    "entry_pick": entry_pick,
+                    "sl_meta": exits.get("sl_meta"),
+                }
 
         LOGGER.info("[EVAL_REJECT] %s no_setup_validated (DESK_EV_MODE=%s)", symbol, DESK_EV_MODE)
         return {
@@ -1115,8 +871,8 @@ class SignalAnalyzer:
             "bos_quality": bos_q,
             "entry_pick": entry_pick,
             "rr": float(rr),
-            "inst_score_eff": int(inst_score_eff),
-            "inst_gate": int(inst_gate),
+            "inst_gate": int(gate),
+            "inst_ok_count": int(ok_count),
             "composite_score": comp_score,
             "composite_label": comp_label,
         }
