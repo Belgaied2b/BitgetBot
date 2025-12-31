@@ -1,4 +1,3 @@
-
 # =====================================================================
 # structure_utils.py — Institutional Structure Engine (Desk v4)
 # BOS / CHOCH / COS / Internal vs External / Liquidity / OB / FVG / HTF
@@ -15,7 +14,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -57,15 +56,15 @@ except Exception:
 
 def _atr(df: pd.DataFrame, length: int = 14) -> float:
     """
-    Returns last ATR value (float). Uses indicators.true_atr/compute_atr if available,
-    otherwise uses a local ATR implementation.
+    Returns last ATR value (float).
+    Uses indicators.true_atr/compute_atr if available, otherwise local ATR implementation (SMA of TR).
     """
     try:
         if df is None or df.empty or len(df) < int(length) + 3:
             return 0.0
 
         if _compute_atr_ext is not None:
-            # be tolerant to signature differences (length / period / n)
+            # tolerate signature differences
             try:
                 s = _compute_atr_ext(df, length=int(length))
             except TypeError:
@@ -138,18 +137,12 @@ def find_swings(df: pd.DataFrame, left: int = 3, right: int = 3) -> Dict[str, Li
         if not np.isfinite(hi) or not np.isfinite(lo):
             continue
 
+        # >= / <= keeps plateau pivots too (desk-friendly)
         if hi >= float(np.max(win_h)):
-            # keep last occurrence if duplicates
-            if np.sum(np.isclose(win_h, hi, atol=0.0, rtol=0.0)) == 1:
-                highs.append((i, hi))
-            else:
-                highs.append((i, hi))
+            highs.append((i, hi))
 
         if lo <= float(np.min(win_l)):
-            if np.sum(np.isclose(win_l, lo, atol=0.0, rtol=0.0)) == 1:
-                lows.append((i, lo))
-            else:
-                lows.append((i, lo))
+            lows.append((i, lo))
 
     return {"highs": highs, "lows": lows}
 
@@ -160,7 +153,8 @@ def find_swings(df: pd.DataFrame, left: int = 3, right: int = 3) -> Dict[str, Li
 
 def _cluster_levels(levels: List[float], tolerance: float) -> List[float]:
     """
-    Groups nearby levels into clusters. Returns cluster mean only if >= 2 touches.
+    Groups nearby levels into clusters.
+    Returns cluster mean only if >= 2 touches.
     """
     if not levels:
         return []
@@ -195,7 +189,7 @@ def detect_equal_levels(
     tol_mult_atr: float = 0.12,
     tol_mult_range: float = 0.15,
     tol_fallback_pct: float = 0.001,
-    tol_atr: Optional[float] = None,  # alias
+    tol_atr: Optional[float] = None,  # alias (compat)
 ) -> Dict[str, List[float]]:
     """
     Detects EQH/EQL pools from swing points.
@@ -206,14 +200,15 @@ def detect_equal_levels(
     if df is None or len(df) < left + right + 10 or not _has_cols(df, ("high", "low", "close")):
         return {"eq_highs": [], "eq_lows": []}
 
+    # compat: if tol_atr is passed, treat it like tol_mult_atr
     if tol_atr is not None:
         tol_mult_atr = float(tol_atr)
 
     sub = df.tail(int(max_window)).reset_index(drop=True)
     swings = find_swings(sub, left=left, right=right)
 
-    high_prices = [p for _, p in swings.get("highs", [])]
-    low_prices = [p for _, p in swings.get("lows", [])]
+    high_prices = [p for _, p in (swings.get("highs") or [])]
+    low_prices = [p for _, p in (swings.get("lows") or [])]
 
     last_price = float(sub["close"].astype(float).iloc[-1])
 
@@ -298,7 +293,7 @@ def liquidity_sweep_details(
     eq_highs = lv.get("eq_highs", []) or []
     eq_lows = lv.get("eq_lows", []) or []
 
-    # pick nearest level to current price (more "desk" than oldest cluster)
+    # pick nearest level to current price
     close_last = float(dfw["close"].astype(float).iloc[-1])
     if d == "LONG" and eq_lows:
         lvl = float(min(eq_lows, key=lambda x: abs(close_last - float(x))))
@@ -307,7 +302,6 @@ def liquidity_sweep_details(
     else:
         return out
 
-    # scan last 3 candles for a sweep
     tail_n = min(3, len(dfw))
     for i in range(len(dfw) - tail_n, len(dfw)):
         row = dfw.iloc[i]
@@ -338,8 +332,7 @@ def liquidity_sweep_details(
                     }
                 )
                 return out
-
-        else:  # SHORT
+        else:
             wick_ratio = float(upper_wick / rng)
             if (h > (lvl + tol)) and (c < (lvl - 0.25 * tol)) and (wick_ratio >= float(wick_ratio_min)):
                 out.update(
@@ -439,6 +432,7 @@ def _classify_bos(
         broken_dn = last_lo
         bos_type_dn = "EXTERNAL" if (ext_lo is not None and last_close < (ext_lo - break_buffer)) else "INTERNAL"
 
+    # resolve rare double-break edge
     if bos_up and bos_dn:
         du = abs(last_close - float(broken_up or last_close))
         dd = abs(last_close - float(broken_dn or last_close))
@@ -613,7 +607,6 @@ def bos_quality_details(
     except Exception:
         liquidity_sweep = False
 
-    # Score
     score = 0.0
     reasons: List[str] = []
 
@@ -859,12 +852,7 @@ def _volume_profile(df: pd.DataFrame, lookback: int = 140, bins: int = 48) -> Di
     """
     Lightweight volume profile (no tick granularity needed).
     Returns:
-      {
-        "poc": float|None,
-        "hvn": float|None,
-        "lvn": float|None,
-        "range": (low, high),
-      }
+      {"poc": float|None, "hvn": float|None, "lvn": float|None, "range": (low, high)}
     """
     out = {"poc": None, "hvn": None, "lvn": None, "range": None}
     try:
@@ -877,7 +865,6 @@ def _volume_profile(df: pd.DataFrame, lookback: int = 140, bins: int = 48) -> Di
         if not np.isfinite(hi) or not np.isfinite(lo) or hi <= lo:
             return out
 
-        rng = hi - lo
         nb = int(max(12, min(200, bins)))
         edges = np.linspace(lo, hi, nb + 1)
         vol_bins = np.zeros(nb, dtype=float)
@@ -896,11 +883,9 @@ def _volume_profile(df: pd.DataFrame, lookback: int = 140, bins: int = 48) -> Di
         poc_i = int(np.nanargmax(vol_bins))
         poc = float((edges[poc_i] + edges[poc_i + 1]) / 2.0)
 
-        # HVN: top 3 bins average
         top_idx = np.argsort(vol_bins)[-3:]
         hvn = float(np.mean([(edges[i] + edges[i + 1]) / 2.0 for i in top_idx]))
 
-        # LVN: among non-zero bins, choose min
         nz = np.where(vol_bins > 0)[0]
         lvn_i = int(nz[np.argmin(vol_bins[nz])]) if len(nz) else poc_i
         lvn = float((edges[lvn_i] + edges[lvn_i + 1]) / 2.0)
@@ -921,9 +906,6 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
       1) Sweep (raid) of EQ level (EQL for longs / EQH for shorts)
       2) Displacement candle in trend direction (impulse)
       3) Fresh FVG formed by displacement -> propose entry at FVG mid
-
-    Returns dict:
-      {"ok": bool, "bias": "LONG"/"SHORT", "entry": float|None, "zone": {low/high/...}|None, "note": str, ...}
     """
     out = {"ok": False, "bias": None, "entry": None, "zone": None, "note": "no_pattern"}
 
@@ -952,10 +934,8 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
         close_last = float(w["close"].astype(float).iloc[-1])
         tol = max(a * 0.10, abs(close_last) * 0.0003)
 
-        # choose nearest level (desk)
         lvl = float(min(eq_lows if bias == "LONG" else eq_highs, key=lambda x: abs(close_last - float(x))))
 
-        # search sweep candle in last 6 candles, then displacement in next 1-3
         tail_start = max(2, len(w) - 12)
         sweep_i = None
         for i in range(tail_start, len(w) - 1):
@@ -964,7 +944,6 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
             l = float(w["low"].iloc[i])
             c = float(w["close"].iloc[i])
             rng = max(h - l, 1e-12)
-            body = abs(c - o)
 
             lower_wick = max(min(o, c) - l, 0.0)
             upper_wick = max(h - max(o, c), 0.0)
@@ -983,7 +962,6 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
             out["note"] = "no_sweep"
             return out
 
-        # find displacement candle after sweep
         disp_i = None
         for j in range(sweep_i + 1, min(len(w), sweep_i + 4)):
             o = float(w["open"].iloc[j])
@@ -999,10 +977,10 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
             if impulse < 1.4 or body_ratio < 0.45:
                 continue
 
-            if bias == "LONG" and c > o and (c - o) > 0:
+            if bias == "LONG" and c > o:
                 disp_i = j
                 break
-            if bias == "SHORT" and c < o and (o - c) > 0:
+            if bias == "SHORT" and c < o:
                 disp_i = j
                 break
 
@@ -1010,15 +988,12 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
             out["note"] = "sweep_no_displacement"
             return out
 
-        # find a fresh FVG created around displacement candle
         zones = _detect_fvg(w, lookback=len(w), keep_last=12)
-        # keep zones created at/after displacement (the "fresh" displacement gap)
         zones = [z for z in zones if int(z.get("index", 0)) >= (len(df) - len(w) + disp_i)]
         if not zones:
             out["note"] = "no_fvg_after_displacement"
             return out
 
-        # pick zone closest to current price and matching bias
         best = None
         best_dist = 1e18
         for z in zones:
@@ -1089,6 +1064,8 @@ def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
             "cos": False,
             "bos_type": None,
             "bos_direction": None,
+            "bos_direction_raw": None,
+            "bos_bias": None,  # LONG/SHORT (derived)
             "broken_level": None,
             "order_blocks": {"bullish": None, "bearish": None},
             "fvg_zones": [],
@@ -1109,6 +1086,13 @@ def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
     raid = _raid_displacement_fvg(df, trend, lookback=180)
     vp = _volume_profile(df, lookback=160, bins=48)
 
+    bos_dir = bos_block.get("direction")
+    bos_bias = None
+    if str(bos_dir).upper() == "UP":
+        bos_bias = "LONG"
+    elif str(bos_dir).upper() == "DOWN":
+        bos_bias = "SHORT"
+
     return {
         "trend": trend,
         "swings": swings,
@@ -1117,7 +1101,9 @@ def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
         "choch": bool(bos_block.get("choch")),
         "cos": bool(bos_block.get("cos")),
         "bos_type": bos_block.get("bos_type"),
-        "bos_direction": bos_block.get("direction"),
+        "bos_direction": bos_dir,          # keep original behavior: UP/DOWN
+        "bos_direction_raw": bos_dir,
+        "bos_bias": bos_bias,              # extra helper (non-breaking)
         "broken_level": bos_block.get("broken_level"),
         "order_blocks": ob,
         "fvg_zones": fvg_zones,
@@ -1160,3 +1146,44 @@ def commitment_score(
         return float(max(-1.0, min(1.0, score)))
     except Exception:
         return 0.0
+
+
+# =====================================================================
+# Optional quick self-test (safe no-op in prod)
+# =====================================================================
+
+def run_structure_tests() -> Dict[str, Any]:
+    """
+    Minimal sanity checks (non-exhaustive). Returns dict with ok + details.
+    You can call this locally to ensure the module loads and core funcs run.
+    """
+    try:
+        # simple dummy OHLCV
+        n = 120
+        x = np.linspace(100, 110, n)
+        df = pd.DataFrame(
+            {
+                "open": x + np.random.normal(0, 0.2, n),
+                "high": x + np.random.normal(0.5, 0.2, n),
+                "low": x + np.random.normal(-0.5, 0.2, n),
+                "close": x + np.random.normal(0, 0.2, n),
+                "volume": np.random.uniform(10, 100, n),
+            }
+        )
+
+        st = analyze_structure(df)
+        lv = detect_equal_levels(df)
+        sw = liquidity_sweep_details(df, "LONG")
+        bq = bos_quality_details(df, direction="UP")
+
+        return {
+            "ok": True,
+            "trend": st.get("trend"),
+            "bos": st.get("bos"),
+            "eqh": len(lv.get("eq_highs") or []),
+            "eql": len(lv.get("eq_lows") or []),
+            "sweep_ok": bool(sw.get("ok")),
+            "bosq_grade": bq.get("grade"),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
