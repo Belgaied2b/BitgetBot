@@ -48,6 +48,41 @@ REQUIRED_COLS = ("open", "high", "low", "close", "volume")
 # Optional: allow technical fallback if Binance is banned/down (default False)
 ALLOW_TECH_FALLBACK_WHEN_INST_DOWN = str(os.getenv("ALLOW_TECH_FALLBACK_WHEN_INST_DOWN", "0")).strip() == "1"
 
+# =====================================================================
+# ✅ Liquidations + 2-pass institutional policy
+# =====================================================================
+def _env_flag(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip() == "1"
+
+
+def _env_str(name: str, default: str) -> str:
+    return str(os.getenv(name, default)).strip()
+
+
+# Liquidations enabled (global)
+INST_ENABLE_LIQUIDATIONS = _env_flag("INST_ENABLE_LIQUIDATIONS", "1")  # ✅ default ON (comme tu veux)
+
+# If 1: only call liquidations on PASS2 (recommended)
+INST_LIQ_PASS2_ONLY = _env_flag("INST_LIQ_PASS2_ONLY", "1")  # ✅ default ON (anti-ban)
+
+# Pass modes (override institutional_data INST_MODE)
+INST_PASS1_MODE = _env_str("INST_PASS1_MODE", "LIGHT").upper()
+INST_PASS2_MODE = _env_str("INST_PASS2_MODE", "NORMAL").upper()  # NORMAL par défaut (FULL si tu veux)
+
+# Enable/disable pass2 completely
+INST_PASS2_ENABLED = _env_flag("INST_PASS2_ENABLED", "1")
+
+# Only do pass2 when gate >= this value (1 = “un peu intéressant”)
+try:
+    INST_PASS2_MIN_GATE = int(_env_str("INST_PASS2_MIN_GATE", "1"))
+except Exception:
+    INST_PASS2_MIN_GATE = 1
+
+if INST_PASS1_MODE not in ("LIGHT", "NORMAL", "FULL"):
+    INST_PASS1_MODE = "LIGHT"
+if INST_PASS2_MODE not in ("LIGHT", "NORMAL", "FULL"):
+    INST_PASS2_MODE = "NORMAL"
+
 
 # =====================================================================
 # Base helpers
@@ -582,10 +617,19 @@ class SignalAnalyzer:
                 return _reject("momentum_not_bearish", structure=struct)
 
         # ===============================================================
-        # 1) INSTITUTIONAL — HARD GATE (but called only for candidates)
+        # 1) INSTITUTIONAL — 2-PASS (anti-ban) + Liquidations (re-enabled)
         # ===============================================================
+        inst: Dict[str, Any]
+
+        # Pass1: cheap, no liquidations by default
+        pass1_liq = bool(INST_ENABLE_LIQUIDATIONS and (not INST_LIQ_PASS2_ONLY))
         try:
-            inst = await compute_full_institutional_analysis(symbol, bias)
+            inst = await compute_full_institutional_analysis(
+                symbol,
+                bias,
+                mode=INST_PASS1_MODE,
+                include_liquidations=pass1_liq,
+            )
         except Exception as e:
             inst = {
                 "institutional_score": 0,
@@ -593,7 +637,7 @@ class SignalAnalyzer:
                 "available": False,
                 "warnings": [f"inst_exception:{e}"],
                 "score_components": {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0},
-                "score_meta": {"raw_components_sum": 0, "ok_count": 0},
+                "score_meta": {"raw_components_sum": 0, "ok_count": 0, "mode": INST_PASS1_MODE},
             }
 
         available = bool(inst.get("available", False))
@@ -602,11 +646,15 @@ class SignalAnalyzer:
         gate, ok_count = _inst_gate_value(inst)
         gate, override = _desk_inst_gate_override(inst, bias, int(gate))
 
+        mode_eff_1 = (inst.get("score_meta") or {}).get("mode") or INST_PASS1_MODE
+        liq_eff_1 = inst.get("liquidation_intensity") is not None
+
         LOGGER.info(
-            "[INST_RAW] %s inst_score=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s",
-            symbol, inst.get("institutional_score"), ok_count, gate, override, available, binance_symbol, bias
+            "[INST_RAW] %s pass=1 mode=%s liq_req=%s liq_ok=%s inst_score=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s",
+            symbol, mode_eff_1, pass1_liq, liq_eff_1, inst.get("institutional_score"), ok_count, gate, override, available, binance_symbol, bias
         )
 
+        # If inst not available: strict reject unless fallback enabled
         if (not available) or (binance_symbol is None):
             if ALLOW_TECH_FALLBACK_WHEN_INST_DOWN:
                 LOGGER.warning("[INST_DOWN] %s tech_fallback_enabled", symbol)
@@ -614,6 +662,51 @@ class SignalAnalyzer:
                 LOGGER.info("[EVAL_REJECT] %s inst_unavailable", symbol)
                 return _reject("inst_unavailable", institutional=inst, structure=struct, momentum=mom, composite=comp)
 
+        # Pass2: only for “candidates” + liquidations ON here
+        do_pass2 = bool(
+            INST_PASS2_ENABLED
+            and available
+            and (binance_symbol is not None)
+            and (int(gate) >= int(INST_PASS2_MIN_GATE) or bool(DESK_EV_MODE))
+        )
+
+        if do_pass2:
+            pass2_liq = bool(INST_ENABLE_LIQUIDATIONS)  # ✅ liquidations re-enabled here
+            try:
+                inst2 = await compute_full_institutional_analysis(
+                    symbol,
+                    bias,
+                    mode=INST_PASS2_MODE,
+                    include_liquidations=pass2_liq,
+                )
+            except Exception as e:
+                inst2 = {
+                    "institutional_score": 0,
+                    "binance_symbol": binance_symbol,
+                    "available": False,
+                    "warnings": [f"inst_pass2_exception:{e}"],
+                    "score_components": {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0},
+                    "score_meta": {"raw_components_sum": 0, "ok_count": 0, "mode": INST_PASS2_MODE},
+                }
+
+            if isinstance(inst2, dict) and bool(inst2.get("available")) and (inst2.get("binance_symbol") is not None):
+                inst = inst2
+
+                available = bool(inst.get("available", False))
+                binance_symbol = inst.get("binance_symbol")
+
+                gate, ok_count = _inst_gate_value(inst)
+                gate, override = _desk_inst_gate_override(inst, bias, int(gate))
+
+                mode_eff_2 = (inst.get("score_meta") or {}).get("mode") or INST_PASS2_MODE
+                liq_eff_2 = inst.get("liquidation_intensity") is not None
+
+                LOGGER.info(
+                    "[INST_RAW] %s pass=2 mode=%s liq_req=%s liq_ok=%s inst_score=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s",
+                    symbol, mode_eff_2, pass2_liq, liq_eff_2, inst.get("institutional_score"), ok_count, gate, override, available, binance_symbol, bias
+                )
+
+        # Hard gate (if inst up)
         if (not ALLOW_TECH_FALLBACK_WHEN_INST_DOWN) and int(gate) < int(MIN_INST_SCORE):
             LOGGER.info("[EVAL_REJECT] %s inst_gate_low gate=%s < %s", symbol, gate, MIN_INST_SCORE)
             return _reject("inst_gate_low", institutional=inst, structure=struct, inst_gate=int(gate), ok_count=int(ok_count))
@@ -653,7 +746,6 @@ class SignalAnalyzer:
         entry_type = str(entry_pick["entry_type"])
         atr14 = float(entry_pick.get("atr") or _atr(df_h1, 14))
 
-        # ✅ FIX: args match placeholders (source: ton log original)
         LOGGER.info(
             "[EVAL_PRE] %s ENTRY_PICK type=%s entry_mkt=%s entry_used=%s in_zone=%s note=%s atr=%.6g",
             symbol,
