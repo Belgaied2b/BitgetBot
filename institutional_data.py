@@ -2,19 +2,24 @@
 # institutional_data.py — Ultra Desk OI + Funding/Basis + (optional) Tape/OB/CVD
 # Binance USDT-M Futures (public endpoints), rate-limited + circuit-breaker
 #
-# Corrections appliquées (robustesse scan multi-coins) :
+# Robustesse scan multi-coins :
 # - Rate limiter global (semaphore + pacing)
 # - Circuit breaker "hard ban" (418 / -1003 avec ban-until) + "soft cooldown" (429 / -1003 / 5xx)
 # - Backoff / cooldown par symbole (évite de marteler le même coin)
 # - Shared aiohttp session (pas de session par call)
 # - Modes LIGHT/NORMAL/FULL + override par paramètre (scanner pass1/pass2)
 # - Sortie enrichie : available_components_count + available_components + ban info + mode effectif
-# - Fixes : fonctions manquantes, garde-fous JSON/parse, fermeture session
+#
+# NOTE IMPORTANT (Binance):
+# - L'endpoint REST /fapi/v1/allForceOrders (liquidations "market") est listé comme
+#   non maintenu et n'accepte plus les requêtes selon le change log. (Binance)
+#   -> include_liquidations est donc désactivé côté REST dans cette version.
 # =====================================================================
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -38,13 +43,13 @@ BINANCE_FAPI_BASE = "https://fapi.binance.com"
 # ---------------------------------------------------------------------
 # LIGHT: OI + premiumIndex (safe)
 # NORMAL: LIGHT + aggTrades + depth
-# FULL: NORMAL + klines + oiHist + fundingHist (+ liquidations optional)
+# FULL: NORMAL + klines + oiHist + fundingHist (+ LSR optional)
 INST_MODE = str(os.getenv("INST_MODE", "LIGHT")).upper().strip()
 if INST_MODE not in ("LIGHT", "NORMAL", "FULL"):
     INST_MODE = "LIGHT"
 
-# If True: even in FULL mode, liquidations require include_liquidations=True
-DEFAULT_INCLUDE_LIQUIDATIONS = str(os.getenv("INST_INCLUDE_LIQUIDATIONS", "0")).strip() == "1"
+# Optional add-ons (disabled by default to save calls)
+INCLUDE_LSR = str(os.getenv("INST_INCLUDE_LSR", "0")).strip() == "1"
 
 # ---------------------------------------------------------------------
 # Global rate limiting + circuit breaker
@@ -205,12 +210,16 @@ async def _http_get(path: str, params: Optional[Dict[str, Any]] = None, *, symbo
         try:
             async with session.get(url, params=params) as resp:
                 status = resp.status
-                txt = await resp.text()
+                raw = await resp.read()
+                txt = ""
+                try:
+                    txt = raw.decode("utf-8", errors="ignore")
+                except Exception:
+                    txt = str(raw)[:500]
 
-                # Attempt JSON parse when possible
                 data: Any = None
                 try:
-                    data = await resp.json()
+                    data = json.loads(txt) if txt else None
                 except Exception:
                     data = None
 
@@ -239,15 +248,15 @@ async def _http_get(path: str, params: Optional[Dict[str, Any]] = None, *, symbo
 
                     # 418 : ban IP en pratique -> hard ban
                     if status == 418:
-                        raw = (msg or txt or "")
-                        m = _RE_BAN_UNTIL.search(raw)
+                        raw_msg = (msg or txt or "")
+                        m = _RE_BAN_UNTIL.search(raw_msg)
                         if m:
-                            _set_hard_ban_until(int(m.group(1)), reason=f"{path} 418 {raw[:140]}")
+                            _set_hard_ban_until(int(m.group(1)), reason=f"{path} 418 {raw_msg[:140]}")
                         else:
                             _set_hard_ban_until(_now_ms() + _HARD_BAN_FALLBACK_MS, reason=f"{path} 418 no_ts")
                         if st is not None:
                             st.mark_err(base_ms=5_000)
-                        LOGGER.warning("[INST] HTTP 418 GET %s params=%s resp=%s", path, params, (raw or "")[:200])
+                        LOGGER.warning("[INST] HTTP 418 GET %s params=%s resp=%s", path, params, (raw_msg or "")[:200])
                         return None
 
                     # 429 : trop de requêtes -> soft cooldown
@@ -292,14 +301,13 @@ async def _http_get(path: str, params: Optional[Dict[str, Any]] = None, *, symbo
 # Light caches
 # ---------------------------------------------------------------------
 # Cache: key -> (ts, data)
-_KLINES_CACHE: Dict[Tuple[str, str], Tuple[float, Any]] = {}
+_KLINES_CACHE: Dict[Tuple[str, str, int], Tuple[float, Any]] = {}
 _DEPTH_CACHE: Dict[Tuple[str, int], Tuple[float, Any]] = {}
 _TRADES_CACHE: Dict[Tuple[str, int], Tuple[float, Any]] = {}
 _FUNDING_CACHE: Dict[str, Tuple[float, Any]] = {}
-_FUNDING_HIST_CACHE: Dict[str, Tuple[float, Any]] = {}
+_FUNDING_HIST_CACHE: Dict[Tuple[str, int], Tuple[float, Any]] = {}
 _OI_CACHE: Dict[str, Tuple[float, Any]] = {}
-_OI_HIST_CACHE: Dict[str, Tuple[float, Any]] = {}
-_FORCE_CACHE: Dict[str, Tuple[float, Any]] = {}
+_OI_HIST_CACHE: Dict[Tuple[str, str, int], Tuple[float, Any]] = {}
 _LSR_CACHE: Dict[Tuple[str, str, str, int], Tuple[float, Any]] = {}
 
 # OI slope memory: symbol -> (ts, oi)
@@ -317,12 +325,8 @@ FUNDING_TTL = float(os.getenv("INST_FUNDING_TTL", "60"))
 FUNDING_HIST_TTL = float(os.getenv("INST_FUNDING_HIST_TTL", "300"))
 OI_TTL = float(os.getenv("INST_OI_TTL", "60"))
 OI_HIST_TTL = float(os.getenv("INST_OI_HIST_TTL", "300"))
-FORCE_TTL = float(os.getenv("INST_FORCE_TTL", "180"))
 BINANCE_SYMBOLS_TTL = float(os.getenv("INST_EXCHANGEINFO_TTL", "900"))
 LSR_TTL = float(os.getenv("INST_LSR_TTL", "300"))
-
-# Optional add-ons (disabled by default to save calls)
-INCLUDE_LSR = str(os.getenv("INST_INCLUDE_LSR", "0")).strip() == "1"
 
 
 # =====================================================================
@@ -403,6 +407,10 @@ async def _fetch_open_interest(binance_symbol: str) -> Optional[float]:
 
 
 async def _fetch_premium_index(binance_symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Binance doc: Mark Price endpoint is GET /fapi/v1/premiumIndex and returns
+    markPrice, indexPrice, lastFundingRate, etc.
+    """
     now = time.time()
     cached = _FUNDING_CACHE.get(binance_symbol)
     if cached is not None and (now - cached[0]) < FUNDING_TTL:
@@ -447,7 +455,7 @@ async def _fetch_depth(binance_symbol: str, limit: int = 100) -> Optional[Dict[s
 
 
 async def _fetch_klines_1h(binance_symbol: str, limit: int = 120) -> Optional[List[List[Any]]]:
-    cache_key = (binance_symbol, "1h")
+    cache_key = (binance_symbol, "1h", int(limit))
     now = time.time()
     cached = _KLINES_CACHE.get(cache_key)
     if cached is not None and (now - cached[0]) < KLINES_TTL:
@@ -466,8 +474,9 @@ async def _fetch_klines_1h(binance_symbol: str, limit: int = 120) -> Optional[Li
 
 
 async def _fetch_open_interest_hist(binance_symbol: str, period: str = "5m", limit: int = 30) -> Optional[List[Dict[str, Any]]]:
+    cache_key = (binance_symbol, str(period), int(limit))
     now = time.time()
-    cached = _OI_HIST_CACHE.get(binance_symbol)
+    cached = _OI_HIST_CACHE.get(cache_key)
     if cached is not None and (now - cached[0]) < OI_HIST_TTL:
         return cached[1]  # type: ignore
 
@@ -479,13 +488,14 @@ async def _fetch_open_interest_hist(binance_symbol: str, period: str = "5m", lim
     if not isinstance(data, list) or not data:
         return None
 
-    _OI_HIST_CACHE[binance_symbol] = (now, data)
+    _OI_HIST_CACHE[cache_key] = (now, data)
     return data
 
 
 async def _fetch_funding_history(binance_symbol: str, limit: int = 30) -> Optional[List[Dict[str, Any]]]:
+    cache_key = (binance_symbol, int(limit))
     now = time.time()
-    cached = _FUNDING_HIST_CACHE.get(binance_symbol)
+    cached = _FUNDING_HIST_CACHE.get(cache_key)
     if cached is not None and (now - cached[0]) < FUNDING_HIST_TTL:
         return cached[1]  # type: ignore
 
@@ -493,25 +503,7 @@ async def _fetch_funding_history(binance_symbol: str, limit: int = 30) -> Option
     if not isinstance(data, list) or not data:
         return None
 
-    _FUNDING_HIST_CACHE[binance_symbol] = (now, data)
-    return data
-
-
-async def _fetch_force_orders(binance_symbol: str, limit: int = 50) -> Optional[List[Dict[str, Any]]]:
-    now = time.time()
-    cached = _FORCE_CACHE.get(binance_symbol)
-    if cached is not None and (now - cached[0]) < FORCE_TTL:
-        return cached[1]  # type: ignore
-
-    data = await _http_get(
-        "/fapi/v1/allForceOrders",
-        params={"symbol": binance_symbol, "limit": int(limit)},
-        symbol=binance_symbol,
-    )
-    if not isinstance(data, list) or not data:
-        return None
-
-    _FORCE_CACHE[binance_symbol] = (now, data)
+    _FUNDING_HIST_CACHE[cache_key] = (now, data)
     return data
 
 
@@ -605,9 +597,10 @@ def _compute_orderbook_imbalance(depth: Dict[str, Any], band_bps: float = 25.0) 
 def _compute_tape_delta(trades: List[Dict[str, Any]], window_sec: int = 300) -> Optional[float]:
     """
     Normalized taker delta in [-1,+1] over last window_sec.
-    For aggTrades:
-      - "m" (isBuyerMaker) == True => seller initiated (taker sells)
-      - "m" == False => buyer initiated (taker buys)
+
+    Binance aggTrades:
+      - "m" == True means buyer is the maker -> trade was seller-initiated (taker sells)
+      - "m" == False -> buyer-initiated (taker buys)
     """
     try:
         if not trades:
@@ -700,6 +693,7 @@ def _compute_oi_hist_slope(oi_hist: Optional[List[Dict[str, Any]]]) -> Optional[
         xs: List[float] = []
         for x in oi_hist[-20:]:
             try:
+                # Binance doc fields: sumOpenInterest / sumOpenInterestValue
                 xs.append(float(x.get("sumOpenInterest") or x.get("openInterest") or x.get("sumOpenInterestValue")))
             except Exception:
                 continue
@@ -715,6 +709,7 @@ def _compute_oi_hist_slope(oi_hist: Optional[List[Dict[str, Any]]]) -> Optional[
 
 def _compute_cvd_slope_from_klines(klines: List[List[Any]], window: int = 40) -> Optional[float]:
     """
+    Approx CVD from futures klines:
     delta = 2 * takerBuyBase - totalVolume
     cumulate delta; slope on last window.
     """
@@ -726,8 +721,8 @@ def _compute_cvd_slope_from_klines(klines: List[List[Any]], window: int = 40) ->
         cvs: List[float] = []
         for item in sub:
             try:
-                vol = float(item[5])
-                taker_buy = float(item[9])
+                vol = float(item[5])     # Volume
+                taker_buy = float(item[9])  # Taker buy base asset volume
             except Exception:
                 continue
             delta = 2.0 * taker_buy - vol
@@ -742,42 +737,6 @@ def _compute_cvd_slope_from_klines(klines: List[List[Any]], window: int = 40) ->
         return float((end - start) / den)
     except Exception:
         return None
-
-
-def _compute_liquidation_intensity(force_orders: Optional[List[Dict[str, Any]]], window_sec: int = 900) -> Tuple[Optional[float], Optional[str]]:
-    try:
-        if not force_orders:
-            return None, None
-        now_ms = _now_ms()
-        cutoff = now_ms - int(window_sec) * 1000
-
-        buy_qty = 0.0
-        sell_qty = 0.0
-        for x in reversed(force_orders):
-            ts = int(x.get("time") or x.get("T") or 0)
-            if ts < cutoff:
-                break
-            qty = float(x.get("origQty") or x.get("q") or 0.0)
-            side = str(x.get("side") or "").upper()
-            if qty <= 0:
-                continue
-            if side == "BUY":
-                buy_qty += qty
-            elif side == "SELL":
-                sell_qty += qty
-
-        total = buy_qty + sell_qty
-        if total <= 0:
-            return None, None
-
-        bias = "mixed"
-        if buy_qty > 1.6 * sell_qty:
-            bias = "buy_liq"
-        elif sell_qty > 1.6 * buy_qty:
-            bias = "sell_liq"
-        return float(total), bias
-    except Exception:
-        return None, None
 
 
 # =====================================================================
@@ -1021,8 +980,6 @@ def _available_components_list(payload: Dict[str, Any]) -> List[str]:
         out.append("oi_hist")
     if payload.get("funding_z") is not None:
         out.append("funding_hist")
-    if payload.get("liquidation_intensity") is not None:
-        out.append("liquidations")
     return out
 
 
@@ -1042,6 +999,10 @@ async def compute_full_institutional_analysis(
     - Uses circuit breaker if banned.
     - Uses mode (override) or INST_MODE env to control endpoint cost.
       mode: "LIGHT" | "NORMAL" | "FULL"
+
+    NOTE:
+    - include_liquidations (REST) is disabled in this implementation because Binance
+      indicates /fapi/v1/allForceOrders is not maintained / no longer accepts requests.
     """
     bias = (bias or "").upper().strip()
     eff_mode = (mode or INST_MODE).upper().strip()
@@ -1115,9 +1076,6 @@ async def compute_full_institutional_analysis(
 
     cvd_slope: Optional[float] = None
 
-    liq_intensity: Optional[float] = None
-    liq_bias: Optional[str] = None
-
     # Optional LSR
     lsr_global_last = lsr_global_slope = None
     lsr_top_last = lsr_top_slope = None
@@ -1154,13 +1112,15 @@ async def compute_full_institutional_analysis(
         warnings.append("no_premiumIndex")
 
     # -------------------------
-    # Mode NORMAL/FULL: add Tape + Orderbook
+    # Mode NORMAL/FULL: add Tape + Orderbook (parallel)
     # -------------------------
     trades = None
     depth = None
     if eff_mode in ("NORMAL", "FULL"):
-        trades = await _fetch_agg_trades(binance_symbol, limit=1000)
-        depth = await _fetch_depth(binance_symbol, limit=100)
+        trades, depth = await asyncio.gather(
+            _fetch_agg_trades(binance_symbol, limit=1000),
+            _fetch_depth(binance_symbol, limit=100),
+        )
 
         if isinstance(trades, list) and trades:
             tape_1m = _compute_tape_delta(trades, window_sec=60)
@@ -1175,12 +1135,14 @@ async def compute_full_institutional_analysis(
             warnings.append("no_depth")
 
     # -------------------------
-    # Mode FULL: add CVD + OI hist + funding hist (heavy endpoints)
+    # Mode FULL: add CVD + OI hist + funding hist (parallel)
     # -------------------------
     if eff_mode == "FULL":
-        klines = await _fetch_klines_1h(binance_symbol, limit=120)
-        oi_hist = await _fetch_open_interest_hist(binance_symbol, period="5m", limit=30)
-        funding_hist = await _fetch_funding_history(binance_symbol, limit=30)
+        klines, oi_hist, funding_hist = await asyncio.gather(
+            _fetch_klines_1h(binance_symbol, limit=120),
+            _fetch_open_interest_hist(binance_symbol, period="5m", limit=30),
+            _fetch_funding_history(binance_symbol, limit=30),
+        )
 
         if isinstance(klines, list) and klines:
             cvd_slope = _compute_cvd_slope_from_klines(klines, window=40)
@@ -1197,33 +1159,25 @@ async def compute_full_institutional_analysis(
         else:
             warnings.append("no_funding_hist")
 
-        # Optional LSR (even heavier, off by default)
+        # Optional LSR (heavier, off by default)
         if INCLUDE_LSR:
             try:
-                lsr_g = await _fetch_lsr("/futures/data/globalLongShortAccountRatio", binance_symbol, period="1h", limit=30)
+                lsr_g, lsr_t, tk = await asyncio.gather(
+                    _fetch_lsr("/futures/data/globalLongShortAccountRatio", binance_symbol, period="1h", limit=30),
+                    _fetch_lsr("/futures/data/topLongShortAccountRatio", binance_symbol, period="1h", limit=30),
+                    _fetch_lsr("/futures/data/takerlongshortRatio", binance_symbol, period="1h", limit=30),
+                )
                 lsr_global_last, lsr_global_slope = _extract_lsr_stats(lsr_g)
-            except Exception:
-                warnings.append("lsr_global_error")
-            try:
-                lsr_t = await _fetch_lsr("/futures/data/topLongShortAccountRatio", binance_symbol, period="1h", limit=30)
                 lsr_top_last, lsr_top_slope = _extract_lsr_stats(lsr_t)
-            except Exception:
-                warnings.append("lsr_top_error")
-            try:
-                tk = await _fetch_lsr("/futures/data/takerlongshortRatio", binance_symbol, period="1h", limit=30)
                 taker_ls_last, taker_ls_slope = _extract_lsr_stats(tk)
             except Exception:
-                warnings.append("lsr_taker_error")
+                warnings.append("lsr_error")
 
     # -------------------------
-    # Liquidations (optional)
+    # Liquidations (REST) disabled (Binance allForceOrders deprecated)
     # -------------------------
-    if include_liquidations or DEFAULT_INCLUDE_LIQUIDATIONS:
-        force_orders = await _fetch_force_orders(binance_symbol, limit=50)
-        if isinstance(force_orders, list) and force_orders:
-            liq_intensity, liq_bias = _compute_liquidation_intensity(force_orders, window_sec=900)
-        else:
-            warnings.append("no_force_orders")
+    if include_liquidations:
+        warnings.append("liquidations_rest_disabled_binance_allForceOrders_deprecated")
 
     funding_regime = _classify_funding(funding_rate, z=funding_z)
     basis_regime = _classify_basis(basis_pct)
@@ -1260,7 +1214,7 @@ async def compute_full_institutional_analysis(
         ]
     )
 
-    payload = {
+    payload: Dict[str, Any] = {
         # required (compat)
         "institutional_score": int(inst_score),
         "binance_symbol": binance_symbol,
@@ -1286,8 +1240,6 @@ async def compute_full_institutional_analysis(
         "funding_mean": funding_mean,
         "funding_std": funding_std,
         "funding_z": funding_z,
-        "liquidation_intensity": liq_intensity,
-        "liquidation_bias": liq_bias,
         # scoring debug
         "score_components": components,
         "score_meta": score_meta,
