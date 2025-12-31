@@ -441,6 +441,23 @@ def _inst_ok_count(inst: Dict[str, Any]) -> int:
         return 0
 
 
+def _inst_gate_value(inst: Dict[str, Any]) -> Tuple[int, int]:
+    """
+    Returns:
+      gate_score = integer used for gating (prefers raw sum of components)
+      ok_count   = number of components that are >0 (debug only)
+    """
+    try:
+        inst_score = int(inst.get("institutional_score") or 0)
+        meta = inst.get("score_meta") or {}
+        raw_sum = meta.get("raw_components_sum")
+        gate = int(raw_sum) if raw_sum is not None else inst_score
+        ok_count = int(meta.get("ok_count") or _inst_ok_count(inst))
+        return gate, ok_count
+    except Exception:
+        return 0, _inst_ok_count(inst)
+
+
 def _desk_inst_gate_override(inst: Dict[str, Any], bias: str, gate: int) -> Tuple[int, Optional[str]]:
     """
     If flow is clearly strong and crowding is not risky, allow bumping gate to MIN_INST_SCORE.
@@ -509,13 +526,16 @@ class SignalAnalyzer:
 
         # ---- structure ----
         struct = analyze_structure(df_h1)
-        bias = str(struct.get("trend", "")).upper()
+        struct_trend = str(struct.get("trend", "")).upper()
+        bias = str(struct_trend).upper()
 
         # Fallback bias if range
+        used_bias_fallback = False
         if bias not in ("LONG", "SHORT"):
             fb = _composite_bias_fallback(comp_score, comp_label, mom)
             if fb is not None:
                 bias = fb
+                used_bias_fallback = True
                 LOGGER.info("[EVAL_PRE] %s bias_fallback_for_inst=%s", symbol, bias)
             else:
                 LOGGER.info("[EVAL_REJECT] %s no_bias_fallback_for_inst", symbol)
@@ -523,20 +543,22 @@ class SignalAnalyzer:
 
         LOGGER.info(
             "[EVAL_PRE] %s STRUCT trend=%s bos=%s choch=%s cos=%s",
-            symbol, str(struct.get("trend", "")).upper(), struct.get("bos"), struct.get("choch"), struct.get("cos")
+            symbol, struct_trend, struct.get("bos"), struct.get("choch"), struct.get("cos")
         )
         LOGGER.info("[EVAL_PRE] %s MOMENTUM=%s", symbol, mom)
         LOGGER.info("[EVAL_PRE] %s MOMENTUM_COMPOSITE score=%.2f label=%s", symbol, comp_score, comp_label)
         LOGGER.info("[EVAL_PRE] %s VOL_REGIME=%s EXTENSION=%s", symbol, vol_reg, ext_sig)
 
-        # ===============================================================
+        # ---------------------------------------------------------------
         # PRE-FILTERS (cheap) BEFORE institutional call (anti-ban)
-        # ===============================================================
+        # ---------------------------------------------------------------
         bos_flag = bool(struct.get("bos", False))
+        raid_ok = bool(isinstance(struct.get("raid_displacement"), dict) and struct["raid_displacement"].get("ok"))
+        liq_sweep_pre = liquidity_sweep_details(df_h1, bias, lookback=180)
+        sweep_ok = bool(isinstance(liq_sweep_pre, dict) and liq_sweep_pre.get("ok"))
 
-        # If you require structure, range was already handled by fallback; so still ok.
-        # But if REQUIRE_STRUCTURE and original trend was RANGE, you can veto:
-        if REQUIRE_STRUCTURE and str(struct.get("trend", "")).upper() not in ("LONG", "SHORT"):
+        # REQUIRE_STRUCTURE: keep strict only outside desk mode.
+        if REQUIRE_STRUCTURE and used_bias_fallback and (not DESK_EV_MODE):
             LOGGER.info("[EVAL_REJECT] %s no_clear_trend_range", symbol)
             return _reject("no_clear_trend_range", structure=struct, momentum=mom, composite=comp)
 
@@ -545,10 +567,10 @@ class SignalAnalyzer:
                 LOGGER.info("[EVAL_REJECT] %s htf_veto", symbol)
                 return _reject("htf_veto", structure=struct)
 
-        # In non-desk mode, BOS is mandatory → reject early to avoid Binance spam
-        if (not DESK_EV_MODE) and (not bos_flag):
-            LOGGER.info("[EVAL_REJECT] %s no_bos", symbol)
-            return _reject("no_bos", structure=struct, momentum=mom, composite=comp)
+        # In non-desk mode, require at least one structural trigger (BOS or RAID or SWEEP)
+        if (not DESK_EV_MODE) and (not (bos_flag or raid_ok or sweep_ok)):
+            LOGGER.info("[EVAL_REJECT] %s no_structure_trigger", symbol)
+            return _reject("no_structure_trigger", structure=struct, sweep=liq_sweep_pre)
 
         # Momentum gating (cheap)
         if REQUIRE_MOMENTUM:
@@ -571,19 +593,18 @@ class SignalAnalyzer:
                 "available": False,
                 "warnings": [f"inst_exception:{e}"],
                 "score_components": {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0},
+                "score_meta": {"raw_components_sum": 0, "ok_count": 0},
             }
 
-        inst_score = int(inst.get("institutional_score") or 0)
         available = bool(inst.get("available", False))
         binance_symbol = inst.get("binance_symbol")
 
-        ok_count = _inst_ok_count(inst)
-        gate = int(ok_count)
-        gate, override = _desk_inst_gate_override(inst, bias, gate)
+        gate, ok_count = _inst_gate_value(inst)
+        gate, override = _desk_inst_gate_override(inst, bias, int(gate))
 
         LOGGER.info(
-            "[INST_RAW] %s score=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s",
-            symbol, inst_score, ok_count, gate, override, available, binance_symbol, bias
+            "[INST_RAW] %s inst_score=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s",
+            symbol, inst.get("institutional_score"), ok_count, gate, override, available, binance_symbol, bias
         )
 
         if (not available) or (binance_symbol is None):
@@ -593,9 +614,9 @@ class SignalAnalyzer:
                 LOGGER.info("[EVAL_REJECT] %s inst_unavailable", symbol)
                 return _reject("inst_unavailable", institutional=inst, structure=struct, momentum=mom, composite=comp)
 
-        if (not ALLOW_TECH_FALLBACK_WHEN_INST_DOWN) and gate < int(MIN_INST_SCORE):
-            LOGGER.info("[EVAL_REJECT] %s inst_components_low gate=%s < %s", symbol, gate, MIN_INST_SCORE)
-            return _reject("inst_components_low", institutional=inst, structure=struct, inst_gate=gate, ok_count=ok_count)
+        if (not ALLOW_TECH_FALLBACK_WHEN_INST_DOWN) and int(gate) < int(MIN_INST_SCORE):
+            LOGGER.info("[EVAL_REJECT] %s inst_gate_low gate=%s < %s", symbol, gate, MIN_INST_SCORE)
+            return _reject("inst_gate_low", institutional=inst, structure=struct, inst_gate=int(gate), ok_count=int(ok_count))
 
         # ===============================================================
         # 2) STRUCTURE / QUALITY / ENTRY / EXITS
@@ -624,7 +645,8 @@ class SignalAnalyzer:
         premium, discount = compute_premium_discount(df_h1)
         LOGGER.info("[EVAL_PRE] %s PREMIUM=%s DISCOUNT=%s", symbol, premium, discount)
 
-        liq_sweep = liquidity_sweep_details(df_h1, bias, lookback=180)
+        # reuse precomputed sweep
+        liq_sweep = liq_sweep_pre
 
         entry_pick = _pick_entry(df_h1, struct, bias)
         entry = float(entry_pick["entry_used"])
@@ -633,7 +655,7 @@ class SignalAnalyzer:
 
         LOGGER.info(
             "[EVAL_PRE] %s ENTRY_PICK type=%s entry_mkt=%s entry_used=%s in_zone=%s note=%s atr=%.6g",
-            symbol, entry_type, entry_pick.get("entry_mkt"), entry, entry_pick.get("in_zone"), entry_pick.get("note"), atr14
+            symbol, entry_type, entry_pick.get("entry_mkt"), entry_pick.get("in_zone"), entry_pick.get("note"), atr14
         )
 
         # Extension hygiene
@@ -666,6 +688,7 @@ class SignalAnalyzer:
         exits = _compute_exits(df_h1, entry, bias, tick=tick)
         sl = float(exits["sl"])
         tp1 = float(exits["tp1"])
+
         rr = _safe_rr(entry, sl, tp1, bias)
 
         # SL hygiene (push beyond sweep / eq levels)
@@ -706,10 +729,19 @@ class SignalAnalyzer:
             LOGGER.info("[EVAL_REJECT] %s sl_invalid_after_liq_adj sl=%s", symbol, sl)
             return _reject("sl_invalid_after_liq_adj", institutional=inst, structure=struct)
 
+        # ✅ IMPORTANT: recalc TP1 after SL adjustments (keeps RR logic consistent)
+        try:
+            tp1, rr_used2 = compute_tp1(entry, sl, bias, df=df_h1, tick=tick)
+            tp1 = float(tp1)
+        except Exception:
+            # keep previous tp1 if compute_tp1 fails
+            tp1 = float(tp1)
+
         rr = _safe_rr(entry, sl, tp1, bias)
+
         LOGGER.info(
             "[EVAL_PRE] %s EXITS entry=%s sl=%s tp1=%s tick=%s RR=%s raw_rr=%s entry_type=%s",
-            symbol, entry, sl, tp1, tick, rr, exits["rr_used"], entry_type
+            symbol, entry, sl, tp1, tick, rr, exits.get("rr_used"), entry_type
         )
 
         if rr is None or rr <= 0:
@@ -754,6 +786,7 @@ class SignalAnalyzer:
                 "institutional": inst,
                 "inst_gate": int(gate),
                 "inst_ok_count": int(ok_count),
+                "inst_score_eff": int(gate),
                 "momentum": mom,
                 "composite": comp,
                 "composite_score": comp_score,
@@ -785,6 +818,7 @@ class SignalAnalyzer:
                 "institutional": inst,
                 "inst_gate": int(gate),
                 "inst_ok_count": int(ok_count),
+                "inst_score_eff": int(gate),
                 "momentum": mom,
                 "composite": comp,
                 "composite_score": comp_score,
@@ -816,6 +850,7 @@ class SignalAnalyzer:
                 "institutional": inst,
                 "inst_gate": int(gate),
                 "inst_ok_count": int(ok_count),
+                "inst_score_eff": int(gate),
                 "momentum": mom,
                 "composite": comp,
                 "composite_score": comp_score,
@@ -852,6 +887,7 @@ class SignalAnalyzer:
                     "institutional": inst,
                     "inst_gate": int(gate),
                     "inst_ok_count": int(ok_count),
+                    "inst_score_eff": int(gate),
                     "momentum": mom,
                     "composite": comp,
                     "composite_score": comp_score,
@@ -873,6 +909,7 @@ class SignalAnalyzer:
             "rr": float(rr),
             "inst_gate": int(gate),
             "inst_ok_count": int(ok_count),
+            "inst_score_eff": int(gate),
             "composite_score": comp_score,
             "composite_label": comp_label,
         }
