@@ -1,721 +1,1327 @@
-# institutional_data.py
-# -*- coding: utf-8 -*-
-
-"""
-Institutional data layer (Binance USD-M focused) with:
-- LIGHT mode: read-only from a WebSocket hub cache (no per-symbol REST spam).
-- FULL mode: optional REST supplements (e.g., Open Interest) with hard cooldown/backoff.
-- Stable output keys to prevent KeyError and "missing field" issues.
-- Component availability + gating helpers (available_components_count).
-
-This module is designed to be safe under multi-symbol scans:
-- If REST starts failing (429 / 418 / -1003), we cool down globally and per symbol.
-- analyze_signal / scanner should prefer LIGHT for pass-1, FULL only for shortlist.
-
-Expected (optional) hub module:
-- institutional_ws_hub.py exposing a singleton or function returning a hub object with:
-    hub.get(symbol) -> dict snapshot (fresh timestamps)
-You can plug any hub; if missing, LIGHT returns mostly None and availability shows low.
-"""
+# =====================================================================
+# institutional_data.py — Ultra Desk OI + Funding/Basis + (optional) Tape/OB/CVD
+# Binance USDT-M Futures (public endpoints), rate-limited + circuit-breaker
+#
+# Corrections appliquées (robustesse scan multi-coins) :
+# - Rate limiter global (semaphore + pacing)
+# - Circuit breaker "hard ban" (418 / -1003 avec ban-until) + "soft cooldown" (429 / -1003 / 5xx)
+# - Backoff / cooldown par symbole (évite de marteler le même coin)
+# - Shared aiohttp session (pas de session par call)
+# - Modes LIGHT/NORMAL/FULL + override par paramètre (scanner pass1/pass2)
+# - Sortie enrichie : available_components_count + available_components + ban info + mode effectif
+# - Fixes : fonctions manquantes, garde-fous JSON/parse, fermeture session
+# =====================================================================
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
+import re
 import time
-import math
-import json
-import threading
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-# Optional dependency (most projects have it)
+import aiohttp
+
 try:
-    import requests  # type: ignore
+    import numpy as np
 except Exception:  # pragma: no cover
-    requests = None  # type: ignore
+    np = None  # type: ignore
 
 
-# ----------------------------
-# Optional project settings
-# ----------------------------
-def _load_settings_value(name: str, default: Any) -> Any:
-    # 1) env
-    if name in os.environ:
-        return os.environ[name]
-    # 2) settings.py if present
-    try:
-        import settings  # type: ignore
+LOGGER = logging.getLogger(__name__)
+BINANCE_FAPI_BASE = "https://fapi.binance.com"
 
-        if hasattr(settings, name):
-            return getattr(settings, name)
-    except Exception:
-        pass
-    return default
+# ---------------------------------------------------------------------
+# Modes (env) + overrides
+# ---------------------------------------------------------------------
+# LIGHT: OI + premiumIndex (safe)
+# NORMAL: LIGHT + aggTrades + depth
+# FULL: NORMAL + klines + oiHist + fundingHist (+ liquidations optional)
+INST_MODE = str(os.getenv("INST_MODE", "LIGHT")).upper().strip()
+if INST_MODE not in ("LIGHT", "NORMAL", "FULL"):
+    INST_MODE = "LIGHT"
+
+# If True: even in FULL mode, liquidations require include_liquidations=True
+DEFAULT_INCLUDE_LIQUIDATIONS = str(os.getenv("INST_INCLUDE_LIQUIDATIONS", "0")).strip() == "1"
+
+# ---------------------------------------------------------------------
+# Global rate limiting + circuit breaker
+# ---------------------------------------------------------------------
+_BINANCE_CONCURRENCY = max(1, int(os.getenv("BINANCE_HTTP_CONCURRENCY", "3")))
+_BINANCE_MIN_INTERVAL_SEC = float(os.getenv("BINANCE_MIN_INTERVAL_SEC", "0.12"))  # ~8.3 req/s total
+
+# Soft cooldown (ms) after 429/5xx/-1003 (sans ban-until)
+_SOFT_COOLDOWN_MS_DEFAULT = int(float(os.getenv("BINANCE_SOFT_COOLDOWN_SEC", "20")) * 1000)
+
+# Hard ban fallback if we cannot parse "banned until"
+_HARD_BAN_FALLBACK_MS = int(float(os.getenv("BINANCE_HARD_BAN_FALLBACK_MIN", "15")) * 60_000)
+
+_HTTP_SEM = asyncio.Semaphore(_BINANCE_CONCURRENCY)
+_PACE_LOCK = asyncio.Lock()
+_LAST_REQ_TS = 0.0
+
+# Circuit breaker times (ms timestamps)
+_BINANCE_HARD_BAN_UNTIL_MS = 0
+_BINANCE_SOFT_UNTIL_MS = 0
+
+# Per-symbol backoff
+_SYM_STATE: Dict[str, "SymbolBackoff"] = {}
+
+# Regex to extract ban-until ms from Binance messages
+_RE_BAN_UNTIL = re.compile(r"banned until (\d+)", re.IGNORECASE)
+
+# ---------------------------------------------------------------------
+# Shared session
+# ---------------------------------------------------------------------
+_SESSION: Optional[aiohttp.ClientSession] = None
+_SESSION_LOCK = asyncio.Lock()
 
 
-# REST base (Binance USD-M Futures)
-BINANCE_FAPI_REST_BASE = _load_settings_value("BINANCE_FAPI_REST_BASE", "https://fapi.binance.com")
-
-# Defaults
-INST_DEFAULT_MODE = str(_load_settings_value("INST_DEFAULT_MODE", "LIGHT")).upper().strip()  # LIGHT / FULL
-INST_LIGHT_TTL_MS = int(_load_settings_value("INST_LIGHT_TTL_MS", 7_000))  # hub freshness window
-INST_FULL_TTL_MS = int(_load_settings_value("INST_FULL_TTL_MS", 15_000))
-
-# Cooldowns/backoff
-INST_SYMBOL_COOLDOWN_SEC = float(_load_settings_value("INST_SYMBOL_COOLDOWN_SEC", 8.0))
-INST_GLOBAL_COOLDOWN_SEC = float(_load_settings_value("INST_GLOBAL_COOLDOWN_SEC", 3.0))
-INST_BAN_COOLDOWN_SEC = float(_load_settings_value("INST_BAN_COOLDOWN_SEC", 90.0))  # when we detect ban-ish errors
-
-# REST timeouts
-INST_REST_TIMEOUT = float(_load_settings_value("INST_REST_TIMEOUT", 4.0))
-
-# Scoring thresholds (directional)
-# You can move these to settings.py if you want finer control.
-INST_FUNDING_ABS_OK = float(_load_settings_value("INST_FUNDING_ABS_OK", 0.0005))  # 0.05%
-INST_DELTA_USD_OK = float(_load_settings_value("INST_DELTA_USD_OK", 50_000.0))
-INST_LIQ_USD_OK = float(_load_settings_value("INST_LIQ_USD_OK", 200_000.0))
-INST_OI_CHANGE_OK = float(_load_settings_value("INST_OI_CHANGE_OK", 0.01))  # +1% in window
-
-# If you want strict gating when components missing:
-INST_REQUIRE_MIN_AVAILABLE = int(_load_settings_value("INST_REQUIRE_MIN_AVAILABLE", 2))
-
-
-# ----------------------------
-# Utilities
-# ----------------------------
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        if isinstance(x, bool):
-            return float(x)
-        if isinstance(x, (int, float)):
-            if math.isfinite(float(x)):
-                return float(x)
-            return None
-        s = str(x).strip()
-        if s == "":
-            return None
-        v = float(s)
-        return v if math.isfinite(v) else None
-    except Exception:
-        return None
+def _is_hard_banned() -> bool:
+    return _now_ms() < int(_BINANCE_HARD_BAN_UNTIL_MS)
 
 
-def _safe_int(x: Any) -> Optional[int]:
-    try:
-        if x is None:
-            return None
-        if isinstance(x, bool):
-            return int(x)
-        if isinstance(x, int):
-            return x
-        if isinstance(x, float):
-            if math.isfinite(x):
-                return int(x)
-            return None
-        s = str(x).strip()
-        if s == "":
-            return None
-        return int(float(s))
-    except Exception:
-        return None
+def _is_soft_blocked() -> bool:
+    return _now_ms() < int(_BINANCE_SOFT_UNTIL_MS)
 
 
-def normalize_binance_symbol(symbol: str) -> str:
-    """
-    Tries to map KuCoin-ish or project symbols to Binance USD-M symbol format:
-    - 'BTCUSDTM' -> 'BTCUSDT'
-    - 'BTC-USDT' -> 'BTCUSDT'
-    - 'BTC/USDT' -> 'BTCUSDT'
-    - 'BTCUSDT_PERP' -> 'BTCUSDT'
-    """
+def _set_hard_ban_until(ms: int, reason: str) -> None:
+    global _BINANCE_HARD_BAN_UNTIL_MS
+    ms = int(ms)
+    if ms > _BINANCE_HARD_BAN_UNTIL_MS:
+        _BINANCE_HARD_BAN_UNTIL_MS = ms
+    LOGGER.error("[INST] BINANCE HARD BAN until_ms=%s reason=%s", ms, reason)
+
+
+def _set_soft_cooldown(ms_from_now: int, reason: str) -> None:
+    global _BINANCE_SOFT_UNTIL_MS
+    until = _now_ms() + int(ms_from_now)
+    if until > _BINANCE_SOFT_UNTIL_MS:
+        _BINANCE_SOFT_UNTIL_MS = until
+    LOGGER.warning("[INST] BINANCE SOFT COOLDOWN until_ms=%s reason=%s", _BINANCE_SOFT_UNTIL_MS, reason)
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    global _SESSION
+    if _SESSION is not None and not _SESSION.closed:
+        return _SESSION
+
+    async with _SESSION_LOCK:
+        if _SESSION is not None and not _SESSION.closed:
+            return _SESSION
+        timeout = aiohttp.ClientTimeout(total=10)
+        connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+        _SESSION = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        return _SESSION
+
+
+async def close_institutional_session() -> None:
+    """Optionnel: à appeler proprement au shutdown."""
+    global _SESSION
+    if _SESSION is not None and not _SESSION.closed:
+        try:
+            await _SESSION.close()
+        except Exception:
+            pass
+    _SESSION = None
+
+
+async def _pace() -> None:
+    global _LAST_REQ_TS
+    async with _PACE_LOCK:
+        now = time.time()
+        wait = _BINANCE_MIN_INTERVAL_SEC - (now - _LAST_REQ_TS)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _LAST_REQ_TS = time.time()
+
+
+@dataclass
+class SymbolBackoff:
+    until_ms: int = 0
+    errors: int = 0
+
+    def blocked(self) -> bool:
+        return _now_ms() < int(self.until_ms)
+
+    def mark_ok(self) -> None:
+        self.errors = 0
+        self.until_ms = 0
+
+    def mark_err(self, base_ms: int = 1200, cap_ms: int = 120_000) -> None:
+        # backoff exponentiel raisonnable
+        self.errors += 1
+        mult = 1.7 ** min(self.errors, 8)
+        cd = int(min(cap_ms, base_ms * mult))
+        self.until_ms = max(self.until_ms, _now_ms() + cd)
+
+
+def _sym_key(symbol: Optional[str]) -> Optional[str]:
     if not symbol:
-        return symbol
-    s = symbol.upper().replace("-", "").replace("/", "").replace(":", "")
-    s = s.replace("_PERP", "").replace("PERP", "")
-    if s.endswith("USDTM"):
-        s = s[:-1]  # drop trailing 'M' -> USDT
-    return s
+        return None
+    return str(symbol).upper()
 
 
-# ----------------------------
-# Backoff / cooldown manager
-# ----------------------------
-@dataclass
-class BackoffState:
-    next_allowed_ts: float = 0.0
-    ban_until_ts: float = 0.0
-    consecutive_errors: int = 0
-
-    def is_banned(self) -> bool:
-        return time.time() < self.ban_until_ts
-
-    def is_in_cooldown(self) -> bool:
-        return time.time() < self.next_allowed_ts
-
-    def mark_success(self) -> None:
-        self.consecutive_errors = 0
-        self.next_allowed_ts = time.time() + INST_GLOBAL_COOLDOWN_SEC
-
-    def mark_error(self, severe: bool = False) -> None:
-        self.consecutive_errors += 1
-        base = INST_GLOBAL_COOLDOWN_SEC
-        # exponential-ish
-        cooldown = min(60.0, base * (1.6 ** min(self.consecutive_errors, 8)))
-        self.next_allowed_ts = time.time() + cooldown
-        if severe:
-            self.ban_until_ts = max(self.ban_until_ts, time.time() + INST_BAN_COOLDOWN_SEC)
+def _get_sym_state(symbol: Optional[str]) -> Optional[SymbolBackoff]:
+    k = _sym_key(symbol)
+    if not k:
+        return None
+    st = _SYM_STATE.get(k)
+    if st is None:
+        st = SymbolBackoff()
+        _SYM_STATE[k] = st
+    return st
 
 
-@dataclass
-class SymbolBackoffState:
-    next_allowed_ts: float = 0.0
-    ban_until_ts: float = 0.0
-    consecutive_errors: int = 0
+async def _http_get(path: str, params: Optional[Dict[str, Any]] = None, *, symbol: Optional[str] = None) -> Any:
+    """
+    Safe GET with:
+    - hard/soft circuit breaker
+    - concurrency semaphore
+    - pacing
+    - per-symbol backoff
+    - ban parsing
+    """
+    if _is_hard_banned():
+        return None
+    if _is_soft_blocked():
+        return None
 
-    def is_banned(self) -> bool:
-        return time.time() < self.ban_until_ts
+    st = _get_sym_state(symbol)
+    if st is not None and st.blocked():
+        return None
 
-    def is_in_cooldown(self) -> bool:
-        return time.time() < self.next_allowed_ts
+    url = BINANCE_FAPI_BASE + path
+    session = await _get_session()
 
-    def mark_success(self) -> None:
-        self.consecutive_errors = 0
-        self.next_allowed_ts = time.time() + INST_SYMBOL_COOLDOWN_SEC
-
-    def mark_error(self, severe: bool = False) -> None:
-        self.consecutive_errors += 1
-        base = INST_SYMBOL_COOLDOWN_SEC
-        cooldown = min(120.0, base * (1.7 ** min(self.consecutive_errors, 8)))
-        self.next_allowed_ts = time.time() + cooldown
-        if severe:
-            self.ban_until_ts = max(self.ban_until_ts, time.time() + INST_BAN_COOLDOWN_SEC)
-
-
-# ----------------------------
-# REST client (optional supplements)
-# ----------------------------
-class BinanceFapiRestClient:
-    def __init__(self, base_url: str = BINANCE_FAPI_REST_BASE, timeout: float = INST_REST_TIMEOUT) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-
-    def _request_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-        """
-        Returns: (json_dict_or_none, meta)
-        meta includes:
-          - ok (bool)
-          - http_status (int|None)
-          - error_code (int|None)
-          - error_msg (str|None)
-        """
-        meta = {"ok": False, "http_status": None, "error_code": None, "error_msg": None}
-
-        if requests is None:
-            meta["error_msg"] = "requests_not_available"
-            return None, meta
-
-        url = f"{self.base_url}{path}"
+    async with _HTTP_SEM:
+        await _pace()
         try:
-            r = requests.get(url, params=params or {}, timeout=self.timeout)
-            meta["http_status"] = r.status_code
-            # Binance may return JSON error payload with code/msg
-            try:
-                data = r.json()
-            except Exception:
-                data = None
+            async with session.get(url, params=params) as resp:
+                status = resp.status
+                txt = await resp.text()
 
-            if r.status_code >= 200 and r.status_code < 300 and isinstance(data, dict):
-                meta["ok"] = True
-                return data, meta
+                # Attempt JSON parse when possible
+                data: Any = None
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = None
 
-            # errors
-            if isinstance(data, dict):
-                meta["error_code"] = _safe_int(data.get("code"))
-                meta["error_msg"] = str(data.get("msg")) if data.get("msg") is not None else None
-            else:
-                meta["error_msg"] = f"non_json_error_http_{r.status_code}"
-            return None, meta
+                if status != 200:
+                    msg = ""
+                    code = None
+                    if isinstance(data, dict):
+                        msg = str(data.get("msg") or "")
+                        code = data.get("code")
 
+                    # -1003 : rate limit (parfois avec banned until)
+                    if isinstance(code, int) and code == -1003:
+                        low = msg.lower()
+                        if "banned until" in low:
+                            m = _RE_BAN_UNTIL.search(low)
+                            if m:
+                                _set_hard_ban_until(int(m.group(1)), reason=f"{path} -1003 {msg[:140]}")
+                            else:
+                                _set_hard_ban_until(_now_ms() + _HARD_BAN_FALLBACK_MS, reason=f"{path} -1003 no_ts")
+                        else:
+                            _set_soft_cooldown(_SOFT_COOLDOWN_MS_DEFAULT, reason=f"{path} -1003 {msg[:140]}")
+                        if st is not None:
+                            st.mark_err(base_ms=3_000)
+                        LOGGER.warning("[INST] HTTP %s GET %s params=%s msg=%s", status, path, params, (msg or txt)[:200])
+                        return None
+
+                    # 418 : ban IP en pratique -> hard ban
+                    if status == 418:
+                        raw = (msg or txt or "")
+                        m = _RE_BAN_UNTIL.search(raw)
+                        if m:
+                            _set_hard_ban_until(int(m.group(1)), reason=f"{path} 418 {raw[:140]}")
+                        else:
+                            _set_hard_ban_until(_now_ms() + _HARD_BAN_FALLBACK_MS, reason=f"{path} 418 no_ts")
+                        if st is not None:
+                            st.mark_err(base_ms=5_000)
+                        LOGGER.warning("[INST] HTTP 418 GET %s params=%s resp=%s", path, params, (raw or "")[:200])
+                        return None
+
+                    # 429 : trop de requêtes -> soft cooldown
+                    if status == 429:
+                        _set_soft_cooldown(_SOFT_COOLDOWN_MS_DEFAULT, reason=f"{path} 429")
+                        if st is not None:
+                            st.mark_err(base_ms=2_500)
+                        LOGGER.warning("[INST] HTTP 429 GET %s params=%s", path, params)
+                        return None
+
+                    # 5xx : soft cooldown court
+                    if 500 <= status <= 599:
+                        _set_soft_cooldown(5_000, reason=f"{path} {status}")
+                        if st is not None:
+                            st.mark_err(base_ms=1_800)
+                        LOGGER.warning("[INST] HTTP %s GET %s params=%s", status, path, params)
+                        return None
+
+                    if st is not None:
+                        st.mark_err(base_ms=1_500)
+                    LOGGER.warning("[INST] HTTP %s GET %s params=%s resp=%s", status, path, params, (txt or "")[:200])
+                    return None
+
+                # OK
+                if st is not None:
+                    st.mark_ok()
+                return data
+
+        except asyncio.TimeoutError:
+            if st is not None:
+                st.mark_err(base_ms=1_600)
+            LOGGER.error("[INST] Timeout GET %s params=%s", path, params)
+            return None
         except Exception as e:
-            meta["error_msg"] = f"exception:{type(e).__name__}"
-            return None, meta
-
-    def fetch_open_interest(self, symbol: str) -> Tuple[Optional[float], Dict[str, Any]]:
-        """
-        USD-M endpoint (documented by Binance):
-          GET /fapi/v1/openInterest?symbol=BTCUSDT
-        Response has "openInterest" (string number).
-        """
-        data, meta = self._request_json("/fapi/v1/openInterest", params={"symbol": symbol})
-        if not meta.get("ok") or not isinstance(data, dict):
-            return None, meta
-        return _safe_float(data.get("openInterest")), meta
+            if st is not None:
+                st.mark_err(base_ms=2_000)
+            LOGGER.error("[INST] Exception GET %s params=%s: %s", path, params, e)
+            return None
 
 
-# ----------------------------
-# Hub adapter (optional)
-# ----------------------------
-class HubAdapter:
-    """
-    Minimal adapter contract:
-      get(symbol) -> dict with latest fields and a timestamp (ms)
-    """
+# ---------------------------------------------------------------------
+# Light caches
+# ---------------------------------------------------------------------
+# Cache: key -> (ts, data)
+_KLINES_CACHE: Dict[Tuple[str, str], Tuple[float, Any]] = {}
+_DEPTH_CACHE: Dict[Tuple[str, int], Tuple[float, Any]] = {}
+_TRADES_CACHE: Dict[Tuple[str, int], Tuple[float, Any]] = {}
+_FUNDING_CACHE: Dict[str, Tuple[float, Any]] = {}
+_FUNDING_HIST_CACHE: Dict[str, Tuple[float, Any]] = {}
+_OI_CACHE: Dict[str, Tuple[float, Any]] = {}
+_OI_HIST_CACHE: Dict[str, Tuple[float, Any]] = {}
+_FORCE_CACHE: Dict[str, Tuple[float, Any]] = {}
+_LSR_CACHE: Dict[Tuple[str, str, str, int], Tuple[float, Any]] = {}
 
-    def __init__(self) -> None:
-        self._hub = None
-        self._init_attempted = False
+# OI slope memory: symbol -> (ts, oi)
+_OI_HISTORY: Dict[str, Tuple[float, float]] = {}
 
-    def _lazy_init(self) -> None:
-        if self._init_attempted:
-            return
-        self._init_attempted = True
+# Binance symbols cache
+_BINANCE_SYMBOLS: Optional[Set[str]] = None
+_BINANCE_SYMBOLS_TS: float = 0.0
+
+# TTLs (seconds)
+KLINES_TTL = float(os.getenv("INST_KLINES_TTL", "120"))
+DEPTH_TTL = float(os.getenv("INST_DEPTH_TTL", "10"))
+TRADES_TTL = float(os.getenv("INST_TRADES_TTL", "10"))
+FUNDING_TTL = float(os.getenv("INST_FUNDING_TTL", "60"))
+FUNDING_HIST_TTL = float(os.getenv("INST_FUNDING_HIST_TTL", "300"))
+OI_TTL = float(os.getenv("INST_OI_TTL", "60"))
+OI_HIST_TTL = float(os.getenv("INST_OI_HIST_TTL", "300"))
+FORCE_TTL = float(os.getenv("INST_FORCE_TTL", "180"))
+BINANCE_SYMBOLS_TTL = float(os.getenv("INST_EXCHANGEINFO_TTL", "900"))
+LSR_TTL = float(os.getenv("INST_LSR_TTL", "300"))
+
+# Optional add-ons (disabled by default to save calls)
+INCLUDE_LSR = str(os.getenv("INST_INCLUDE_LSR", "0")).strip() == "1"
+
+
+# =====================================================================
+# Binance symbols (exchangeInfo)
+# =====================================================================
+async def _get_binance_symbols() -> Set[str]:
+    global _BINANCE_SYMBOLS, _BINANCE_SYMBOLS_TS
+    now = time.time()
+    if _BINANCE_SYMBOLS is not None and (now - _BINANCE_SYMBOLS_TS) < BINANCE_SYMBOLS_TTL:
+        return _BINANCE_SYMBOLS
+
+    data = await _http_get("/fapi/v1/exchangeInfo", params=None, symbol=None)
+    symbols: Set[str] = set()
+
+    if not isinstance(data, dict) or "symbols" not in data:
+        LOGGER.warning("[INST] Unable to fetch Binance exchangeInfo, keeping old symbols cache")
+        _BINANCE_SYMBOLS = _BINANCE_SYMBOLS or set()
+        return _BINANCE_SYMBOLS
+
+    for s in data.get("symbols", []):
         try:
-            # expected file you will add later
-            import institutional_ws_hub  # type: ignore
+            if s.get("status") != "TRADING":
+                continue
+            if s.get("contractType") != "PERPETUAL":
+                continue
+            if s.get("quoteAsset") != "USDT":
+                continue
+            sym = str(s.get("symbol", "")).upper()
+            if sym:
+                symbols.add(sym)
+        except Exception:
+            continue
 
-            # common patterns:
-            # - institutional_ws_hub.HUB
-            # - institutional_ws_hub.get_hub()
-            if hasattr(institutional_ws_hub, "HUB"):
-                self._hub = getattr(institutional_ws_hub, "HUB")
-            elif hasattr(institutional_ws_hub, "get_hub"):
-                self._hub = institutional_ws_hub.get_hub()  # type: ignore
+    _BINANCE_SYMBOLS = symbols
+    _BINANCE_SYMBOLS_TS = now
+    LOGGER.info("[INST] Binance futures symbols loaded: %d", len(symbols))
+    return _BINANCE_SYMBOLS
+
+
+def _map_symbol_to_binance(symbol: str, binance_symbols: Set[str]) -> Optional[str]:
+    """
+    Map KuCoin/Bitget symbols to Binance USDT-M perp symbol.
+    Handles:
+      - direct
+      - 1000TOKENUSDT -> TOKENUSDT
+      - TOKENUSDT_UMCBL / BTCUSDTM / BTC-USDT -> BTCUSDT
+    """
+    s = (symbol or "").upper().replace("-", "").replace("_", "")
+    s = s.replace("UMCBL", "").replace("USDTM", "USDT")
+    if s in binance_symbols:
+        return s
+    if s.startswith("1000"):
+        alt = s[4:]
+        if alt in binance_symbols:
+            return alt
+    return None
+
+
+# =====================================================================
+# Endpoints
+# =====================================================================
+async def _fetch_open_interest(binance_symbol: str) -> Optional[float]:
+    now = time.time()
+    cached = _OI_CACHE.get(binance_symbol)
+    if cached is not None and (now - cached[0]) < OI_TTL:
+        return cached[1]  # type: ignore
+
+    data = await _http_get("/fapi/v1/openInterest", params={"symbol": binance_symbol}, symbol=binance_symbol)
+    if not isinstance(data, dict) or "openInterest" not in data:
+        return None
+    try:
+        oi = float(data["openInterest"])
+    except Exception:
+        return None
+
+    _OI_CACHE[binance_symbol] = (now, oi)
+    return oi
+
+
+async def _fetch_premium_index(binance_symbol: str) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    cached = _FUNDING_CACHE.get(binance_symbol)
+    if cached is not None and (now - cached[0]) < FUNDING_TTL:
+        return cached[1]  # type: ignore
+
+    data = await _http_get("/fapi/v1/premiumIndex", params={"symbol": binance_symbol}, symbol=binance_symbol)
+    if not isinstance(data, dict) or "symbol" not in data:
+        return None
+
+    _FUNDING_CACHE[binance_symbol] = (now, data)
+    return data
+
+
+async def _fetch_agg_trades(binance_symbol: str, limit: int = 1000) -> Optional[List[Dict[str, Any]]]:
+    cache_key = (binance_symbol, int(limit))
+    now = time.time()
+    cached = _TRADES_CACHE.get(cache_key)
+    if cached is not None and (now - cached[0]) < TRADES_TTL:
+        return cached[1]  # type: ignore
+
+    data = await _http_get("/fapi/v1/aggTrades", params={"symbol": binance_symbol, "limit": int(limit)}, symbol=binance_symbol)
+    if not isinstance(data, list) or not data:
+        return None
+
+    _TRADES_CACHE[cache_key] = (now, data)
+    return data
+
+
+async def _fetch_depth(binance_symbol: str, limit: int = 100) -> Optional[Dict[str, Any]]:
+    cache_key = (binance_symbol, int(limit))
+    now = time.time()
+    cached = _DEPTH_CACHE.get(cache_key)
+    if cached is not None and (now - cached[0]) < DEPTH_TTL:
+        return cached[1]  # type: ignore
+
+    data = await _http_get("/fapi/v1/depth", params={"symbol": binance_symbol, "limit": int(limit)}, symbol=binance_symbol)
+    if not isinstance(data, dict) or "bids" not in data or "asks" not in data:
+        return None
+
+    _DEPTH_CACHE[cache_key] = (now, data)
+    return data
+
+
+async def _fetch_klines_1h(binance_symbol: str, limit: int = 120) -> Optional[List[List[Any]]]:
+    cache_key = (binance_symbol, "1h")
+    now = time.time()
+    cached = _KLINES_CACHE.get(cache_key)
+    if cached is not None and (now - cached[0]) < KLINES_TTL:
+        return cached[1]  # type: ignore
+
+    data = await _http_get(
+        "/fapi/v1/klines",
+        params={"symbol": binance_symbol, "interval": "1h", "limit": int(limit)},
+        symbol=binance_symbol,
+    )
+    if not isinstance(data, list) or not data:
+        return None
+
+    _KLINES_CACHE[cache_key] = (now, data)
+    return data
+
+
+async def _fetch_open_interest_hist(binance_symbol: str, period: str = "5m", limit: int = 30) -> Optional[List[Dict[str, Any]]]:
+    now = time.time()
+    cached = _OI_HIST_CACHE.get(binance_symbol)
+    if cached is not None and (now - cached[0]) < OI_HIST_TTL:
+        return cached[1]  # type: ignore
+
+    data = await _http_get(
+        "/futures/data/openInterestHist",
+        params={"symbol": binance_symbol, "period": period, "limit": int(limit)},
+        symbol=binance_symbol,
+    )
+    if not isinstance(data, list) or not data:
+        return None
+
+    _OI_HIST_CACHE[binance_symbol] = (now, data)
+    return data
+
+
+async def _fetch_funding_history(binance_symbol: str, limit: int = 30) -> Optional[List[Dict[str, Any]]]:
+    now = time.time()
+    cached = _FUNDING_HIST_CACHE.get(binance_symbol)
+    if cached is not None and (now - cached[0]) < FUNDING_HIST_TTL:
+        return cached[1]  # type: ignore
+
+    data = await _http_get("/fapi/v1/fundingRate", params={"symbol": binance_symbol, "limit": int(limit)}, symbol=binance_symbol)
+    if not isinstance(data, list) or not data:
+        return None
+
+    _FUNDING_HIST_CACHE[binance_symbol] = (now, data)
+    return data
+
+
+async def _fetch_force_orders(binance_symbol: str, limit: int = 50) -> Optional[List[Dict[str, Any]]]:
+    now = time.time()
+    cached = _FORCE_CACHE.get(binance_symbol)
+    if cached is not None and (now - cached[0]) < FORCE_TTL:
+        return cached[1]  # type: ignore
+
+    data = await _http_get(
+        "/fapi/v1/allForceOrders",
+        params={"symbol": binance_symbol, "limit": int(limit)},
+        symbol=binance_symbol,
+    )
+    if not isinstance(data, list) or not data:
+        return None
+
+    _FORCE_CACHE[binance_symbol] = (now, data)
+    return data
+
+
+# =====================================================================
+# LSR endpoints (optional)
+# =====================================================================
+async def _fetch_lsr(path: str, binance_symbol: str, period: str = "1h", limit: int = 30) -> Optional[List[Dict[str, Any]]]:
+    cache_key = (path, binance_symbol, period, int(limit))
+    now = time.time()
+    cached = _LSR_CACHE.get(cache_key)
+    if cached is not None and (now - cached[0]) < LSR_TTL:
+        return cached[1]  # type: ignore
+
+    data = await _http_get(path, params={"symbol": binance_symbol, "period": period, "limit": int(limit)}, symbol=binance_symbol)
+    if not isinstance(data, list) or not data:
+        return None
+
+    _LSR_CACHE[cache_key] = (now, data)
+    return data
+
+
+def _extract_lsr_stats(lsr: Optional[List[Dict[str, Any]]]) -> Tuple[Optional[float], Optional[float]]:
+    """Returns: (last_ratio, slope)"""
+    try:
+        if not lsr or len(lsr) < 6:
+            return None, None
+        vals: List[float] = []
+        for x in lsr[-20:]:
+            v = x.get("longShortRatio")
+            if v is None:
+                v = x.get("longAccount")
+            try:
+                vals.append(float(v))
+            except Exception:
+                continue
+        if len(vals) < 6:
+            return None, None
+        a = float(vals[0])
+        b = float(vals[-1])
+        den = abs(a) if abs(a) > 1e-12 else max(abs(b), 1e-12)
+        slope = float((b - a) / den)
+        return float(vals[-1]), slope
+    except Exception:
+        return None, None
+
+
+# =====================================================================
+# Metrics helpers
+# =====================================================================
+def _compute_orderbook_imbalance(depth: Dict[str, Any], band_bps: float = 25.0) -> Optional[float]:
+    """Imbalance in [-1,+1] computed within +/- band_bps around mid."""
+    try:
+        bids = depth.get("bids") or []
+        asks = depth.get("asks") or []
+        if not bids or not asks:
+            return None
+
+        b0p = float(bids[0][0])
+        a0p = float(asks[0][0])
+        if a0p <= 0 or b0p <= 0:
+            return None
+
+        mid = (b0p + a0p) / 2.0
+        band = float(band_bps) / 10000.0
+        lo = mid * (1.0 - band)
+        hi = mid * (1.0 + band)
+
+        bid_val = 0.0
+        ask_val = 0.0
+
+        for p, q in bids:
+            pf = float(p)
+            if pf < lo:
+                break
+            bid_val += pf * float(q)
+
+        for p, q in asks:
+            pf = float(p)
+            if pf > hi:
+                break
+            ask_val += pf * float(q)
+
+        den = bid_val + ask_val
+        if den <= 0:
+            return None
+        return float((bid_val - ask_val) / den)
+    except Exception:
+        return None
+
+
+def _compute_tape_delta(trades: List[Dict[str, Any]], window_sec: int = 300) -> Optional[float]:
+    """
+    Normalized taker delta in [-1,+1] over last window_sec.
+    For aggTrades:
+      - "m" (isBuyerMaker) == True => seller initiated (taker sells)
+      - "m" == False => buyer initiated (taker buys)
+    """
+    try:
+        if not trades:
+            return None
+        now_ms = _now_ms()
+        cutoff = now_ms - int(window_sec) * 1000
+
+        buy = 0.0
+        sell = 0.0
+        for t in reversed(trades):
+            ts = int(t.get("T") or 0)
+            if ts < cutoff:
+                break
+            qty = float(t.get("q") or 0.0)
+            if qty <= 0:
+                continue
+            is_buyer_maker = bool(t.get("m", False))
+            if is_buyer_maker:
+                sell += qty
             else:
-                self._hub = None
-        except Exception:
-            self._hub = None
+                buy += qty
 
-    def available(self) -> bool:
-        self._lazy_init()
-        return self._hub is not None
-
-    def get(self, symbol: str) -> Optional[Dict[str, Any]]:
-        self._lazy_init()
-        if self._hub is None:
+        den = buy + sell
+        if den <= 0:
             return None
+        return float((buy - sell) / den)
+    except Exception:
+        return None
+
+
+def _mean_std(vals: List[float]) -> Tuple[Optional[float], Optional[float]]:
+    if not vals:
+        return None, None
+    if np is not None:
         try:
-            if hasattr(self._hub, "get"):
-                return self._hub.get(symbol)  # type: ignore
-            return None
+            return float(np.mean(vals)), float(np.std(vals))
         except Exception:
+            pass
+    # fallback sans numpy
+    try:
+        m = sum(vals) / len(vals)
+        v = sum((x - m) ** 2 for x in vals) / len(vals)
+        return float(m), float(v ** 0.5)
+    except Exception:
+        return None, None
+
+
+def _compute_funding_stats(funding_hist: Optional[List[Dict[str, Any]]]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Returns: (mean, std, zscore_last)"""
+    try:
+        if not funding_hist:
+            return None, None, None
+        rates: List[float] = []
+        for x in funding_hist[-24:]:
+            try:
+                rates.append(float(x.get("fundingRate")))
+            except Exception:
+                continue
+        if len(rates) < 5:
+            return None, None, None
+
+        mean, stdv = _mean_std(rates)
+        if mean is None or stdv is None:
+            return None, None, None
+
+        std = stdv if stdv > 1e-12 else 0.0
+        last = float(rates[-1])
+        z = float((last - mean) / std) if std > 0 else None
+        return float(mean), (float(std) if std > 0 else None), z
+    except Exception:
+        return None, None, None
+
+
+def _compute_oi_slope(binance_symbol: str, new_oi: Optional[float]) -> Optional[float]:
+    if new_oi is None:
+        return None
+    prev = _OI_HISTORY.get(binance_symbol)
+    if prev is None:
+        return 0.0
+    _, old_oi = prev
+    if old_oi <= 0:
+        return 0.0
+    return float((float(new_oi) - float(old_oi)) / float(old_oi))
+
+
+def _compute_oi_hist_slope(oi_hist: Optional[List[Dict[str, Any]]]) -> Optional[float]:
+    try:
+        if not oi_hist or len(oi_hist) < 8:
             return None
+        xs: List[float] = []
+        for x in oi_hist[-20:]:
+            try:
+                xs.append(float(x.get("sumOpenInterest") or x.get("openInterest") or x.get("sumOpenInterestValue")))
+            except Exception:
+                continue
+        if len(xs) < 6:
+            return None
+        a = float(xs[0])
+        b = float(xs[-1])
+        den = abs(a) if abs(a) > 1e-12 else max(abs(b), 1e-12)
+        return float((b - a) / den)
+    except Exception:
+        return None
 
 
-# ----------------------------
-# Institutional service
-# ----------------------------
-class InstitutionalService:
-    def __init__(self) -> None:
-        self.rest = BinanceFapiRestClient()
-        self.hub = HubAdapter()
-
-        self._lock = threading.Lock()
-        self._global = BackoffState()
-        self._per_symbol: Dict[str, SymbolBackoffState] = {}
-
-        # cache: symbol -> {"ts": ms, "data": {...}}
-        self._cache_light: Dict[str, Dict[str, Any]] = {}
-        self._cache_full: Dict[str, Dict[str, Any]] = {}
-
-        # for OI delta
-        self._last_oi: Dict[str, Tuple[int, float]] = {}
-
-    def _sym_state(self, symbol: str) -> SymbolBackoffState:
-        with self._lock:
-            if symbol not in self._per_symbol:
-                self._per_symbol[symbol] = SymbolBackoffState()
-            return self._per_symbol[symbol]
-
-    def _mark_error(self, symbol: str, meta: Dict[str, Any]) -> None:
-        http_status = meta.get("http_status")
-        err_code = meta.get("error_code")
-        severe = False
-
-        # severe ban-ish signals:
-        # - HTTP 418 (IP ban) / 429 (rate limit) are common in practice
-        # - API error code -1003 indicates too many requests
-        if http_status in (418, 429):
-            severe = True
-        if err_code == -1003:
-            severe = True
-
-        with self._lock:
-            self._global.mark_error(severe=severe)
-            st = self._sym_state(symbol)
-            st.mark_error(severe=severe)
-
-    def _mark_success(self, symbol: str) -> None:
-        with self._lock:
-            self._global.mark_success()
-            st = self._sym_state(symbol)
-            st.mark_success()
-
-    def global_ban_until(self) -> float:
-        with self._lock:
-            return self._global.ban_until_ts
-
-    def symbol_ban_until(self, symbol: str) -> float:
-        with self._lock:
-            st = self._sym_state(symbol)
-            return st.ban_until_ts
-
-    def _cooldown_blocked(self, symbol: str) -> bool:
-        with self._lock:
-            if self._global.is_banned() or self._global.is_in_cooldown():
-                return True
-            st = self._sym_state(symbol)
-            if st.is_banned() or st.is_in_cooldown():
-                return True
-        return False
-
-    @staticmethod
-    def _fresh(ts_ms: Optional[int], ttl_ms: int) -> bool:
-        if ts_ms is None:
-            return False
-        return (_now_ms() - ts_ms) <= ttl_ms
-
-    def _base_output(self) -> Dict[str, Any]:
-        # Stable keys: keep these always present to avoid KeyError.
-        return {
-            "symbol": None,
-            "ts": None,
-            "mode": None,
-            "source": None,  # "hub" | "rest" | "mixed" | "none"
-            "available": False,
-            "available_components_count": 0,
-            # components (raw)
-            "fundingRate": None,
-            "openInterest": None,
-            "openInterestChange": None,  # fractional change in a window
-            "markPrice": None,
-            "bookImbalance": None,  # (bid-ask)/(bid+ask)
-            "deltaUsd_1m": None,
-            "cvdUsd_5m": None,
-            "liquidationsUsd_5m": None,
-            # component availability flags
-            "components": {
-                "funding": False,
-                "oi": False,
-                "delta": False,
-                "liq": False,
-                "book": False,
-            },
-            # debug/meta
-            "meta": {
-                "global_ban_until": None,
-                "symbol_ban_until": None,
-                "rest": {},
-                "hub": {},
-            },
-        }
-
-    def _read_from_hub(self, symbol: str) -> Dict[str, Any]:
-        out = self._base_output()
-        out["symbol"] = symbol
-
-        snap = self.hub.get(symbol) if self.hub.available() else None
-        if not isinstance(snap, dict):
-            out["source"] = "none"
-            return out
-
-        # timestamp in ms (common fields in caches)
-        ts = _safe_int(snap.get("ts")) or _safe_int(snap.get("timestamp")) or _safe_int(snap.get("T"))
-        out["ts"] = ts
-        out["source"] = "hub"
-        out["meta"]["hub"] = {"has_snapshot": True}
-
-        # funding (from markPrice stream cache or derived)
-        fr = _safe_float(snap.get("fundingRate") if "fundingRate" in snap else snap.get("funding_rate"))
-        mp = _safe_float(snap.get("markPrice") if "markPrice" in snap else snap.get("mark_price"))
-
-        # orderbook best bid/ask or imbalance
-        bid = _safe_float(snap.get("bid") if "bid" in snap else snap.get("bestBid"))
-        ask = _safe_float(snap.get("ask") if "ask" in snap else snap.get("bestAsk"))
-        imb = _safe_float(snap.get("bookImbalance") if "bookImbalance" in snap else snap.get("book_imbalance"))
-        if imb is None and bid is not None and ask is not None and (bid + ask) > 0:
-            imb = (bid - ask) / (bid + ask)
-
-        # delta & cvd in USD (if hub computed it)
-        d1m = _safe_float(snap.get("deltaUsd_1m") if "deltaUsd_1m" in snap else snap.get("delta_usd_1m"))
-        cvd5 = _safe_float(snap.get("cvdUsd_5m") if "cvdUsd_5m" in snap else snap.get("cvd_usd_5m"))
-
-        # liquidations (if hub computed it)
-        liq5 = _safe_float(
-            snap.get("liquidationsUsd_5m") if "liquidationsUsd_5m" in snap else snap.get("liq_usd_5m")
-        )
-
-        # write stable keys
-        out["fundingRate"] = fr
-        out["markPrice"] = mp
-        out["bookImbalance"] = imb
-        out["deltaUsd_1m"] = d1m
-        out["cvdUsd_5m"] = cvd5
-        out["liquidationsUsd_5m"] = liq5
-
-        # availability flags
-        out["components"]["funding"] = fr is not None
-        out["components"]["book"] = imb is not None
-        out["components"]["delta"] = (d1m is not None) or (cvd5 is not None)
-        out["components"]["liq"] = liq5 is not None
-
-        return out
-
-    def _supplement_open_interest(self, symbol: str, out: Dict[str, Any]) -> Dict[str, Any]:
-        # REST supplement, guarded by cooldown/backoff
-        out["meta"]["rest"]["attempted"] = True
-
-        if self._cooldown_blocked(symbol):
-            out["meta"]["rest"]["blocked"] = True
-            return out
-
-        oi, meta = self.rest.fetch_open_interest(symbol)
-        out["meta"]["rest"]["openInterest"] = {"ok": meta.get("ok"), "http": meta.get("http_status"), "code": meta.get("error_code")}
-        if oi is None:
-            self._mark_error(symbol, meta)
-            return out
-
-        self._mark_success(symbol)
-        out["openInterest"] = oi
-        out["components"]["oi"] = True
-
-        # compute change vs last seen
-        now = _now_ms()
-        with self._lock:
-            prev = self._last_oi.get(symbol)
-            self._last_oi[symbol] = (now, oi)
-
-        if prev:
-            prev_ts, prev_oi = prev
-            # only compute if previous is recent-ish (15 min)
-            if prev_oi > 0 and (now - prev_ts) <= 15 * 60 * 1000:
-                out["openInterestChange"] = (oi - prev_oi) / prev_oi
-
-        return out
-
-    def get_institutional(self, raw_symbol: str, mode: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Main fetch:
-        - LIGHT: hub only (no REST)
-        - FULL : hub + optional REST supplements (currently Open Interest)
-        """
-        mode_use = (mode or INST_DEFAULT_MODE).upper().strip()
-        symbol = normalize_binance_symbol(raw_symbol)
-
-        # Light cache
-        now = _now_ms()
-        ttl = INST_LIGHT_TTL_MS if mode_use == "LIGHT" else INST_FULL_TTL_MS
-
-        # Return cached if fresh
-        cache = self._cache_light if mode_use == "LIGHT" else self._cache_full
-        cached = cache.get(symbol)
-        if isinstance(cached, dict) and self._fresh(_safe_int(cached.get("ts")), ttl):
-            out = dict(cached)
-            out["mode"] = mode_use
-            return out
-
-        out = self._read_from_hub(symbol)
-        out["mode"] = mode_use
-        out["meta"]["global_ban_until"] = self.global_ban_until()
-        out["meta"]["symbol_ban_until"] = self.symbol_ban_until(symbol)
-
-        # Determine freshness/availability
-        out["available"] = self._fresh(_safe_int(out.get("ts")), ttl)
-
-        # FULL mode: supplement with REST (guarded)
-        if mode_use == "FULL":
-            out["source"] = out["source"] if out["source"] != "none" else "rest"
-            out = self._supplement_open_interest(symbol, out)
-            if out["openInterest"] is not None and out["source"] == "hub":
-                out["source"] = "mixed"
-
-        # recompute available_components_count
-        comp = out.get("components", {}) or {}
-        out["available_components_count"] = sum(1 for k in ("funding", "oi", "delta", "liq", "book") if comp.get(k) is True)
-
-        # cache store
-        cache[symbol] = dict(out)
-        return out
-
-
-# Singleton service (simple drop-in)
-_INST = InstitutionalService()
-
-
-# ----------------------------
-# Scoring / gating
-# ----------------------------
-@dataclass
-class InstScoreConfig:
-    funding_abs_ok: float = INST_FUNDING_ABS_OK
-    delta_usd_ok: float = INST_DELTA_USD_OK
-    liq_usd_ok: float = INST_LIQ_USD_OK
-    oi_change_ok: float = INST_OI_CHANGE_OK
-    min_available: int = INST_REQUIRE_MIN_AVAILABLE
-
-
-def compute_institutional_score(
-    inst: Dict[str, Any],
-    direction: str,
-    cfg: Optional[InstScoreConfig] = None,
-) -> Dict[str, Any]:
+def _compute_cvd_slope_from_klines(klines: List[List[Any]], window: int = 40) -> Optional[float]:
     """
-    Returns a stable, explainable score bundle:
-      {
-        "inst_score": int,
-        "available_components_count": int,
-        "required_min_available": int,
-        "ok_components": [...],
-        "warn_components": [...],
-        "fail_components": [...],
-        "details": {...}
-      }
-    Direction: "long"/"short" (anything starting with 'l' treated as long).
+    delta = 2 * takerBuyBase - totalVolume
+    cumulate delta; slope on last window.
     """
-    cfg = cfg or InstScoreConfig()
-    is_long = str(direction).lower().startswith("l")
+    try:
+        if not klines or len(klines) < window + 6:
+            return None
+        sub = klines[-(window + 6):]
+        cvd = 0.0
+        cvs: List[float] = []
+        for item in sub:
+            try:
+                vol = float(item[5])
+                taker_buy = float(item[9])
+            except Exception:
+                continue
+            delta = 2.0 * taker_buy - vol
+            cvd += delta
+            cvs.append(cvd)
+        if len(cvs) < window:
+            return None
+        seg = cvs[-window:]
+        start = float(seg[0])
+        end = float(seg[-1])
+        den = abs(start) if abs(start) > 1e-12 else max(abs(end), 1e-12)
+        return float((end - start) / den)
+    except Exception:
+        return None
 
-    comp_flags = (inst.get("components") or {}).copy()
-    available = int(inst.get("available_components_count") or 0)
 
-    out = {
-        "inst_score": 0,
-        "available_components_count": available,
-        "required_min_available": int(cfg.min_available),
-        "ok_components": [],
-        "warn_components": [],
-        "fail_components": [],
-        "details": {},
-    }
+def _compute_liquidation_intensity(force_orders: Optional[List[Dict[str, Any]]], window_sec: int = 900) -> Tuple[Optional[float], Optional[str]]:
+    try:
+        if not force_orders:
+            return None, None
+        now_ms = _now_ms()
+        cutoff = now_ms - int(window_sec) * 1000
 
-    # If too few components, we don't fabricate signals.
-    if available <= 0:
-        out["fail_components"].append("no_components")
-        return out
+        buy_qty = 0.0
+        sell_qty = 0.0
+        for x in reversed(force_orders):
+            ts = int(x.get("time") or x.get("T") or 0)
+            if ts < cutoff:
+                break
+            qty = float(x.get("origQty") or x.get("q") or 0.0)
+            side = str(x.get("side") or "").upper()
+            if qty <= 0:
+                continue
+            if side == "BUY":
+                buy_qty += qty
+            elif side == "SELL":
+                sell_qty += qty
 
-    # Funding: typically directional interpretation depends on your strategy.
-    # Here we do a conservative mapping:
-    # - Funding near 0 is "good"; extreme funding is "warn" (crowded).
-    fr = _safe_float(inst.get("fundingRate"))
-    if fr is not None:
-        out["details"]["fundingRate"] = fr
-        if abs(fr) <= cfg.funding_abs_ok:
-            out["inst_score"] += 1
-            out["ok_components"].append("funding")
+        total = buy_qty + sell_qty
+        if total <= 0:
+            return None, None
+
+        bias = "mixed"
+        if buy_qty > 1.6 * sell_qty:
+            bias = "buy_liq"
+        elif sell_qty > 1.6 * buy_qty:
+            bias = "sell_liq"
+        return float(total), bias
+    except Exception:
+        return None, None
+
+
+# =====================================================================
+# Regimes + scoring
+# =====================================================================
+def _classify_tape(delta: Optional[float]) -> str:
+    if delta is None:
+        return "unknown"
+    x = float(delta)
+    if x >= 0.35:
+        return "strong_buy"
+    if x >= 0.12:
+        return "buy"
+    if x <= -0.35:
+        return "strong_sell"
+    if x <= -0.12:
+        return "sell"
+    return "neutral"
+
+
+def _classify_orderbook(imb: Optional[float]) -> str:
+    if imb is None:
+        return "unknown"
+    x = float(imb)
+    if x >= 0.35:
+        return "strong_bid"
+    if x >= 0.12:
+        return "bid"
+    if x <= -0.35:
+        return "strong_ask"
+    if x <= -0.12:
+        return "ask"
+    return "balanced"
+
+
+def _classify_funding(funding_rate: Optional[float], z: Optional[float] = None) -> str:
+    if funding_rate is None:
+        return "unknown"
+    fr = float(funding_rate)
+    if z is not None and abs(float(z)) >= 2.2:
+        return "extreme"
+    if fr <= -0.0015:
+        return "very_negative"
+    if fr <= -0.0005:
+        return "negative"
+    if fr < 0.0005:
+        return "neutral"
+    if fr < 0.0015:
+        return "positive"
+    return "very_positive"
+
+
+def _classify_basis(basis_pct: Optional[float]) -> str:
+    if basis_pct is None:
+        return "unknown"
+    b = float(basis_pct)
+    if b >= 0.002:
+        return "contango_strong"
+    if b >= 0.0006:
+        return "contango"
+    if b <= -0.002:
+        return "backwardation_strong"
+    if b <= -0.0006:
+        return "backwardation"
+    return "flat"
+
+
+def _classify_crowding(bias: str, funding_rate: Optional[float], basis_pct: Optional[float], funding_z: Optional[float]) -> str:
+    if funding_rate is None and basis_pct is None:
+        return "unknown"
+
+    b = (bias or "").upper()
+    fr = float(funding_rate) if funding_rate is not None else 0.0
+    bs = float(basis_pct) if basis_pct is not None else 0.0
+
+    crowded_long = (fr >= 0.001) or (bs >= 0.0015) or (funding_z is not None and funding_z >= 2.0)
+    crowded_short = (fr <= -0.001) or (bs <= -0.0015) or (funding_z is not None and funding_z <= -2.0)
+
+    if b == "LONG":
+        if crowded_long:
+            return "long_crowded_risky"
+        if crowded_short:
+            return "short_crowded_favorable"
+        return "balanced"
+
+    if b == "SHORT":
+        if crowded_long:
+            return "long_crowded_favorable"
+        if crowded_short:
+            return "short_crowded_risky"
+        return "balanced"
+
+    return "unknown"
+
+
+def _classify_flow(cvd_slope: Optional[float], tape_5m: Optional[float]) -> str:
+    if tape_5m is not None:
+        return _classify_tape(tape_5m)
+    if cvd_slope is None:
+        return "unknown"
+    x = float(cvd_slope)
+    if x >= 1.0:
+        return "strong_buy"
+    if x >= 0.2:
+        return "buy"
+    if x <= -1.0:
+        return "strong_sell"
+    if x <= -0.2:
+        return "sell"
+    return "neutral"
+
+
+def _score_institutional(
+    bias: str,
+    *,
+    oi_slope: Optional[float],
+    oi_hist_slope: Optional[float],
+    cvd_slope: Optional[float],
+    tape_5m: Optional[float],
+    funding_rate: Optional[float],
+    funding_z: Optional[float],
+    basis_pct: Optional[float],
+    ob_25bps: Optional[float],
+) -> Tuple[int, Dict[str, int], Dict[str, Any]]:
+    """
+    Score in [0..4].
+    Components:
+      - flow: 0..2 (tape/cvd)
+      - oi: 0..1
+      - crowding: 0..1 (contrarian funding/basis)
+      - orderbook: 0..1
+    """
+    b = (bias or "").upper()
+    comp: Dict[str, int] = {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0}
+    meta: Dict[str, Any] = {}
+
+    # Flow
+    flow_points = 0
+    if tape_5m is not None:
+        x = float(tape_5m)
+        if b == "LONG":
+            if x >= 0.35:
+                flow_points += 2
+            elif x >= 0.12:
+                flow_points += 1
         else:
-            out["warn_components"].append("funding")
+            if x <= -0.35:
+                flow_points += 2
+            elif x <= -0.12:
+                flow_points += 1
 
-    # Orderbook imbalance: positive favors long, negative favors short (very rough proxy)
-    imb = _safe_float(inst.get("bookImbalance"))
-    if imb is not None:
-        out["details"]["bookImbalance"] = imb
-        if (is_long and imb > 0) or ((not is_long) and imb < 0):
-            out["inst_score"] += 1
-            out["ok_components"].append("book")
+    if cvd_slope is not None:
+        x = float(cvd_slope)
+        if b == "LONG":
+            if x >= 1.0:
+                flow_points += 2
+            elif x >= 0.2:
+                flow_points += 1
         else:
-            out["warn_components"].append("book")
+            if x <= -1.0:
+                flow_points += 2
+            elif x <= -0.2:
+                flow_points += 1
 
-    # Delta/CVD: if hub provides one of them
-    d1m = _safe_float(inst.get("deltaUsd_1m"))
-    cvd5 = _safe_float(inst.get("cvdUsd_5m"))
-    best_delta = d1m if d1m is not None else cvd5
-    if best_delta is not None:
-        out["details"]["deltaProxyUsd"] = best_delta
-        if (is_long and best_delta >= cfg.delta_usd_ok) or ((not is_long) and best_delta <= -cfg.delta_usd_ok):
-            out["inst_score"] += 1
-            out["ok_components"].append("delta")
-        else:
-            out["warn_components"].append("delta")
+    if flow_points >= 3:
+        comp["flow"] = 2
+    elif flow_points >= 1:
+        comp["flow"] = 1
 
-    # Liquidations: high liquidation flow can indicate forced moves / squeezes.
-    # We only treat "high liq" as confirmation of activity, not direction.
-    liq5 = _safe_float(inst.get("liquidationsUsd_5m"))
-    if liq5 is not None:
-        out["details"]["liquidationsUsd_5m"] = liq5
-        if liq5 >= cfg.liq_usd_ok:
-            out["inst_score"] += 1
-            out["ok_components"].append("liq")
-        else:
-            out["warn_components"].append("liq")
+    # OI
+    oi_ok = False
+    if oi_slope is not None:
+        x = float(oi_slope)
+        if b == "LONG" and x >= 0.008:
+            oi_ok = True
+        if b == "SHORT" and x <= -0.008:
+            oi_ok = True
+    if (not oi_ok) and oi_hist_slope is not None:
+        x = float(oi_hist_slope)
+        if b == "LONG" and x >= 0.012:
+            oi_ok = True
+        if b == "SHORT" and x <= -0.012:
+            oi_ok = True
+    if oi_ok:
+        comp["oi"] = 1
 
-    # Open interest change: only if we have a computed change
-    oic = _safe_float(inst.get("openInterestChange"))
-    if oic is not None:
-        out["details"]["openInterestChange"] = oic
-        # We only score OI change if it’s positive and meaningful; direction logic can be refined later.
-        if oic >= cfg.oi_change_ok:
-            out["inst_score"] += 1
-            out["ok_components"].append("oi")
-        else:
-            out["warn_components"].append("oi")
+    # Crowding (contrarian)
+    if funding_rate is not None:
+        fr = float(funding_rate)
+        if b == "LONG" and fr < -0.0005:
+            comp["crowding"] = 1
+        if b == "SHORT" and fr > 0.0005:
+            comp["crowding"] = 1
+    if funding_z is not None:
+        z = float(funding_z)
+        if b == "LONG" and z <= -1.6:
+            comp["crowding"] = max(comp["crowding"], 1)
+        if b == "SHORT" and z >= 1.6:
+            comp["crowding"] = max(comp["crowding"], 1)
+    if basis_pct is not None:
+        bs = float(basis_pct)
+        if b == "LONG" and bs < -0.0006:
+            comp["crowding"] = max(comp["crowding"], 1)
+        if b == "SHORT" and bs > 0.0006:
+            comp["crowding"] = max(comp["crowding"], 1)
 
-    # Minimum availability gating (so you can implement A/B/C tiers cleanly)
-    if available < cfg.min_available:
-        out["fail_components"].append("available_below_min")
+    # Orderbook
+    if ob_25bps is not None:
+        x = float(ob_25bps)
+        if b == "LONG" and x >= 0.12:
+            comp["orderbook"] = 1
+        if b == "SHORT" and x <= -0.12:
+            comp["orderbook"] = 1
 
+    total = int(comp["flow"] + comp["oi"] + comp["crowding"] + comp["orderbook"])
+    total = max(0, min(4, total))
+    meta["raw_components_sum"] = int(comp["flow"] + comp["oi"] + comp["crowding"] + comp["orderbook"])
+    return total, comp, meta
+
+
+def _components_ok_count(components: Dict[str, int]) -> int:
+    try:
+        return int(sum(1 for v in (components or {}).values() if int(v) > 0))
+    except Exception:
+        return 0
+
+
+def _available_components_list(payload: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    if payload.get("oi") is not None:
+        out.append("oi")
+    if payload.get("funding_rate") is not None:
+        out.append("funding")
+    if payload.get("tape_delta_5m") is not None:
+        out.append("tape")
+    if payload.get("orderbook_imb_25bps") is not None:
+        out.append("orderbook")
+    if payload.get("cvd_slope") is not None:
+        out.append("cvd")
+    if payload.get("oi_hist_slope") is not None:
+        out.append("oi_hist")
+    if payload.get("funding_z") is not None:
+        out.append("funding_hist")
+    if payload.get("liquidation_intensity") is not None:
+        out.append("liquidations")
     return out
 
 
-def institutional_gating_ok(score_bundle: Dict[str, Any]) -> bool:
-    """
-    Simple gate: enough components AND score >= 2.
-    (Adjust in settings or in analyze_signal tiers.)
-    """
-    available = int(score_bundle.get("available_components_count") or 0)
-    min_avail = int(score_bundle.get("required_min_available") or 0)
-    score = int(score_bundle.get("inst_score") or 0)
-    if available < min_avail:
-        return False
-    return score >= 2
-
-
-# ----------------------------
-# Public API (drop-in helpers)
-# ----------------------------
-def get_institutional_data(symbol: str, mode: str = "LIGHT") -> Dict[str, Any]:
-    """
-    Stable raw snapshot. Keys like fundingRate/openInterest always exist (may be None).
-    """
-    return _INST.get_institutional(symbol, mode=mode)
-
-
-def get_institutional_score(
+# =====================================================================
+# MAIN API
+# =====================================================================
+async def compute_full_institutional_analysis(
     symbol: str,
-    direction: str,
-    mode: str = "LIGHT",
-    cfg: Optional[InstScoreConfig] = None,
+    bias: str,
+    *,
+    include_liquidations: bool = False,
+    mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Convenience: returns {"inst": <raw>, "score": <bundle>, "gating_ok": bool}
-    """
-    inst = _INST.get_institutional(symbol, mode=mode)
-    score = compute_institutional_score(inst, direction=direction, cfg=cfg)
-    return {"inst": inst, "score": score, "gating_ok": institutional_gating_ok(score)}
+    Institutional analysis for a given symbol (KuCoin/Bitget format) using Binance USDT-M Futures.
 
+    - Uses circuit breaker if banned.
+    - Uses mode (override) or INST_MODE env to control endpoint cost.
+      mode: "LIGHT" | "NORMAL" | "FULL"
+    """
+    bias = (bias or "").upper().strip()
+    eff_mode = (mode or INST_MODE).upper().strip()
+    if eff_mode not in ("LIGHT", "NORMAL", "FULL"):
+        eff_mode = "LIGHT"
 
-def get_institutional_availability(symbol: str, mode: str = "LIGHT") -> Dict[str, Any]:
-    """
-    Useful for scanner to decide tier C fallback:
-    - available_components_count
-    - ban timers
-    """
-    inst = _INST.get_institutional(symbol, mode=mode)
-    return {
-        "symbol": inst.get("symbol"),
-        "available": bool(inst.get("available")),
-        "available_components_count": int(inst.get("available_components_count") or 0),
-        "global_ban_until": inst.get("meta", {}).get("global_ban_until"),
-        "symbol_ban_until": inst.get("meta", {}).get("symbol_ban_until"),
-        "source": inst.get("source"),
+    warnings: List[str] = []
+
+    if _is_hard_banned():
+        payload = {
+            "institutional_score": 0,
+            "binance_symbol": None,
+            "available": False,
+            "oi": None,
+            "oi_slope": None,
+            "cvd_slope": None,
+            "funding_rate": None,
+            "funding_regime": "unknown",
+            "crowding_regime": "unknown",
+            "flow_regime": "unknown",
+            "warnings": [f"binance_hard_ban_until_ms={_BINANCE_HARD_BAN_UNTIL_MS}"],
+            "score_components": {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0},
+            "score_meta": {"mode": eff_mode},
+            "available_components": [],
+            "available_components_count": 0,
+            "ban": {"hard_until_ms": int(_BINANCE_HARD_BAN_UNTIL_MS), "soft_until_ms": int(_BINANCE_SOFT_UNTIL_MS)},
+        }
+        return payload
+
+    # Resolve Binance symbol
+    binance_symbols = await _get_binance_symbols()
+    binance_symbol = _map_symbol_to_binance(symbol, binance_symbols)
+    if binance_symbol is None:
+        payload = {
+            "institutional_score": 0,
+            "binance_symbol": None,
+            "available": False,
+            "oi": None,
+            "oi_slope": None,
+            "cvd_slope": None,
+            "funding_rate": None,
+            "funding_regime": "unknown",
+            "crowding_regime": "unknown",
+            "flow_regime": "unknown",
+            "warnings": ["symbol_not_mapped_to_binance"],
+            "score_components": {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0},
+            "score_meta": {"mode": eff_mode},
+            "available_components": [],
+            "available_components_count": 0,
+            "ban": {"hard_until_ms": int(_BINANCE_HARD_BAN_UNTIL_MS), "soft_until_ms": int(_BINANCE_SOFT_UNTIL_MS)},
+        }
+        return payload
+
+    # Fields
+    oi_value: Optional[float] = None
+    oi_slope: Optional[float] = None
+    oi_hist_slope: Optional[float] = None
+
+    funding_rate: Optional[float] = None
+    funding_mean: Optional[float] = None
+    funding_std: Optional[float] = None
+    funding_z: Optional[float] = None
+
+    basis_pct: Optional[float] = None
+
+    tape_1m: Optional[float] = None
+    tape_5m: Optional[float] = None
+
+    ob_10: Optional[float] = None
+    ob_25: Optional[float] = None
+
+    cvd_slope: Optional[float] = None
+
+    liq_intensity: Optional[float] = None
+    liq_bias: Optional[str] = None
+
+    # Optional LSR
+    lsr_global_last = lsr_global_slope = None
+    lsr_top_last = lsr_top_slope = None
+    taker_ls_last = taker_ls_slope = None
+
+    # -------------------------
+    # Stage 1 (always): OI + premiumIndex
+    # -------------------------
+    oi_value = await _fetch_open_interest(binance_symbol)
+    prem = await _fetch_premium_index(binance_symbol)
+
+    if oi_value is None:
+        warnings.append("no_oi")
+    else:
+        oi_slope = _compute_oi_slope(binance_symbol, oi_value)
+        _OI_HISTORY[binance_symbol] = (time.time(), float(oi_value))
+
+    if isinstance(prem, dict):
+        try:
+            funding_rate = float(prem.get("lastFundingRate", "0"))
+        except Exception:
+            funding_rate = None
+            warnings.append("funding_parse_error")
+
+        try:
+            mark = float(prem.get("markPrice", "0"))
+            index = float(prem.get("indexPrice", "0"))
+            if index > 0:
+                basis_pct = (mark - index) / index
+        except Exception:
+            basis_pct = None
+            warnings.append("basis_parse_error")
+    else:
+        warnings.append("no_premiumIndex")
+
+    # -------------------------
+    # Mode NORMAL/FULL: add Tape + Orderbook
+    # -------------------------
+    trades = None
+    depth = None
+    if eff_mode in ("NORMAL", "FULL"):
+        trades = await _fetch_agg_trades(binance_symbol, limit=1000)
+        depth = await _fetch_depth(binance_symbol, limit=100)
+
+        if isinstance(trades, list) and trades:
+            tape_1m = _compute_tape_delta(trades, window_sec=60)
+            tape_5m = _compute_tape_delta(trades, window_sec=300)
+        else:
+            warnings.append("no_trades")
+
+        if isinstance(depth, dict):
+            ob_10 = _compute_orderbook_imbalance(depth, band_bps=10.0)
+            ob_25 = _compute_orderbook_imbalance(depth, band_bps=25.0)
+        else:
+            warnings.append("no_depth")
+
+    # -------------------------
+    # Mode FULL: add CVD + OI hist + funding hist (heavy endpoints)
+    # -------------------------
+    if eff_mode == "FULL":
+        klines = await _fetch_klines_1h(binance_symbol, limit=120)
+        oi_hist = await _fetch_open_interest_hist(binance_symbol, period="5m", limit=30)
+        funding_hist = await _fetch_funding_history(binance_symbol, limit=30)
+
+        if isinstance(klines, list) and klines:
+            cvd_slope = _compute_cvd_slope_from_klines(klines, window=40)
+        else:
+            warnings.append("no_klines")
+
+        if isinstance(oi_hist, list) and oi_hist:
+            oi_hist_slope = _compute_oi_hist_slope(oi_hist)
+        else:
+            warnings.append("no_oi_hist")
+
+        if isinstance(funding_hist, list) and funding_hist:
+            funding_mean, funding_std, funding_z = _compute_funding_stats(funding_hist)
+        else:
+            warnings.append("no_funding_hist")
+
+        # Optional LSR (even heavier, off by default)
+        if INCLUDE_LSR:
+            try:
+                lsr_g = await _fetch_lsr("/futures/data/globalLongShortAccountRatio", binance_symbol, period="1h", limit=30)
+                lsr_global_last, lsr_global_slope = _extract_lsr_stats(lsr_g)
+            except Exception:
+                warnings.append("lsr_global_error")
+            try:
+                lsr_t = await _fetch_lsr("/futures/data/topLongShortAccountRatio", binance_symbol, period="1h", limit=30)
+                lsr_top_last, lsr_top_slope = _extract_lsr_stats(lsr_t)
+            except Exception:
+                warnings.append("lsr_top_error")
+            try:
+                tk = await _fetch_lsr("/futures/data/takerlongshortRatio", binance_symbol, period="1h", limit=30)
+                taker_ls_last, taker_ls_slope = _extract_lsr_stats(tk)
+            except Exception:
+                warnings.append("lsr_taker_error")
+
+    # -------------------------
+    # Liquidations (optional)
+    # -------------------------
+    if include_liquidations or DEFAULT_INCLUDE_LIQUIDATIONS:
+        force_orders = await _fetch_force_orders(binance_symbol, limit=50)
+        if isinstance(force_orders, list) and force_orders:
+            liq_intensity, liq_bias = _compute_liquidation_intensity(force_orders, window_sec=900)
+        else:
+            warnings.append("no_force_orders")
+
+    funding_regime = _classify_funding(funding_rate, z=funding_z)
+    basis_regime = _classify_basis(basis_pct)
+    crowding_regime = _classify_crowding(bias, funding_rate, basis_pct, funding_z)
+    flow_regime = _classify_flow(cvd_slope, tape_5m)
+    ob_regime = _classify_orderbook(ob_25)
+
+    inst_score, components, score_meta = _score_institutional(
+        bias,
+        oi_slope=oi_slope,
+        oi_hist_slope=oi_hist_slope,
+        cvd_slope=cvd_slope,
+        tape_5m=tape_5m,
+        funding_rate=funding_rate,
+        funding_z=funding_z,
+        basis_pct=basis_pct,
+        ob_25bps=ob_25,
+    )
+
+    ok_count = _components_ok_count(components)
+
+    score_meta = dict(score_meta or {})
+    score_meta["mode"] = eff_mode
+    score_meta["ok_count"] = int(ok_count)
+
+    available = any(
+        [
+            oi_value is not None,
+            funding_rate is not None,
+            tape_5m is not None,
+            ob_25 is not None,
+            cvd_slope is not None,
+            oi_hist_slope is not None,
+        ]
+    )
+
+    payload = {
+        # required (compat)
+        "institutional_score": int(inst_score),
+        "binance_symbol": binance_symbol,
+        "available": bool(available),
+        "oi": oi_value,
+        "oi_slope": oi_slope,
+        "cvd_slope": cvd_slope,
+        "funding_rate": funding_rate,
+        "funding_regime": funding_regime,
+        "crowding_regime": crowding_regime,
+        "flow_regime": flow_regime,
+        "warnings": warnings,
+        # extras
+        "oi_hist_slope": oi_hist_slope,
+        "tape_delta_1m": tape_1m,
+        "tape_delta_5m": tape_5m,
+        "tape_regime": _classify_tape(tape_5m),
+        "basis_pct": basis_pct,
+        "basis_regime": basis_regime,
+        "orderbook_imb_10bps": ob_10,
+        "orderbook_imb_25bps": ob_25,
+        "orderbook_regime": ob_regime,
+        "funding_mean": funding_mean,
+        "funding_std": funding_std,
+        "funding_z": funding_z,
+        "liquidation_intensity": liq_intensity,
+        "liquidation_bias": liq_bias,
+        # scoring debug
+        "score_components": components,
+        "score_meta": score_meta,
+        # LSR debug (only in FULL + INCLUDE_LSR)
+        "lsr_global_last": lsr_global_last,
+        "lsr_global_slope": lsr_global_slope,
+        "lsr_top_last": lsr_top_last,
+        "lsr_top_slope": lsr_top_slope,
+        "taker_ls_last": taker_ls_last,
+        "taker_ls_slope": taker_ls_slope,
+        # new: availability & bans
+        "available_components": [],
+        "available_components_count": 0,
+        "ban": {"hard_until_ms": int(_BINANCE_HARD_BAN_UNTIL_MS), "soft_until_ms": int(_BINANCE_SOFT_UNTIL_MS)},
     }
 
+    comps = _available_components_list(payload)
+    payload["available_components"] = comps
+    payload["available_components_count"] = int(len(comps))
 
-# Optional: tiny debug helper
-def dump_institutional(symbol: str, direction: str = "long", mode: str = "LIGHT") -> str:
-    payload = get_institutional_score(symbol, direction=direction, mode=mode)
-    return json.dumps(payload, indent=2, sort_keys=True, default=str)
+    # ajoute la backoff symbole (utile scanner)
+    st = _get_sym_state(binance_symbol)
+    if st is not None:
+        payload["symbol_cooldown_until_ms"] = int(st.until_ms)
+        payload["symbol_errors"] = int(st.errors)
+
+    return payload
+
+
+# Alias (si tu utilises déjà un autre nom ailleurs)
+async def compute_institutional(symbol: str, bias: str, *, mode: Optional[str] = None, include_liquidations: bool = False) -> Dict[str, Any]:
+    return await compute_full_institutional_analysis(symbol, bias, include_liquidations=include_liquidations, mode=mode)
+
+
+def get_ban_state() -> Dict[str, int]:
+    """Helper sync pour logs."""
+    return {"hard_until_ms": int(_BINANCE_HARD_BAN_UNTIL_MS), "soft_until_ms": int(_BINANCE_SOFT_UNTIL_MS)}
