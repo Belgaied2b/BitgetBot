@@ -653,9 +653,16 @@ class SignalAnalyzer:
         entry_type = str(entry_pick["entry_type"])
         atr14 = float(entry_pick.get("atr") or _atr(df_h1, 14))
 
+        # ✅ FIX: args match placeholders (source: ton log original)
         LOGGER.info(
             "[EVAL_PRE] %s ENTRY_PICK type=%s entry_mkt=%s entry_used=%s in_zone=%s note=%s atr=%.6g",
-            symbol, entry_type, entry_pick.get("entry_mkt"), entry_pick.get("in_zone"), entry_pick.get("note"), atr14
+            symbol,
+            entry_type,
+            entry_pick.get("entry_mkt"),
+            entry_pick.get("entry_used"),
+            entry_pick.get("in_zone"),
+            entry_pick.get("note"),
+            atr14,
         )
 
         # Extension hygiene
@@ -734,7 +741,6 @@ class SignalAnalyzer:
             tp1, rr_used2 = compute_tp1(entry, sl, bias, df=df_h1, tick=tick)
             tp1 = float(tp1)
         except Exception:
-            # keep previous tp1 if compute_tp1 fails
             tp1 = float(tp1)
 
         rr = _safe_rr(entry, sl, tp1, bias)
