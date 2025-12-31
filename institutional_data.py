@@ -1,5 +1,5 @@
 # =====================================================================
-# institutional_data.py — Ultra Desk OI + Funding/Basis + (optional) Tape/OB/CVD
+# institutional_data.py — Ultra Desk OI + Funding/Basis + (optional) Tape/OB/CVD + Liquidations (WS)
 # Binance USDT-M Futures (public endpoints), rate-limited + circuit-breaker
 #
 # Robustesse scan multi-coins :
@@ -10,10 +10,10 @@
 # - Modes LIGHT/NORMAL/FULL + override par paramètre (scanner pass1/pass2)
 # - Sortie enrichie : available_components_count + available_components + ban info + mode effectif
 #
-# NOTE IMPORTANT (Binance):
-# - L'endpoint REST /fapi/v1/allForceOrders (liquidations "market") est listé comme
-#   non maintenu et n'accepte plus les requêtes selon le change log. (Binance)
-#   -> include_liquidations est donc désactivé côté REST dans cette version.
+# Liquidations:
+# - REST "all market force orders" n'est pas utilisé ici.
+# - On consomme le flux WebSocket "All Market Liquidation Order Streams": !forceOrder@arr
+#   (1 seule connexion, agrégation en mémoire, puis lecture par symbole dans compute_*).
 # =====================================================================
 
 from __future__ import annotations
@@ -24,8 +24,9 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 
@@ -37,6 +38,7 @@ except Exception:  # pragma: no cover
 
 LOGGER = logging.getLogger(__name__)
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
+BINANCE_FSTREAM_WS_BASE = "wss://fstream.binance.com/ws"
 
 # ---------------------------------------------------------------------
 # Modes (env) + overrides
@@ -50,6 +52,12 @@ if INST_MODE not in ("LIGHT", "NORMAL", "FULL"):
 
 # Optional add-ons (disabled by default to save calls)
 INCLUDE_LSR = str(os.getenv("INST_INCLUDE_LSR", "0")).strip() == "1"
+
+# Liquidations (WebSocket)
+INST_INCLUDE_LIQUIDATIONS = str(os.getenv("INST_INCLUDE_LIQUIDATIONS", "0")).strip() == "1"
+_LIQ_WINDOW_SEC = int(float(os.getenv("INST_LIQ_WINDOW_SEC", "300")))      # metrics window (default 5m)
+_LIQ_STORE_SEC = int(float(os.getenv("INST_LIQ_STORE_SEC", "900")))        # store depth (default 15m)
+_LIQ_MIN_NOTIONAL_USD = float(os.getenv("INST_LIQ_MIN_NOTIONAL_USD", "50000"))  # ignore tiny flows by default
 
 # ---------------------------------------------------------------------
 # Global rate limiting + circuit breaker
@@ -126,9 +134,203 @@ async def _get_session() -> aiohttp.ClientSession:
         return _SESSION
 
 
+# ---------------------------------------------------------------------
+# Liquidations WebSocket (single shared worker)
+# ---------------------------------------------------------------------
+_LIQ_TASK: Optional[asyncio.Task] = None
+_LIQ_START_LOCK = asyncio.Lock()
+_LIQ_STOP: Optional[asyncio.Event] = None
+_LIQ_LOCK = asyncio.Lock()
+# symbol -> deque[(ts_ms, side, notional_usd)]
+_LIQ_EVENTS: Dict[str, Deque[Tuple[int, str, float]]] = {}
+
+
+def _liq_stream_url() -> str:
+    return f"{BINANCE_FSTREAM_WS_BASE}/!forceOrder@arr"
+
+
+async def _liq_add_event(symbol: str, ts_ms: int, side: str, notional_usd: float) -> None:
+    try:
+        sym = str(symbol or "").upper().strip()
+        if not sym:
+            return
+        s = str(side or "").upper().strip()
+        if s not in ("BUY", "SELL"):
+            return
+        n = float(notional_usd)
+        if not (n > 0.0):
+            return
+
+        cutoff_store = _now_ms() - int(_LIQ_STORE_SEC) * 1000
+        async with _LIQ_LOCK:
+            dq = _LIQ_EVENTS.get(sym)
+            if dq is None:
+                dq = deque(maxlen=6000)
+                _LIQ_EVENTS[sym] = dq
+            dq.append((int(ts_ms), s, float(n)))
+
+            while dq and int(dq[0][0]) < cutoff_store:
+                dq.popleft()
+
+            if not dq:
+                _LIQ_EVENTS.pop(sym, None)
+    except Exception:
+        return
+
+
+async def _liq_metrics(symbol: str, window_sec: int) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    Returns: (buy_usd, sell_usd, total_usd, delta_ratio) over last window_sec.
+      delta_ratio = (buy - sell) / (buy + sell)
+    """
+    try:
+        sym = str(symbol or "").upper().strip()
+        if not sym:
+            return None, None, None, None
+        cutoff = _now_ms() - int(window_sec) * 1000
+
+        buy = 0.0
+        sell = 0.0
+        async with _LIQ_LOCK:
+            dq = _LIQ_EVENTS.get(sym)
+            if not dq:
+                return None, None, None, None
+
+            # iterate from newest backwards until cutoff
+            for ts_ms, side, notional in reversed(dq):
+                if int(ts_ms) < cutoff:
+                    break
+                if side == "BUY":
+                    buy += float(notional)
+                elif side == "SELL":
+                    sell += float(notional)
+
+        total = buy + sell
+        if total <= 0:
+            return float(buy), float(sell), 0.0, None
+        delta_ratio = (buy - sell) / total
+        return float(buy), float(sell), float(total), float(delta_ratio)
+    except Exception:
+        return None, None, None, None
+
+
+async def _liq_worker() -> None:
+    global _LIQ_STOP
+    backoff = 1.0
+    url = _liq_stream_url()
+    LOGGER.info("[INST_LIQ] WS worker start url=%s", url)
+
+    while _LIQ_STOP is not None and (not _LIQ_STOP.is_set()):
+        try:
+            session = await _get_session()
+            async with session.ws_connect(url, heartbeat=30) as ws:
+                LOGGER.info("[INST_LIQ] WS connected")
+                backoff = 1.0
+                async for msg in ws:
+                    if _LIQ_STOP is not None and _LIQ_STOP.is_set():
+                        break
+
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        raw = msg.data
+                    elif msg.type == aiohttp.WSMsgType.BINARY:
+                        try:
+                            raw = msg.data.decode("utf-8", errors="ignore")
+                        except Exception:
+                            continue
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+                    else:
+                        continue
+
+                    try:
+                        payload = json.loads(raw) if raw else None
+                    except Exception:
+                        continue
+
+                    # handle combined-stream envelope: {"stream": "...", "data": {...}}
+                    if isinstance(payload, dict) and "data" in payload and isinstance(payload.get("data"), (dict, list)):
+                        payload = payload.get("data")
+
+                    events: List[Any] = []
+                    if isinstance(payload, list):
+                        events = payload
+                    elif isinstance(payload, dict):
+                        events = [payload]
+
+                    for ev in events:
+                        try:
+                            if not isinstance(ev, dict):
+                                continue
+                            o = ev.get("o")
+                            if not isinstance(o, dict):
+                                continue
+                            sym = o.get("s")
+                            side = o.get("S")
+                            qty = o.get("q")
+                            price = o.get("ap") or o.get("p")
+                            ts = o.get("T") or ev.get("E") or _now_ms()
+
+                            try:
+                                qf = float(qty)
+                                pf = float(price)
+                            except Exception:
+                                continue
+                            notional = qf * pf
+                            await _liq_add_event(str(sym), int(ts), str(side), float(notional))
+                        except Exception:
+                            continue
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            LOGGER.warning("[INST_LIQ] WS error: %s", e)
+
+        # reconnect backoff
+        if _LIQ_STOP is not None and _LIQ_STOP.is_set():
+            break
+        await asyncio.sleep(min(60.0, backoff))
+        backoff = min(60.0, backoff * 2.0)
+
+    LOGGER.info("[INST_LIQ] WS worker stopped")
+
+
+async def _ensure_liq_stream() -> None:
+    global _LIQ_TASK, _LIQ_STOP
+    # start only if enabled
+    if not INST_INCLUDE_LIQUIDATIONS:
+        return
+
+    if _LIQ_STOP is None or _LIQ_STOP.is_set():
+        _LIQ_STOP = asyncio.Event()
+
+    if _LIQ_TASK is not None and (not _LIQ_TASK.done()):
+        return
+
+    async with _LIQ_START_LOCK:
+        if _LIQ_TASK is not None and (not _LIQ_TASK.done()):
+            return
+        _LIQ_TASK = asyncio.create_task(_liq_worker())
+
+
 async def close_institutional_session() -> None:
     """Optionnel: à appeler proprement au shutdown."""
-    global _SESSION
+    global _SESSION, _LIQ_TASK, _LIQ_STOP
+
+    # stop ws worker
+    try:
+        if _LIQ_STOP is not None:
+            _LIQ_STOP.set()
+        if _LIQ_TASK is not None:
+            _LIQ_TASK.cancel()
+            try:
+                await _LIQ_TASK
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _LIQ_TASK = None
+
+    # close http session
     if _SESSION is not None and not _SESSION.closed:
         try:
             await _SESSION.close()
@@ -639,7 +841,6 @@ def _mean_std(vals: List[float]) -> Tuple[Optional[float], Optional[float]]:
             return float(np.mean(vals)), float(np.std(vals))
         except Exception:
             pass
-    # fallback sans numpy
     try:
         m = sum(vals) / len(vals)
         v = sum((x - m) ** 2 for x in vals) / len(vals)
@@ -693,7 +894,6 @@ def _compute_oi_hist_slope(oi_hist: Optional[List[Dict[str, Any]]]) -> Optional[
         xs: List[float] = []
         for x in oi_hist[-20:]:
             try:
-                # Binance doc fields: sumOpenInterest / sumOpenInterestValue
                 xs.append(float(x.get("sumOpenInterest") or x.get("openInterest") or x.get("sumOpenInterestValue")))
             except Exception:
                 continue
@@ -721,7 +921,7 @@ def _compute_cvd_slope_from_klines(klines: List[List[Any]], window: int = 40) ->
         cvs: List[float] = []
         for item in sub:
             try:
-                vol = float(item[5])     # Volume
+                vol = float(item[5])        # Volume
                 taker_buy = float(item[9])  # Taker buy base asset volume
             except Exception:
                 continue
@@ -849,6 +1049,14 @@ def _classify_flow(cvd_slope: Optional[float], tape_5m: Optional[float]) -> str:
     return "neutral"
 
 
+def _classify_liq(delta_ratio: Optional[float], total_usd: Optional[float]) -> str:
+    if delta_ratio is None or total_usd is None:
+        return "unknown"
+    if float(total_usd) < float(_LIQ_MIN_NOTIONAL_USD):
+        return "low"
+    return _classify_tape(delta_ratio)
+
+
 def _score_institutional(
     bias: str,
     *,
@@ -860,11 +1068,13 @@ def _score_institutional(
     funding_z: Optional[float],
     basis_pct: Optional[float],
     ob_25bps: Optional[float],
+    liq_delta_ratio_5m: Optional[float],
+    liq_total_usd_5m: Optional[float],
 ) -> Tuple[int, Dict[str, int], Dict[str, Any]]:
     """
     Score in [0..4].
     Components:
-      - flow: 0..2 (tape/cvd)
+      - flow: 0..2 (tape/cvd/liquidations)
       - oi: 0..1
       - crowding: 0..1 (contrarian funding/basis)
       - orderbook: 0..1
@@ -875,6 +1085,8 @@ def _score_institutional(
 
     # Flow
     flow_points = 0
+
+    # Tape
     if tape_5m is not None:
         x = float(tape_5m)
         if b == "LONG":
@@ -888,6 +1100,7 @@ def _score_institutional(
             elif x <= -0.12:
                 flow_points += 1
 
+    # CVD
     if cvd_slope is not None:
         x = float(cvd_slope)
         if b == "LONG":
@@ -900,6 +1113,23 @@ def _score_institutional(
                 flow_points += 2
             elif x <= -0.2:
                 flow_points += 1
+
+    # Liquidations (WS): treated as additional flow confirmation, only if notional is meaningful.
+    if liq_delta_ratio_5m is not None and liq_total_usd_5m is not None and float(liq_total_usd_5m) >= float(_LIQ_MIN_NOTIONAL_USD):
+        x = float(liq_delta_ratio_5m)
+        if b == "LONG":
+            if x >= 0.35:
+                flow_points += 2
+            elif x >= 0.12:
+                flow_points += 1
+        else:
+            if x <= -0.35:
+                flow_points += 2
+            elif x <= -0.12:
+                flow_points += 1
+        meta["liq_used"] = True
+    else:
+        meta["liq_used"] = False
 
     if flow_points >= 3:
         comp["flow"] = 2
@@ -980,6 +1210,8 @@ def _available_components_list(payload: Dict[str, Any]) -> List[str]:
         out.append("oi_hist")
     if payload.get("funding_z") is not None:
         out.append("funding_hist")
+    if payload.get("liq_total_usd_5m") is not None:
+        out.append("liquidations")
     return out
 
 
@@ -999,10 +1231,8 @@ async def compute_full_institutional_analysis(
     - Uses circuit breaker if banned.
     - Uses mode (override) or INST_MODE env to control endpoint cost.
       mode: "LIGHT" | "NORMAL" | "FULL"
-
-    NOTE:
-    - include_liquidations (REST) is disabled in this implementation because Binance
-      indicates /fapi/v1/allForceOrders is not maintained / no longer accepts requests.
+    - Liquidations: consumed via WebSocket stream !forceOrder@arr when enabled.
+      Enable with INST_INCLUDE_LIQUIDATIONS=1 or include_liquidations=True.
     """
     bias = (bias or "").upper().strip()
     eff_mode = (mode or INST_MODE).upper().strip()
@@ -1010,6 +1240,15 @@ async def compute_full_institutional_analysis(
         eff_mode = "LIGHT"
 
     warnings: List[str] = []
+
+    # liquidations enable (env OR param)
+    use_liq = bool(INST_INCLUDE_LIQUIDATIONS or include_liquidations)
+    if use_liq:
+        # start WS worker lazily
+        try:
+            await _ensure_liq_stream()
+        except Exception:
+            warnings.append("liq_ws_start_error")
 
     if _is_hard_banned():
         payload = {
@@ -1029,6 +1268,12 @@ async def compute_full_institutional_analysis(
             "available_components": [],
             "available_components_count": 0,
             "ban": {"hard_until_ms": int(_BINANCE_HARD_BAN_UNTIL_MS), "soft_until_ms": int(_BINANCE_SOFT_UNTIL_MS)},
+            # liq fields
+            "liq_buy_usd_5m": None,
+            "liq_sell_usd_5m": None,
+            "liq_total_usd_5m": None,
+            "liq_delta_ratio_5m": None,
+            "liq_regime": "unknown",
         }
         return payload
 
@@ -1053,6 +1298,12 @@ async def compute_full_institutional_analysis(
             "available_components": [],
             "available_components_count": 0,
             "ban": {"hard_until_ms": int(_BINANCE_HARD_BAN_UNTIL_MS), "soft_until_ms": int(_BINANCE_SOFT_UNTIL_MS)},
+            # liq fields
+            "liq_buy_usd_5m": None,
+            "liq_sell_usd_5m": None,
+            "liq_total_usd_5m": None,
+            "liq_delta_ratio_5m": None,
+            "liq_regime": "unknown",
         }
         return payload
 
@@ -1075,6 +1326,13 @@ async def compute_full_institutional_analysis(
     ob_25: Optional[float] = None
 
     cvd_slope: Optional[float] = None
+
+    # Liquidations (WS metrics)
+    liq_buy_usd_5m: Optional[float] = None
+    liq_sell_usd_5m: Optional[float] = None
+    liq_total_usd_5m: Optional[float] = None
+    liq_delta_ratio_5m: Optional[float] = None
+    liq_regime: str = "unknown"
 
     # Optional LSR
     lsr_global_last = lsr_global_slope = None
@@ -1110,6 +1368,17 @@ async def compute_full_institutional_analysis(
             warnings.append("basis_parse_error")
     else:
         warnings.append("no_premiumIndex")
+
+    # -------------------------
+    # Liquidations window (WS) — independent of mode
+    # -------------------------
+    if use_liq:
+        try:
+            b, s, t, d = await _liq_metrics(binance_symbol, window_sec=_LIQ_WINDOW_SEC)
+            liq_buy_usd_5m, liq_sell_usd_5m, liq_total_usd_5m, liq_delta_ratio_5m = b, s, t, d
+            liq_regime = _classify_liq(liq_delta_ratio_5m, liq_total_usd_5m)
+        except Exception:
+            warnings.append("liq_metrics_error")
 
     # -------------------------
     # Mode NORMAL/FULL: add Tape + Orderbook (parallel)
@@ -1173,12 +1442,6 @@ async def compute_full_institutional_analysis(
             except Exception:
                 warnings.append("lsr_error")
 
-    # -------------------------
-    # Liquidations (REST) disabled (Binance allForceOrders deprecated)
-    # -------------------------
-    if include_liquidations:
-        warnings.append("liquidations_rest_disabled_binance_allForceOrders_deprecated")
-
     funding_regime = _classify_funding(funding_rate, z=funding_z)
     basis_regime = _classify_basis(basis_pct)
     crowding_regime = _classify_crowding(bias, funding_rate, basis_pct, funding_z)
@@ -1195,6 +1458,8 @@ async def compute_full_institutional_analysis(
         funding_z=funding_z,
         basis_pct=basis_pct,
         ob_25bps=ob_25,
+        liq_delta_ratio_5m=liq_delta_ratio_5m,
+        liq_total_usd_5m=liq_total_usd_5m,
     )
 
     ok_count = _components_ok_count(components)
@@ -1202,6 +1467,8 @@ async def compute_full_institutional_analysis(
     score_meta = dict(score_meta or {})
     score_meta["mode"] = eff_mode
     score_meta["ok_count"] = int(ok_count)
+    score_meta["liq_window_sec"] = int(_LIQ_WINDOW_SEC)
+    score_meta["liq_min_notional_usd"] = float(_LIQ_MIN_NOTIONAL_USD)
 
     available = any(
         [
@@ -1211,6 +1478,7 @@ async def compute_full_institutional_analysis(
             ob_25 is not None,
             cvd_slope is not None,
             oi_hist_slope is not None,
+            (liq_total_usd_5m is not None and liq_total_usd_5m > 0.0),
         ]
     )
 
@@ -1240,6 +1508,12 @@ async def compute_full_institutional_analysis(
         "funding_mean": funding_mean,
         "funding_std": funding_std,
         "funding_z": funding_z,
+        # liquidations (WS)
+        "liq_buy_usd_5m": liq_buy_usd_5m,
+        "liq_sell_usd_5m": liq_sell_usd_5m,
+        "liq_total_usd_5m": liq_total_usd_5m,
+        "liq_delta_ratio_5m": liq_delta_ratio_5m,
+        "liq_regime": liq_regime,
         # scoring debug
         "score_components": components,
         "score_meta": score_meta,
