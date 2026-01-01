@@ -56,7 +56,7 @@ class RiskConfig:
     max_daily_loss: float = 60.0
 
     # daily trades cap
-    max_trades_per_day: int = 20
+    max_trades_per_day: int = 0
 
     # max concurrently open positions
     max_open_positions: int = 10
