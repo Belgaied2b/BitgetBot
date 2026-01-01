@@ -1,18 +1,21 @@
 # =====================================================================
 # bitget_trader.py — Bitget Execution (Entry + TP1 + SL->BE)
-# Desk-lead hardened FINAL:
-# - Meta tick/step FIX (priceEndStep * 10^-pricePlace)
-# - qty_step != minTradeNum (minTradeNum is minQty)
-# - TP/SL intended tradeSide=close (scanner enforces; trader supports)
-# - Auto-downsize + retry on 40762 (insufficient balance) for ENTRY
-# - Retry on 40020 (precision) / 22047 (price band) / 45110 (min usdt)
-# - Stable signature params ordering
+# Desk-lead hardened FINAL (ready to paste)
 #
-# PATCH (2026-01):
-# - FIX: cancel_order crash (missing _symbol / _call)
-# - FIX: cancel_plan_orders payload format (orderIdList must be list of objects)
-# - ADD: optional presetStopLossPrice / presetStopSurplusPrice on ENTRY (place-order v2)
-# - ADD: flash_close_position() helper (close-positions v2)
+# Hardenings:
+# - Contract meta parsing more robust (data can be list or dict->list)
+# - Tick derivation: priceStep/priceEndStep interpreted with pricePlace
+# - qty_step != minTradeNum (minTradeNum = minQty)
+# - Stable params ordering for signatures (GET query sorted)
+# - place_limit retry: 22047 band clamp, 40020 precision, 40762 downsize (ENTRY)
+# - place_plan retry: 22047 band clamp, 40020 precision
+# - cancel_order: safe payload + no crash
+# - cancel_plan_orders: v2 payload orderIdList = list of objects (fix)
+# - get_order_detail: safer params (includes marginCoin) + accepts orderId/clientOid
+# - is_filled(): handles “filled” + numeric fallback; also treats partial fill as “filled enough”
+#   so the watcher can arm protection when ANY position is open.
+# - helpers: filled_qty(), order_size(), remaining_qty()
+# - flash_close_position(): close-positions v2 helper
 # =====================================================================
 
 from __future__ import annotations
@@ -52,6 +55,8 @@ def _now_ms() -> int:
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
+        if x is None:
+            return default
         return float(x)
     except Exception:
         return default
@@ -59,6 +64,8 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 
 def _safe_int(x: Any, default: int = 0) -> int:
     try:
+        if x is None:
+            return default
         return int(float(x))
     except Exception:
         return default
@@ -95,7 +102,10 @@ def _decimals_from_step(step: float, cap: int = 12) -> int:
     t = abs(float(step))
     if t <= 0:
         return 6
-    d = int(round(-math.log10(t)))
+    try:
+        d = int(round(-math.log10(t)))
+    except Exception:
+        d = 6
     return max(0, min(cap, d))
 
 
@@ -142,6 +152,7 @@ def _clamp_band(price: float, tick: float, mn: Optional[float], mx: Optional[flo
     p = float(price)
     if p <= 0:
         return None
+
     if tick <= 0:
         if mx is not None:
             p = min(p, float(mx))
@@ -149,6 +160,7 @@ def _clamp_band(price: float, tick: float, mn: Optional[float], mx: Optional[flo
             p = max(p, float(mn))
         return p if p > 0 else None
 
+    # keep a little buffer inside the band
     if mx is not None:
         p = min(p, float(mx) - 2.0 * tick)
     if mn is not None:
@@ -201,6 +213,18 @@ class ContractMetaCache:
         self._by_symbol: Dict[str, ContractMeta] = {}
         self._lock = asyncio.Lock()
 
+    @staticmethod
+    def _extract_contracts_list(js: Dict[str, Any]) -> List[Dict[str, Any]]:
+        data = js.get("data")
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            for k in ("list", "data", "rows"):
+                v = data.get(k)
+                if isinstance(v, list):
+                    return [x for x in v if isinstance(x, dict)]
+        return []
+
     async def refresh(self, force: bool = False) -> None:
         async with self._lock:
             now = time.time()
@@ -214,13 +238,21 @@ class ContractMetaCache:
                 auth=False,
             )
 
-            if not isinstance(js, dict) or "data" not in js:
-                logger.error("[META] bad contracts response: %s", js)
+            if not isinstance(js, dict):
+                logger.error("[META] bad contracts response (non-dict): %s", js)
+                return
+
+            if str(js.get("code", "")) not in ("", "00000"):
+                logger.warning("[META] contracts response code=%s msg=%s", js.get("code"), js.get("msg"))
+
+            contracts = self._extract_contracts_list(js)
+            if not contracts:
+                logger.error("[META] empty contracts list: %s", js)
                 return
 
             by_symbol: Dict[str, ContractMeta] = {}
 
-            for c in js.get("data", []):
+            for c in contracts:
                 sym = (c.get("symbol") or "").upper()
                 if not sym:
                     continue
@@ -235,7 +267,6 @@ class ContractMetaCache:
                 pt = _safe_float(c.get("priceTick"), 0.0)
 
                 tick = 0.0
-                # priority: (priceEndStep/priceStep) interpreted with pricePlace
                 if ps > 0:
                     tick = _tick_from_place_and_step(price_place, ps)
                 elif pe > 0:
@@ -243,15 +274,17 @@ class ContractMetaCache:
                 elif ts > 0:
                     tick = float(ts)
                 elif pt > 0:
-                    # priceTick is sometimes garbage (=1); only accept if plausible
+                    # accept only if plausible
                     base = (10.0 ** (-price_place)) if price_place > 0 else 1.0
-                    tick = float(pt) if (pt < 1.0 or base >= 1.0) else base
+                    if pt < 1.0:
+                        tick = float(pt)
+                    else:
+                        tick = float(base)
 
                 if tick <= 0:
                     tick = float(10 ** (-max(0, price_place)))
 
                 # ---- QTY STEP (FIX) ----
-                # minTradeNum is min qty, not step
                 vol_step = _safe_float(c.get("volumeStep"), 0.0)
                 size_mult = _safe_float(c.get("sizeMultiplier"), 0.0)
                 min_trade = _safe_float(c.get("minTradeNum"), 0.0)
@@ -262,7 +295,6 @@ class ContractMetaCache:
                 elif size_mult > 0:
                     step = float(size_mult)
                 else:
-                    # fallback from decimals
                     step = float(10 ** (-max(0, qty_place))) if qty_place > 0 else 1.0
 
                 min_qty = float(min_trade) if min_trade > 0 else float(step)
@@ -285,8 +317,13 @@ class ContractMetaCache:
 
     async def get(self, symbol: str) -> Optional[ContractMeta]:
         sym = (symbol or "").upper()
-        await self.refresh()
-        return self._by_symbol.get(sym)
+        await self.refresh(force=False)
+        m = self._by_symbol.get(sym)
+        if m is None:
+            # force refresh once (new listing / cache stale)
+            await self.refresh(force=True)
+            m = self._by_symbol.get(sym)
+        return m
 
 
 # ---------------------------------------------------------------------
@@ -321,7 +358,6 @@ class BitgetTrader:
 
     @staticmethod
     def _symbol(symbol: str) -> str:
-        # Bitget symbols are typically already like BTCUSDT; keep it safe.
         return (symbol or "").upper().replace("-", "").replace("_", "")
 
     async def _call(
@@ -334,7 +370,7 @@ class BitgetTrader:
         auth: bool = True,
         timeout: int = 12,
     ) -> Dict[str, Any]:
-        # Backward-compatible wrapper (old code used _call)
+        # Backward-compatible wrapper
         if (method or "GET").upper() == "GET":
             return await self._request_any_status("GET", path, params=params, timeout=timeout, auth=auth)
         return await self._request_any_status("POST", path, data=payload, timeout=timeout, auth=auth)
@@ -366,6 +402,7 @@ class BitgetTrader:
         headers: Dict[str, str] = {"Content-Type": "application/json"}
 
         if auth:
+            # relies on your bitget_client._sign implementation
             sig = self.client._sign(ts, method.upper(), path, query, body)
             headers.update(
                 {
@@ -427,9 +464,9 @@ class BitgetTrader:
     async def get_tick(self, symbol: str) -> float:
         meta = await self._meta.get(symbol)
         if not meta:
-            return 1e-6
+            return float(_estimate_tick_from_price(1.0))
         t = float(meta.price_tick or (10 ** (-max(0, meta.price_place))))
-        return t if t > 0 else 1e-6
+        return t if t > 0 else float(_estimate_tick_from_price(1.0))
 
     async def debug_meta(self, symbol: str) -> Dict[str, Any]:
         meta = await self._meta.get(symbol)
@@ -450,6 +487,7 @@ class BitgetTrader:
                 "volumePlace": meta.raw.get("volumePlace"),
                 "volumeStep": meta.raw.get("volumeStep"),
                 "minTradeNum": meta.raw.get("minTradeNum"),
+                "sizeMultiplier": meta.raw.get("sizeMultiplier"),
             },
         }
 
@@ -483,6 +521,7 @@ class BitgetTrader:
         p = float(price)
         if tick > 0:
             if is_trigger:
+                # for stop triggers, we quantize based on the close side (more conservative)
                 cs = (close_side or "").upper()
                 if cs == "SELL":
                     q_price = _ceil_step(p, tick)
@@ -504,6 +543,7 @@ class BitgetTrader:
         q = float(qty)
         q_qty = _floor_step(q, step) if step > 0 else q
 
+        # hard min qty gate
         if q_qty < float(meta.min_qty or 0.0):
             q_qty = 0.0
 
@@ -530,7 +570,6 @@ class BitgetTrader:
             d = _decimals_from_step(tick_used or _estimate_tick_from_price(p))
             return _fmt_decimal(p, d)
 
-        # normal: use meta pricePlace
         if meta.price_place >= 0:
             return _fmt_decimal(p, max(0, meta.price_place))
 
@@ -557,7 +596,7 @@ class BitgetTrader:
         post_only: bool = False,
         tick_hint: Optional[float] = None,
         debug_tag: str = "ENTRY",
-        # NEW (optional): attach SL/TP directly on entry (Bitget v2 place-order)
+        # optional: attach SL/TP directly on entry
         preset_stop_loss: Optional[float] = None,
         preset_take_profit: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -578,7 +617,6 @@ class BitgetTrader:
 
         price_str = await self._format_price(sym, q_price, tick_used=tick_used)
         size_str = self._format_qty_str(q_qty, qp)
-
         oid = client_oid or f"oid-{sym}-{_now_ms()}"
 
         payload: Dict[str, Any] = {
@@ -590,8 +628,6 @@ class BitgetTrader:
             "price": price_str,
             "side": s,
             "orderType": "limit",
-            # Bitget v2 expects `force` (gtc / post_only / ioc ...). We also keep
-            # `timeInForceValue` for backward compatibility with older payloads.
             "force": "post_only" if post_only else "gtc",
             "timeInForceValue": "post_only" if post_only else "normal",
             "clientOid": oid,
@@ -600,13 +636,10 @@ class BitgetTrader:
         if reduce_only:
             payload["reduceOnly"] = "YES"
 
-        # Attach SL/TP only for ENTRY (tradeSide=open). If your scanner passes these,
-        # Bitget will register protection at creation time.
         if payload["tradeSide"] == "open":
             if preset_stop_loss is not None:
                 payload["presetStopLossPrice"] = await self._format_price(sym, float(preset_stop_loss), tick_used=tick_used)
             if preset_take_profit is not None:
-                # Bitget v2 uses presetStopSurplusPrice for take profit
                 payload["presetStopSurplusPrice"] = await self._format_price(sym, float(preset_take_profit), tick_used=tick_used)
 
         logger.info(
@@ -641,7 +674,6 @@ class BitgetTrader:
 
         # 40020 => force decimals from tick retry
         code = str(resp.get("code", ""))
-        msg = str(resp.get("msg") or "")
         if (not _is_ok(resp)) and code in _ERR_PRICE_PRECISION:
             d = _decimals_from_step(tick_used or _estimate_tick_from_price(q_price))
             price_str2 = await self._format_price(sym, q_price, tick_used=tick_used, force_decimals=d)
@@ -650,11 +682,9 @@ class BitgetTrader:
             logger.warning("[ORDER_%s] 40020 retry force_decimals=%s price_str=%s->%s", debug_tag, d, price_str, price_str2)
             resp = await _send(payload2)
 
-        # 40762 => downsize retry (ENTRY only)
+        # 40762 => downsize retry (ENTRY only, when size=None and not reduce-only)
         code = str(resp.get("code", ""))
-        msg = str(resp.get("msg") or "")
         if (not _is_ok(resp)) and code in _ERR_BALANCE and payload.get("tradeSide") == "open" and (not reduce_only) and size is None:
-            # progressively reduce qty (keeps price)
             downs = []
             cur_qty = float(raw_qty)
             for k in range(3):
@@ -677,11 +707,10 @@ class BitgetTrader:
             if (not _is_ok(resp)) and downs:
                 resp["_downsized"] = downs
 
-        # Attach debug hints
+        # Attach debug hints + min_usdt/band parsing
         if not _is_ok(resp):
             code = str(resp.get("code", ""))
             msg = str(resp.get("msg") or "")
-
             if code in _ERR_MIN_USDT:
                 mmin = _parse_min_usdt(msg)
                 if mmin is not None:
@@ -820,7 +849,6 @@ class BitgetTrader:
 
         # price precision retry
         code = str(resp.get("code", ""))
-        msg = str(resp.get("msg") or "")
         if (not _is_ok(resp)) and code in _ERR_PRICE_PRECISION:
             d = _decimals_from_step(tick_used or _estimate_tick_from_price(q_trig))
             trig_str2 = await self._format_price(sym, q_trig, tick_used=tick_used, force_decimals=d)
@@ -871,7 +899,6 @@ class BitgetTrader:
     ) -> Dict[str, Any]:
         """
         Cancel a normal (non-plan) order by orderId or clientOid.
-        FIX: previously referenced self._symbol/self._call inconsistently.
         """
         sym = self._symbol(symbol)
         payload: Dict[str, Any] = {
@@ -898,8 +925,8 @@ class BitgetTrader:
     ) -> Dict[str, Any]:
         """
         Cancel trigger/plan orders.
-        FIX: Bitget v2 requires orderIdList to be a list of objects, not list of strings.
-        Each object: {"orderId": "...", "clientOid": "..."} (either one is ok).
+        Bitget v2 requires orderIdList to be a list of objects.
+        Each object: {"orderId":"...", "clientOid":"..."} (either one is ok).
         """
         sym = self._symbol(symbol)
         items: List[Dict[str, str]] = []
@@ -938,25 +965,41 @@ class BitgetTrader:
         client_oid: Optional[str] = None,
     ) -> Dict[str, Any]:
         sym = self._symbol(symbol)
-        params: Dict[str, Any] = {"symbol": sym, "productType": self.product_type}
+        if not order_id and not client_oid:
+            return {"ok": False, "code": "NOID", "msg": "order_id or client_oid required"}
+
+        params: Dict[str, Any] = {
+            "symbol": sym,
+            "productType": self.product_type,
+            "marginCoin": self.margin_coin,
+        }
         if order_id:
             params["orderId"] = str(order_id)
         if client_oid:
             params["clientOid"] = str(client_oid)
+
         return await self._request_any_status("GET", "/api/v2/mix/order/detail", params=params, auth=True)
 
     @staticmethod
-    def is_filled(order_detail_resp: Dict[str, Any]) -> bool:
+    def _data_row(order_detail_resp: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(order_detail_resp, dict):
+            return {}
+        data = order_detail_resp.get("data")
+        if isinstance(data, dict):
+            # sometimes nested lists exist, but detail is typically a dict
+            return data
+        if isinstance(data, list):
+            for it in data:
+                if isinstance(it, dict):
+                    return it
+        return {}
+
+    @staticmethod
+    def filled_qty(order_detail_resp: Dict[str, Any]) -> float:
         if not _is_ok(order_detail_resp):
-            return False
-
-        data = order_detail_resp.get("data") or {}
-        state = str(data.get("state") or data.get("status") or "").lower()
-
-        if state in {"filled", "full_fill", "fullfill", "completed", "success"}:
-            return True
-
-        filled = _safe_float(
+            return 0.0
+        data = BitgetTrader._data_row(order_detail_resp)
+        return _safe_float(
             data.get("baseVolume")
             or data.get("filledQty")
             or data.get("filledSize")
@@ -964,7 +1007,13 @@ class BitgetTrader:
             or data.get("dealSize"),
             0.0,
         )
-        size = _safe_float(
+
+    @staticmethod
+    def order_size(order_detail_resp: Dict[str, Any]) -> float:
+        if not _is_ok(order_detail_resp):
+            return 0.0
+        data = BitgetTrader._data_row(order_detail_resp)
+        return _safe_float(
             data.get("size")
             or data.get("quantity")
             or data.get("qty")
@@ -972,12 +1021,44 @@ class BitgetTrader:
             0.0,
         )
 
-        if size <= 0:
+    @staticmethod
+    def remaining_qty(order_detail_resp: Dict[str, Any]) -> float:
+        size = BitgetTrader.order_size(order_detail_resp)
+        filled = BitgetTrader.filled_qty(order_detail_resp)
+        return max(0.0, float(size) - float(filled))
+
+    @staticmethod
+    def is_filled(order_detail_resp: Dict[str, Any]) -> bool:
+        """
+        IMPORTANT for your watcher:
+        - returns True when fully filled
+        - ALSO returns True when partially filled (filled > 0) so the watcher can arm SL/TP
+          as soon as a position exists (prevents “partial fill unprotected”).
+        """
+        if not _is_ok(order_detail_resp):
             return False
-        return filled >= size * 0.999
+
+        data = BitgetTrader._data_row(order_detail_resp)
+        state = str(data.get("state") or data.get("status") or "").lower()
+
+        if state in {"filled", "full_fill", "fullfill", "completed", "success"}:
+            return True
+
+        filled = BitgetTrader.filled_qty(order_detail_resp)
+        size = BitgetTrader.order_size(order_detail_resp)
+
+        # full numeric fill
+        if size > 0 and filled >= size * 0.999:
+            return True
+
+        # partial fill -> treat as "filled enough" to arm protection
+        if filled > 0:
+            return True
+
+        return False
 
     # ----------------------------
-    # Emergency close (NEW helper)
+    # Emergency close
     # ----------------------------
 
     async def flash_close_position(
@@ -989,7 +1070,6 @@ class BitgetTrader:
     ) -> Dict[str, Any]:
         """
         Close position at market price (Bitget v2: /api/v2/mix/order/close-positions).
-        Useful for your scanner RISK_CLOSE.
         """
         sym = self._symbol(symbol)
         payload: Dict[str, Any] = {"symbol": sym, "productType": self.product_type}
