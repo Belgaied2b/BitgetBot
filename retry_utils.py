@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import random
-import time
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 
 T = TypeVar("T")
@@ -21,18 +20,21 @@ T = TypeVar("T")
 
 def _default_retry_on(exc: Exception) -> bool:
     """
-    Default: retry on network/timeout-like errors.
-    We keep it generic: callers can pass a stricter predicate.
+    Default: retry on transient/network/timeout-like errors + common API throttles/5xx.
+    Callers can pass a stricter predicate via retry_on=...
     """
-    # asyncio
+    # asyncio / stdlib network-ish
     if isinstance(exc, (asyncio.TimeoutError, ConnectionError)):
         return True
 
-    # aiohttp is optional; do not import hard dependency here
     name = exc.__class__.__name__.lower()
     msg = str(exc).lower()
 
-    # common transient classes
+    # Custom "Retryable" marker exceptions (ex: _Retryable in bitget_client.py)
+    if "retryable" in name:
+        return True
+
+    # common aiohttp transient classes (aiohttp import is optional)
     if "clientconnectorerror" in name or "clientoserror" in name:
         return True
     if "serverdisconnectederror" in name:
@@ -45,6 +47,13 @@ def _default_retry_on(exc: Exception) -> bool:
     # common transient messages
     if "too many requests" in msg or "http 429" in msg:
         return True
+
+    # generic 5xx hints (covers messages like "HTTP 500", "HTTP 502", etc.)
+    if "http 5" in msg:
+        return True
+    if "bad gateway" in msg or "service unavailable" in msg or "gateway timeout" in msg:
+        return True
+
     if "temporarily unavailable" in msg:
         return True
     if "connection reset" in msg or "connection aborted" in msg:
@@ -69,12 +78,12 @@ async def retry_async(
 
     Args:
       retries: total attempts (>=1). Example retries=4 => up to 4 tries.
-      base_delay: initial backoff seconds.
+      base_delay: initial backoff seconds (attempt=1 => base_delay).
       max_delay: cap for backoff delay.
       jitter: random added seconds (0..jitter).
       timeout_s: per-attempt timeout (None = no timeout).
       retry_on: predicate(exc)->bool. If returns False => raise immediately.
-      on_retry: callback(attempt_index, exc, sleep_s). Called before sleeping.
+      on_retry: callback(attempt_number, exc, sleep_s). Called before sleeping.
 
     Returns:
       Result of fn() if successful.
@@ -82,19 +91,18 @@ async def retry_async(
     Raises:
       Last exception if all attempts fail or retry_on says no retry.
     """
-    if retries <= 0:
+    if retries < 1:
         raise ValueError("retries must be >= 1")
 
     pred = retry_on or _default_retry_on
-
     last_exc: Optional[Exception] = None
-    t_start = time.time()
 
     for attempt in range(1, retries + 1):
         try:
             if timeout_s is not None and timeout_s > 0:
                 return await asyncio.wait_for(fn(), timeout=timeout_s)
             return await fn()
+
         except Exception as exc:
             last_exc = exc
 
@@ -106,8 +114,7 @@ async def retry_async(
             if attempt >= retries:
                 raise
 
-            # compute backoff
-            # attempt=1 => 0 * base (but we still sleep base_delay)
+            # exponential backoff + jitter
             backoff = base_delay * (2 ** (attempt - 1))
             sleep_s = min(max_delay, backoff) + random.random() * float(jitter)
 
@@ -115,7 +122,6 @@ async def retry_async(
                 try:
                     on_retry(attempt, exc, sleep_s)
                 except Exception:
-                    # never let logging callbacks break retry behavior
                     pass
 
             await asyncio.sleep(sleep_s)
