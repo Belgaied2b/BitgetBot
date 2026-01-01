@@ -56,14 +56,14 @@ class RiskConfig:
     max_daily_loss: float = 60.0
 
     # daily trades cap
-    max_trades_per_day: int = 0
+    max_trades_per_day: int = 500
 
     # max concurrently open positions
-    max_open_positions: int = 10
+    max_open_positions: int = 20
 
     # directional caps
-    max_long_positions: int = 10
-    max_short_positions: int = 10
+    max_long_positions: int = 15
+    max_short_positions: int = 15
 
     # tilt: consecutive losses => cooldown
     max_consecutive_losses: int = 5
