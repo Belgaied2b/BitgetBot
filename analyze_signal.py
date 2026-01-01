@@ -138,6 +138,65 @@ def compute_premium_discount(df: pd.DataFrame, lookback: int = 80) -> Tuple[bool
 
 
 # =====================================================================
+# Tick helpers (for post-adjust rounding hygiene)
+# =====================================================================
+def _safe_tick(tick: float) -> float:
+    try:
+        t = float(tick)
+        if not np.isfinite(t) or t <= 0:
+            return 0.0
+        return t
+    except Exception:
+        return 0.0
+
+
+def _floor_to_tick(price: float, tick: float) -> float:
+    t = _safe_tick(tick)
+    if t <= 0:
+        return float(price)
+    p = float(price)
+    return float(np.floor(p / t) * t)
+
+
+def _ceil_to_tick(price: float, tick: float) -> float:
+    t = _safe_tick(tick)
+    if t <= 0:
+        return float(price)
+    p = float(price)
+    return float(np.ceil(p / t) * t)
+
+
+def _round_sl_for_side(sl: float, entry: float, bias: str, tick: float) -> float:
+    """
+    Align SL to tick grid safely:
+      - LONG SL rounds DOWN
+      - SHORT SL rounds UP
+    Also re-enforces SL on correct side of entry if something broke after adjustments.
+    """
+    b = (bias or "").upper()
+    t = _safe_tick(tick)
+    sl_f = float(sl)
+    entry_f = float(entry)
+
+    if b == "LONG":
+        sl_f = _floor_to_tick(sl_f, t)
+        if sl_f >= entry_f:
+            # force minimal safe gap if something went wrong after liquidity adjustments
+            gap = max((2.0 * t if t > 0 else 0.0), abs(entry_f) * 0.001)
+            sl_f = _floor_to_tick(entry_f - gap, t)
+        return float(sl_f)
+
+    if b == "SHORT":
+        sl_f = _ceil_to_tick(sl_f, t)
+        if sl_f <= entry_f:
+            gap = max((2.0 * t if t > 0 else 0.0), abs(entry_f) * 0.001)
+            sl_f = _ceil_to_tick(entry_f + gap, t)
+        return float(sl_f)
+
+    return float(sl_f)
+
+
+# =====================================================================
 # Composite helpers
 # =====================================================================
 def _composite_bias_ok(bias: str, score: float, label: str, thr: float = 65.0) -> bool:
@@ -224,11 +283,41 @@ def estimate_tick_from_price(price: float) -> float:
     return 0.0000001
 
 
-def _compute_exits(df: pd.DataFrame, entry: float, bias: str, tick: float) -> Dict[str, Any]:
+def _compute_exits(
+    df: pd.DataFrame,
+    entry: float,
+    bias: str,
+    tick: float,
+    *,
+    setup: Optional[str] = None,
+    entry_type: Optional[str] = None,
+    htf_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
+    """
+    Uses stops.py v3 policy-aware stops:
+      protective_stop_*(..., setup=..., entry_type=..., htf_df=...)
+    """
     if bias == "LONG":
-        sl, meta = protective_stop_long(df, entry, tick, return_meta=True)
+        sl, meta = protective_stop_long(
+            df,
+            entry,
+            tick,
+            return_meta=True,
+            setup=setup,
+            entry_type=entry_type,
+            htf_df=htf_df,
+        )
     else:
-        sl, meta = protective_stop_short(df, entry, tick, return_meta=True)
+        sl, meta = protective_stop_short(
+            df,
+            entry,
+            tick,
+            return_meta=True,
+            setup=setup,
+            entry_type=entry_type,
+            htf_df=htf_df,
+        )
+
     tp1, rr_used = compute_tp1(entry, sl, bias, df=df, tick=tick)
     return {"sl": float(sl), "tp1": float(tp1), "rr_used": float(rr_used), "sl_meta": meta}
 
@@ -783,25 +872,64 @@ class SignalAnalyzer:
                 LOGGER.info("[EVAL_REJECT] %s short_in_discount_market", symbol)
                 return _reject("short_in_discount_market", institutional=inst, structure=struct, entry_pick=entry_pick)
 
+        # --------------------------
+        # Exits (policy-aware SL v3)
+        # --------------------------
+        setup_hint: Optional[str] = None
+        if bos_flag:
+            setup_hint = "BOS_STRICT"
+        elif DESK_EV_MODE and raid_ok:
+            setup_hint = "RAID_DISPLACEMENT"
+        elif DESK_EV_MODE and sweep_ok:
+            setup_hint = "LIQ_SWEEP"
+        elif DESK_EV_MODE:
+            setup_hint = "INST_CONTINUATION"
+
         tick = estimate_tick_from_price(entry)
-        exits = _compute_exits(df_h1, entry, bias, tick=tick)
+        exits = _compute_exits(
+            df_h1,
+            entry,
+            bias,
+            tick=tick,
+            setup=setup_hint,
+            entry_type=entry_type,
+            htf_df=df_h4,  # enables optional HTF swing/liq candidates in stops.py v3
+        )
+
         sl = float(exits["sl"])
         tp1 = float(exits["tp1"])
 
         rr = _safe_rr(entry, sl, tp1, bias)
 
-        # SL hygiene (push beyond sweep / eq levels)
+        # SL hygiene (push beyond sweep / eq levels) + keep tick rounding consistent
         atr_last = _atr(df_h1, 14)
         buf = max((atr_last * 0.08) if atr_last > 0 else 0.0, float(tick) * 2.0, entry * 0.0004)
+
+        sl_pre = float(sl)
+        sl_adj: Dict[str, Any] = {
+            "setup_hint": setup_hint,
+            "entry_type": entry_type,
+            "sl_pre": sl_pre,
+            "buf": float(buf),
+            "did_sweep": False,
+            "did_eq": False,
+            "sweep_extreme": None,
+            "eq_level": None,
+            "sl_post_round": None,
+        }
 
         try:
             if isinstance(liq_sweep, dict) and liq_sweep.get("ok"):
                 ext = float(liq_sweep.get("sweep_extreme") or 0.0)
                 if ext > 0 and buf > 0:
                     if bias == "LONG":
-                        sl = min(sl, ext - buf)
+                        new_sl = min(sl, ext - buf)
                     else:
-                        sl = max(sl, ext + buf)
+                        new_sl = max(sl, ext + buf)
+                    if np.isfinite(new_sl) and float(new_sl) != float(sl):
+                        sl = float(new_sl)
+                        sl_adj["did_sweep"] = True
+                        sl_adj["sweep_extreme"] = float(ext)
         except Exception:
             pass
 
@@ -814,15 +942,27 @@ class SignalAnalyzer:
                 lvl = min(eq_lows, key=lambda x: abs(entry - float(x)))
                 lvl = float(lvl)
                 if lvl > 0 and lvl < entry and sl > (lvl - buf):
-                    sl = min(sl, lvl - buf)
+                    new_sl = min(sl, lvl - buf)
+                    if np.isfinite(new_sl) and float(new_sl) != float(sl):
+                        sl = float(new_sl)
+                        sl_adj["did_eq"] = True
+                        sl_adj["eq_level"] = float(lvl)
 
             if bias == "SHORT" and eq_highs:
                 lvl = min(eq_highs, key=lambda x: abs(entry - float(x)))
                 lvl = float(lvl)
                 if lvl > 0 and lvl > entry and sl < (lvl + buf):
-                    sl = max(sl, lvl + buf)
+                    new_sl = max(sl, lvl + buf)
+                    if np.isfinite(new_sl) and float(new_sl) != float(sl):
+                        sl = float(new_sl)
+                        sl_adj["did_eq"] = True
+                        sl_adj["eq_level"] = float(lvl)
         except Exception:
             pass
+
+        # ✅ tick-grid rounding AFTER adjustments (exchange hygiene)
+        sl = _round_sl_for_side(sl, entry, bias, tick)
+        sl_adj["sl_post_round"] = float(sl)
 
         if sl <= 0:
             LOGGER.info("[EVAL_REJECT] %s sl_invalid_after_liq_adj sl=%s", symbol, sl)
@@ -830,16 +970,21 @@ class SignalAnalyzer:
 
         # ✅ IMPORTANT: recalc TP1 after SL adjustments (keeps RR logic consistent)
         try:
-            tp1, rr_used2 = compute_tp1(entry, sl, bias, df=df_h1, tick=tick)
+            tp1, _rr_used2 = compute_tp1(entry, sl, bias, df=df_h1, tick=tick)
             tp1 = float(tp1)
         except Exception:
             tp1 = float(tp1)
 
         rr = _safe_rr(entry, sl, tp1, bias)
 
+        # merge SL meta (original + post adjustments)
+        base_sl_meta = exits.get("sl_meta") if isinstance(exits.get("sl_meta"), dict) else {}
+        sl_meta_out = dict(base_sl_meta)
+        sl_meta_out["post_adjust"] = sl_adj
+
         LOGGER.info(
-            "[EVAL_PRE] %s EXITS entry=%s sl=%s tp1=%s tick=%s RR=%s raw_rr=%s entry_type=%s",
-            symbol, entry, sl, tp1, tick, rr, exits.get("rr_used"), entry_type
+            "[EVAL_PRE] %s EXITS entry=%s sl=%s tp1=%s tick=%s RR=%s raw_rr=%s entry_type=%s setup_hint=%s",
+            symbol, entry, sl, tp1, tick, rr, exits.get("rr_used"), entry_type, setup_hint
         )
 
         if rr is None or rr <= 0:
@@ -892,7 +1037,7 @@ class SignalAnalyzer:
                 "premium": premium,
                 "discount": discount,
                 "entry_pick": entry_pick,
-                "sl_meta": exits.get("sl_meta"),
+                "sl_meta": sl_meta_out,
             }
 
         # 2) RAID_DISPLACEMENT (desk)
@@ -925,6 +1070,7 @@ class SignalAnalyzer:
                 "discount": discount,
                 "entry_pick": entry_pick,
                 "liquidity_sweep": liq_sweep,
+                "sl_meta": sl_meta_out,
             }
 
         # 3) LIQ_SWEEP (desk)
@@ -957,6 +1103,7 @@ class SignalAnalyzer:
                 "discount": discount,
                 "entry_pick": entry_pick,
                 "liquidity_sweep": liq_sweep,
+                "sl_meta": sl_meta_out,
             }
 
         # 4) INST_CONTINUATION (desk)
@@ -993,7 +1140,7 @@ class SignalAnalyzer:
                     "premium": premium,
                     "discount": discount,
                     "entry_pick": entry_pick,
-                    "sl_meta": exits.get("sl_meta"),
+                    "sl_meta": sl_meta_out,
                 }
 
         LOGGER.info("[EVAL_REJECT] %s no_setup_validated (DESK_EV_MODE=%s)", symbol, DESK_EV_MODE)
@@ -1010,4 +1157,5 @@ class SignalAnalyzer:
             "inst_score_eff": int(gate),
             "composite_score": comp_score,
             "composite_label": comp_label,
+            "sl_meta": sl_meta_out,
         }
