@@ -72,7 +72,20 @@ def _atr(df: pd.DataFrame, length: int = 14) -> float:
                     s = _compute_atr_ext(df, period=int(length))
                 except TypeError:
                     s = _compute_atr_ext(df, n=int(length))
-            v = float(s.iloc[-1]) if s is not None and len(s) else 0.0
+
+            # robust: Series / scalar / array-like
+            if s is None:
+                v = 0.0
+            elif isinstance(s, (int, float, np.floating)):
+                v = float(s)
+            elif hasattr(s, "iloc"):
+                v = float(s.iloc[-1])
+            else:
+                try:
+                    v = float(list(s)[-1])
+                except Exception:
+                    v = float(s)
+
             return max(0.0, v) if np.isfinite(v) else 0.0
 
         if not _has_cols(df, ("high", "low", "close")):
@@ -897,7 +910,7 @@ def _volume_profile(df: pd.DataFrame, lookback: int = 140, bins: int = 48) -> Di
 
 
 # =====================================================================
-# RAID → DISPLACEMENT → FVG (desk)
+# RAID → DISPLACEMENT → FVG (desk) — FIXED (local vs global indexing)
 # =====================================================================
 
 def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) -> Dict[str, Any]:
@@ -906,6 +919,12 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
       1) Sweep (raid) of EQ level (EQL for longs / EQH for shorts)
       2) Displacement candle in trend direction (impulse)
       3) Fresh FVG formed by displacement -> propose entry at FVG mid
+
+    NOTE:
+      This implementation is careful about indices:
+        - We work on a local window `w` (reset_index).
+        - FVG zones built on `w` have local indices.
+        - We also attach index_global for debugging/logging consistency.
     """
     out = {"ok": False, "bias": None, "entry": None, "zone": None, "note": "no_pattern"}
 
@@ -919,6 +938,8 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
         out["bias"] = bias
 
         w = df.tail(int(max(120, lookback))).copy().reset_index(drop=True)
+        global_offset = int(len(df) - len(w))
+
         a = _atr(w, 14)
         if a <= 0:
             return out
@@ -936,6 +957,7 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
 
         lvl = float(min(eq_lows if bias == "LONG" else eq_highs, key=lambda x: abs(close_last - float(x))))
 
+        # 1) find sweep
         tail_start = max(2, len(w) - 12)
         sweep_i = None
         for i in range(tail_start, len(w) - 1):
@@ -962,6 +984,7 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
             out["note"] = "no_sweep"
             return out
 
+        # 2) find displacement after sweep
         disp_i = None
         for j in range(sweep_i + 1, min(len(w), sweep_i + 4)):
             o = float(w["open"].iloc[j])
@@ -988,12 +1011,17 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
             out["note"] = "sweep_no_displacement"
             return out
 
-        zones = _detect_fvg(w, lookback=len(w), keep_last=12)
-        zones = [z for z in zones if int(z.get("index", 0)) >= (len(df) - len(w) + disp_i)]
+        # 3) detect FVG zones on the same local window
+        zones = _detect_fvg(w, lookback=len(w), keep_last=16)
+
+        # IMPORTANT FIX:
+        # zones' "index" is LOCAL (because w is reset_index and idx_offset=0).
+        zones = [z for z in zones if int(z.get("index", -1)) >= int(disp_i)]
         if not zones:
             out["note"] = "no_fvg_after_displacement"
             return out
 
+        # pick nearest zone midpoint that matches bias direction
         best = None
         best_dist = 1e18
         for z in zones:
@@ -1002,10 +1030,12 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
                 continue
             if bias == "SHORT" and "bull" in zdir:
                 continue
+
             zl = float(z["low"])
             zh = float(z["high"])
             mid = (zl + zh) / 2.0
             dist = abs(close_last - mid)
+
             if dist < best_dist:
                 best_dist = dist
                 best = z
@@ -1014,20 +1044,34 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
             out["note"] = "no_fvg_bias_match"
             return out
 
-        entry = float((float(best["low"]) + float(best["high"])) / 2.0)
+        # distance sanity
         if best_dist > 2.0 * a:
             out["note"] = f"fvg_too_far dist={best_dist:.6g} atr={a:.6g}"
             return out
+
+        entry = float((float(best["low"]) + float(best["high"])) / 2.0)
+
+        # attach global index (debug)
+        best = dict(best)
+        try:
+            best["index_global"] = int(global_offset + int(best.get("index", 0)))
+        except Exception:
+            pass
 
         out.update(
             {
                 "ok": True,
                 "entry": entry,
                 "zone": best,
-                "note": f"raid(lvl={lvl:.6g}) sweep_i={sweep_i} disp_i={disp_i} fvg_i={best.get('index')} dist={best_dist:.6g} atr={a:.6g}",
+                "note": (
+                    f"raid(lvl={lvl:.6g}) sweep_i={sweep_i} disp_i={disp_i} "
+                    f"fvg_i_local={best.get('index')} fvg_i_global={best.get('index_global')} "
+                    f"dist={best_dist:.6g} atr={a:.6g}"
+                ),
                 "sweep_level": lvl,
-                "sweep_index": sweep_i,
-                "displacement_index": disp_i,
+                "sweep_index": int(sweep_i),
+                "displacement_index": int(disp_i),
+                "window_offset": int(global_offset),
             }
         )
         return out
