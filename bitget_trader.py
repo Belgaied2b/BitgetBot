@@ -7,6 +7,12 @@
 # - Auto-downsize + retry on 40762 (insufficient balance) for ENTRY
 # - Retry on 40020 (precision) / 22047 (price band) / 45110 (min usdt)
 # - Stable signature params ordering
+#
+# PATCH (2026-01):
+# - FIX: cancel_order crash (missing _symbol / _call)
+# - FIX: cancel_plan_orders payload format (orderIdList must be list of objects)
+# - ADD: optional presetStopLossPrice / presetStopSurplusPrice on ENTRY (place-order v2)
+# - ADD: flash_close_position() helper (close-positions v2)
 # =====================================================================
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ import math
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, Union
 
 from retry_utils import retry_async
 from settings import PRODUCT_TYPE, MARGIN_COIN
@@ -309,6 +315,30 @@ class BitgetTrader:
 
         self._meta = ContractMetaCache(client)
 
+    # ----------------------------
+    # Compat / helpers
+    # ----------------------------
+
+    @staticmethod
+    def _symbol(symbol: str) -> str:
+        # Bitget symbols are typically already like BTCUSDT; keep it safe.
+        return (symbol or "").upper().replace("-", "").replace("_", "")
+
+    async def _call(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        auth: bool = True,
+        timeout: int = 12,
+    ) -> Dict[str, Any]:
+        # Backward-compatible wrapper (old code used _call)
+        if (method or "GET").upper() == "GET":
+            return await self._request_any_status("GET", path, params=params, timeout=timeout, auth=auth)
+        return await self._request_any_status("POST", path, data=payload, timeout=timeout, auth=auth)
+
     async def _request_any_status(
         self,
         method: str,
@@ -527,8 +557,11 @@ class BitgetTrader:
         post_only: bool = False,
         tick_hint: Optional[float] = None,
         debug_tag: str = "ENTRY",
+        # NEW (optional): attach SL/TP directly on entry (Bitget v2 place-order)
+        preset_stop_loss: Optional[float] = None,
+        preset_take_profit: Optional[float] = None,
     ) -> Dict[str, Any]:
-        sym = (symbol or "").upper()
+        sym = self._symbol(symbol)
         s = (side or "").lower()
 
         if size is None:
@@ -547,7 +580,8 @@ class BitgetTrader:
         size_str = self._format_qty_str(q_qty, qp)
 
         oid = client_oid or f"oid-{sym}-{_now_ms()}"
-        payload = {
+
+        payload: Dict[str, Any] = {
             "symbol": sym,
             "productType": self.product_type,
             "marginCoin": self.margin_coin,
@@ -566,9 +600,19 @@ class BitgetTrader:
         if reduce_only:
             payload["reduceOnly"] = "YES"
 
+        # Attach SL/TP only for ENTRY (tradeSide=open). If your scanner passes these,
+        # Bitget will register protection at creation time.
+        if payload["tradeSide"] == "open":
+            if preset_stop_loss is not None:
+                payload["presetStopLossPrice"] = await self._format_price(sym, float(preset_stop_loss), tick_used=tick_used)
+            if preset_take_profit is not None:
+                # Bitget v2 uses presetStopSurplusPrice for take profit
+                payload["presetStopSurplusPrice"] = await self._format_price(sym, float(preset_take_profit), tick_used=tick_used)
+
         logger.info(
             "[ORDER_%s] sym=%s side=%s tradeSide=%s reduceOnly=%s raw_price=%s q_price=%s price_str=%s raw_qty=%s q_qty=%s tick_used=%s",
-            debug_tag, sym, s, payload["tradeSide"], payload.get("reduceOnly"), float(price), q_price, price_str, float(raw_qty), q_qty, tick_used
+            debug_tag, sym, s, payload["tradeSide"], payload.get("reduceOnly"),
+            float(price), q_price, price_str, float(raw_qty), q_qty, tick_used
         )
 
         async def _send(data_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -708,7 +752,7 @@ class BitgetTrader:
         tick_hint: Optional[float] = None,
         debug_tag: str = "SL",
     ) -> Dict[str, Any]:
-        sym = (symbol or "").upper()
+        sym = self._symbol(symbol)
         close_s = (close_side or "").lower()
         close_u = close_s.upper()
 
@@ -815,14 +859,20 @@ class BitgetTrader:
             resp["_debug"] = {"debug_tag": debug_tag, "trigger_str": trig_str, "tick_used": float(tick_used), "clientOid": oid}
         return resp
 
-    
+    # ----------------------------
+    # Cancels (FIXED)
+    # ----------------------------
+
     async def cancel_order(
         self,
         symbol: str,
         order_id: Optional[str] = None,
         client_oid: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Cancel a normal (non-plan) order by orderId or clientOid."""
+        """
+        Cancel a normal (non-plan) order by orderId or clientOid.
+        FIX: previously referenced self._symbol/self._call inconsistently.
+        """
         sym = self._symbol(symbol)
         payload: Dict[str, Any] = {
             "symbol": sym,
@@ -833,20 +883,52 @@ class BitgetTrader:
             payload["orderId"] = str(order_id)
         if client_oid:
             payload["clientOid"] = str(client_oid)
-        return await self._call("POST", "/api/v2/mix/order/cancel-order", payload=payload, auth=True, timeout=6)
 
-    async def cancel_plan_orders(self, symbol: str, order_ids: List[str]) -> Dict[str, Any]:
-        sym = (symbol or "").upper()
-        ids = [str(x) for x in (order_ids or []) if str(x)]
-        if not ids:
+        if not payload.get("orderId") and not payload.get("clientOid"):
+            return {"ok": False, "code": "NOID", "msg": "order_id or client_oid required"}
+
+        return await self._request_any_status("POST", "/api/v2/mix/order/cancel-order", data=payload, auth=True, timeout=6)
+
+    async def cancel_plan_orders(
+        self,
+        symbol: str,
+        order_ids: List[Union[str, Dict[str, Any]]],
+        *,
+        plan_type: str = "normal_plan",
+    ) -> Dict[str, Any]:
+        """
+        Cancel trigger/plan orders.
+        FIX: Bitget v2 requires orderIdList to be a list of objects, not list of strings.
+        Each object: {"orderId": "...", "clientOid": "..."} (either one is ok).
+        """
+        sym = self._symbol(symbol)
+        items: List[Dict[str, str]] = []
+
+        for x in (order_ids or []):
+            if isinstance(x, dict):
+                oid = str(x.get("orderId") or "")
+                coid = str(x.get("clientOid") or "")
+                if oid or coid:
+                    items.append({"orderId": oid, "clientOid": coid})
+            else:
+                s = str(x)
+                if s:
+                    items.append({"orderId": s, "clientOid": ""})
+
+        if not items:
             return {"ok": False, "code": "NOIDS", "msg": "order_ids empty"}
+
         payload = {
             "symbol": sym,
             "productType": self.product_type,
-            "planType": "normal_plan",
-            "orderIdList": ids,
+            "planType": plan_type,
+            "orderIdList": items,
         }
-        return await self._request_any_status("POST", "/api/v2/mix/order/cancel-plan-order", data=payload, auth=True)
+        return await self._request_any_status("POST", "/api/v2/mix/order/cancel-plan-order", data=payload, auth=True, timeout=8)
+
+    # ----------------------------
+    # Queries
+    # ----------------------------
 
     async def get_order_detail(
         self,
@@ -855,7 +937,7 @@ class BitgetTrader:
         order_id: Optional[str] = None,
         client_oid: Optional[str] = None,
     ) -> Dict[str, Any]:
-        sym = (symbol or "").upper()
+        sym = self._symbol(symbol)
         params: Dict[str, Any] = {"symbol": sym, "productType": self.product_type}
         if order_id:
             params["orderId"] = str(order_id)
@@ -893,3 +975,24 @@ class BitgetTrader:
         if size <= 0:
             return False
         return filled >= size * 0.999
+
+    # ----------------------------
+    # Emergency close (NEW helper)
+    # ----------------------------
+
+    async def flash_close_position(
+        self,
+        symbol: str,
+        *,
+        hold_side: Optional[str] = None,  # "long" / "short" in hedge mode; None closes all sides
+        timeout: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        Close position at market price (Bitget v2: /api/v2/mix/order/close-positions).
+        Useful for your scanner RISK_CLOSE.
+        """
+        sym = self._symbol(symbol)
+        payload: Dict[str, Any] = {"symbol": sym, "productType": self.product_type}
+        if hold_side:
+            payload["holdSide"] = str(hold_side).lower()
+        return await self._request_any_status("POST", "/api/v2/mix/order/close-positions", data=payload, auth=True, timeout=timeout)
