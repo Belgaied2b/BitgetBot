@@ -297,7 +297,7 @@ def _cap_max_distance_pct(sl: float, entry: float, side: str) -> float:
 def _cap_by_atr(sl: float, entry: float, atr: float, side: str) -> Tuple[float, bool]:
     """
     If a structural SL is extremely far, cap it using ATR_MULT_SL_CAP * ATR.
-    LONG: ensure SL >= entry - cap_dist (i.e., not too wide)
+    LONG: ensure SL >= entry - cap_dist
     SHORT: ensure SL <= entry + cap_dist
     Returns (sl_capped, did_cap)
     """
@@ -347,23 +347,18 @@ def _sl_policy(setup: Optional[str], entry_type: Optional[str]) -> List[str]:
     su = str(setup or "").upper()
     et = str(entry_type or "").upper()
 
-    # If user configured default policy as "TIGHT", we keep the classic behavior:
-    # pick the tightest valid across all candidates.
     default_pol = str(SL_POLICY_DEFAULT or "TIGHT").upper().strip()
 
-    # Setup-aware overrides
     if "BOS" in su:
         return _parse_policy(SL_POLICY_BOS)
     if "INST" in su:
         return _parse_policy(SL_POLICY_INST)
 
-    # Entry-type aware (OTE pullback typically wants liq stop)
     if "OTE" in et:
         return _parse_policy(SL_POLICY_OTE)
     if "PULLBACK" in et:
         return _parse_policy(SL_POLICY_OTE)
 
-    # default
     if default_pol == "TIGHT":
         return ["TIGHT"]
     return _parse_policy(default_pol)
@@ -459,7 +454,6 @@ def _choose_sl(side: str, entry: float, candidates: Dict[str, float], policy: Li
                 k, sl = picked
                 return float(sl), str(k)
 
-    # fallback
     k, sl = _pick_tightest_any(side, entry, candidates)
     return float(sl), str(k)
 
@@ -468,11 +462,25 @@ def _choose_sl(side: str, entry: float, candidates: Dict[str, float], policy: Li
 # Candidate builder
 # =====================================================================
 
-def _build_long_candidates(df: pd.DataFrame, entry: float, tick: float, atr_v: float, htf_df: Optional[pd.DataFrame] = None) -> Dict[str, float]:
+def _build_long_candidates(
+    df: pd.DataFrame,
+    entry: float,
+    tick: float,
+    atr_v: float,
+    htf_df: Optional[pd.DataFrame] = None
+) -> Dict[str, float]:
     entry_f = float(entry)
 
-    gen_buf = _buffer_price(entry_f, tick, float(SL_BUFFER_PCT), int(SL_BUFFER_TICKS), atr=atr_v, atr_mult=float(SL_BUFFER_ATR_MULT))
-    liq_buf = _buffer_price(entry_f, tick, float(LIQ_BUFFER_PCT), int(LIQ_BUFFER_TICKS), atr=atr_v, atr_mult=float(LIQ_BUFFER_ATR_MULT))
+    gen_buf = _buffer_price(
+        entry_f, tick,
+        float(SL_BUFFER_PCT), int(SL_BUFFER_TICKS),
+        atr=atr_v, atr_mult=float(SL_BUFFER_ATR_MULT)
+    )
+    liq_buf = _buffer_price(
+        entry_f, tick,
+        float(LIQ_BUFFER_PCT), int(LIQ_BUFFER_TICKS),
+        atr=atr_v, atr_mult=float(LIQ_BUFFER_ATR_MULT)
+    )
 
     swing = _last_swing_low_below(df, entry_f)
     liq = _liq_low_below(df, entry_f)
@@ -500,11 +508,25 @@ def _build_long_candidates(df: pd.DataFrame, entry: float, tick: float, atr_v: f
     return cands
 
 
-def _build_short_candidates(df: pd.DataFrame, entry: float, tick: float, atr_v: float, htf_df: Optional[pd.DataFrame] = None) -> Dict[str, float]:
+def _build_short_candidates(
+    df: pd.DataFrame,
+    entry: float,
+    tick: float,
+    atr_v: float,
+    htf_df: Optional[pd.DataFrame] = None
+) -> Dict[str, float]:
     entry_f = float(entry)
 
-    gen_buf = _buffer_price(entry_f, tick, float(SL_BUFFER_PCT), int(SL_BUFFER_TICKS), atr=atr_v, atr_mult=float(SL_BUFFER_ATR_MULT))
-    liq_buf = _buffer_price(entry_f, tick, float(LIQ_BUFFER_PCT), int(LIQ_BUFFER_TICKS), atr=atr_v, atr_mult=float(LIQ_BUFFER_ATR_MULT))
+    gen_buf = _buffer_price(
+        entry_f, tick,
+        float(SL_BUFFER_PCT), int(SL_BUFFER_TICKS),
+        atr=atr_v, atr_mult=float(SL_BUFFER_ATR_MULT)
+    )
+    liq_buf = _buffer_price(
+        entry_f, tick,
+        float(LIQ_BUFFER_PCT), int(LIQ_BUFFER_TICKS),
+        atr=atr_v, atr_mult=float(LIQ_BUFFER_ATR_MULT)
+    )
 
     swing = _last_swing_high_above(df, entry_f)
     liq = _liq_high_above(df, entry_f)
@@ -587,12 +609,10 @@ def protective_stop_long(
         cands = _build_long_candidates(df, entry_f, t, atr_v, htf_df=htf_df)
         sl_raw, chosen = _choose_sl("LONG", entry_f, cands, policy)
 
-        # Cap by ATR if candidate is too wide
         sl_raw2, did_cap = _cap_by_atr(sl_raw, entry_f, atr_v, side="LONG")
         if did_cap:
             chosen = f"{chosen}+ATR_CAP"
 
-        # Guardrails
         sl_raw2 = _enforce_min_distance_long(sl_raw2, entry_f, t)
         sl_raw2 = _cap_max_distance_pct(sl_raw2, entry_f, side="LONG")
 
