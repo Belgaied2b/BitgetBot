@@ -1,3 +1,13 @@
+# =====================================================================
+# scanner.py — Desk-lead Scanner + Watcher (Bitget) — READY TO PASTE
+# =====================================================================
+# ✅ Fix principal: le watcher NE cancel plus “direct” après ENTRY_OK
+#    - Grace period avant runaway/invalidation
+#    - Runaway “sans pullback” (pour les entrées pullback) au lieu d’un simple seuil
+#    - Premium/discount invalidation uniquement pour entry_type=MARKET
+#    - Seuil runaway robuste: max(ATR*mult, MIN_TICKS*tick)
+# =====================================================================
+
 from __future__ import annotations
 
 import asyncio
@@ -76,9 +86,24 @@ ENTRY_TTL_FVG_S = int(os.getenv("ENTRY_TTL_FVG_S", "2700"))
 ENTRY_TTL_RAID_S = int(os.getenv("ENTRY_TTL_RAID_S", "1800"))
 ENTRY_TTL_DEFAULT_S = int(os.getenv("ENTRY_TTL_DEFAULT_S", "1800"))
 
-# Run-away cancel: if price runs away from entry by ATR*MULT (prevents chasing)
+# Run-away cancel
 RUNAWAY_ATR_MULT_MARKET = float(os.getenv("RUNAWAY_ATR_MULT_MARKET", "1.0"))
 RUNAWAY_ATR_MULT_PULLBACK = float(os.getenv("RUNAWAY_ATR_MULT_PULLBACK", "1.5"))
+
+# ✅ NEW: grace periods so it never cancels immediately
+RUNAWAY_GRACE_S_MARKET = int(os.getenv("RUNAWAY_GRACE_S_MARKET", "30"))
+RUNAWAY_GRACE_S_PULLBACK = int(os.getenv("RUNAWAY_GRACE_S_PULLBACK", "300"))
+
+# ✅ NEW: heavy checks grace (structure / HTF / PD invalidations)
+HEAVY_GRACE_S_MARKET = int(os.getenv("HEAVY_GRACE_S_MARKET", "45"))
+HEAVY_GRACE_S_PULLBACK = int(os.getenv("HEAVY_GRACE_S_PULLBACK", "120"))
+
+# ✅ NEW: runaway requires "no pullback touch" for pullback entries
+RUNAWAY_TOUCH_ATR = float(os.getenv("RUNAWAY_TOUCH_ATR", "0.25"))
+RUNAWAY_TOUCH_TICKS = int(os.getenv("RUNAWAY_TOUCH_TICKS", "10"))
+
+# ✅ NEW: runaway distance min floor in ticks (avoids ATR too small => instant cancel)
+RUNAWAY_MIN_TICKS = int(os.getenv("RUNAWAY_MIN_TICKS", "20"))
 
 # Throttles (seconds)
 PRICE_CHECK_INTERVAL_S = float(os.getenv("PRICE_CHECK_INTERVAL_S", "6"))
@@ -169,6 +194,12 @@ def _pending_serializable(state: Dict[str, Any]) -> Dict[str, Any]:
         "last_price_ts",
         "last_price",
         "last_heavy_ts",
+
+        # ✅ NEW: runaway memory
+        "tick_used",
+        "min_price_seen",
+        "max_price_seen",
+        "pullback_touched",
     ]
     out: Dict[str, Any] = {}
     for k in keep:
@@ -536,6 +567,18 @@ def _runaway_mult(entry_type: str) -> float:
     return float(RUNAWAY_ATR_MULT_MARKET if "MARKET" in et else RUNAWAY_ATR_MULT_PULLBACK)
 
 
+def _is_market_entry(entry_type: str) -> bool:
+    return "MARKET" in str(entry_type or "").upper()
+
+
+def _runaway_grace_s(entry_type: str) -> int:
+    return int(RUNAWAY_GRACE_S_MARKET if _is_market_entry(entry_type) else RUNAWAY_GRACE_S_PULLBACK)
+
+
+def _heavy_grace_s(entry_type: str) -> int:
+    return int(HEAVY_GRACE_S_MARKET if _is_market_entry(entry_type) else HEAVY_GRACE_S_PULLBACK)
+
+
 # =====================================================================
 # ✅ FIX: robust last price (Bitget may return dict OR list)
 # =====================================================================
@@ -555,7 +598,6 @@ def _pick_ticker_row(data: Any, symbol: str) -> Dict[str, Any]:
     symn = _norm_sym(symbol)
 
     if isinstance(data, dict):
-        # sometimes dict that contains a list
         for k in ("data", "list", "tickers", "rows"):
             v = data.get(k)
             if isinstance(v, list) and v:
@@ -571,7 +613,6 @@ def _pick_ticker_row(data: Any, symbol: str) -> Dict[str, Any]:
             s = it.get("symbol") or it.get("symbolName") or it.get("instId") or it.get("contractCode")
             if s and _norm_sym(str(s)) == symn:
                 return it
-        # fallback: first dict
         for it in data:
             if isinstance(it, dict):
                 return it
@@ -606,7 +647,6 @@ async def _get_last_price(trader: BitgetTrader, symbol: str) -> float:
         if px > 0:
             return px
 
-    # sometimes nested (rare)
     if isinstance(raw, dict):
         for k in ("last", "lastPr", "lastPrice", "close", "price", "markPrice"):
             v = raw.get(k)
@@ -619,7 +659,13 @@ async def _get_last_price(trader: BitgetTrader, symbol: str) -> float:
     return 0.0
 
 
-async def _invalidation_check(client, symbol: str, direction: str, entry_price: float) -> Tuple[bool, str, Dict[str, Any]]:
+async def _invalidation_check(
+    client,
+    symbol: str,
+    direction: str,
+    entry_price: float,
+    entry_type: str,
+) -> Tuple[bool, str, Dict[str, Any]]:
     """Lightweight re-validation for pending (unfilled) entries."""
     sym = str(symbol).upper()
 
@@ -643,22 +689,21 @@ async def _invalidation_check(client, symbol: str, direction: str, entry_price: 
     except Exception:
         pass
 
-    # H1 trend flip / CHoCH flip
+    # H1 trend flip / CHoCH
     try:
         st1 = analyze_structure(df_h1)
         tr = str(st1.get("trend") or "").upper()
         if tr in ("LONG", "SHORT") and tr != str(direction).upper():
             return False, "invalidate:trend_flip_h1", {"trend_h1": tr}
-        if bool(st1.get("choch")):
-            bos_dir = str(st1.get("bos_direction") or "").upper()
-            if bos_dir in ("LONG", "SHORT") and bos_dir != str(direction).upper():
-                return False, "invalidate:choch_flip", {"bos_dir": bos_dir}
+        # NOTE: analyze_structure bos_direction is UP/DOWN; keep CHOCH as a soft warning unless trend flips.
+        if bool(st1.get("choch")) and tr in ("LONG", "SHORT") and tr != str(direction).upper():
+            return False, "invalidate:choch_flip", {"trend_h1": tr}
     except Exception:
         pass
 
-    # Premium/discount of the *entry price* relative to new range
+    # ✅ Premium/discount invalidation ONLY for MARKET entries
     mid = _pd_mid(df_h1, 80)
-    if mid > 0 and math.isfinite(mid):
+    if _is_market_entry(entry_type) and mid > 0 and math.isfinite(mid):
         if str(direction).upper() == "LONG" and float(entry_price) > float(mid):
             return False, "invalidate:entry_premium", {"mid": mid}
         if str(direction).upper() == "SHORT" and float(entry_price) < float(mid):
@@ -678,7 +723,6 @@ async def _cancel_pending_entry(
     sym = str(st.get("symbol") or "").upper()
     direction = str(st.get("direction") or "")
     try:
-        # Cancel entry order (best effort)
         oid = st.get("entry_order_id")
         coid = st.get("entry_client_oid")
         if oid or coid:
@@ -690,7 +734,6 @@ async def _cancel_pending_entry(
     except Exception:
         pass
 
-    # risk cleanup
     if bool(st.get("risk_confirmed", False)):
         await _risk_close_trade(trader, sym, direction, reason=reason, pnl_override=0.0)
     else:
@@ -702,10 +745,10 @@ async def _cancel_pending_entry(
     async with PENDING_LOCK:
         PENDING.pop(tid, None)
 
-    # ✅ persist removal immediately
     await _pending_save(force=True)
 
     await send_telegram(_mk_exec_msg("ENTRY_CANCEL", sym, tid, reason=reason, **kv))
+
 
 # =====================================================================
 # Position / PnL helpers (risk close + bootstrap)
@@ -742,7 +785,6 @@ async def _get_position_total(trader: BitgetTrader, symbol: str, direction: str)
     if not isinstance(data, list):
         return 0.0
 
-    # prefer side match
     for row in data:
         if not isinstance(row, dict):
             continue
@@ -753,14 +795,12 @@ async def _get_position_total(trader: BitgetTrader, symbol: str, direction: str)
         if tot != 0:
             return abs(tot)
 
-    # fallback: any total in the payload
     for row in data:
         if isinstance(row, dict):
             tot = _safe_float(row.get("total"), 0.0)
             if tot != 0:
                 return abs(tot)
 
-    # fallback single row
     if len(data) == 1 and isinstance(data[0], dict):
         return _safe_float(data[0].get("total"), 0.0)
 
@@ -1203,13 +1243,11 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
 
     desk_log(logging.INFO, "ENTRY_OK", sym, tid, orderId=entry_order_id, qty=qty_total)
 
-    # confirm risk reservation (counts as an open position at desk level)
     try:
         await RISK.confirm_open(risk_rid)
     except Exception:
         pass
 
-    # mark trade dedup ONLY after entry accepted
     TRADE_GUARD.mark(fp_trade)
 
     async with PENDING_LOCK:
@@ -1254,6 +1292,12 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
             "last_price_ts": 0.0,
             "last_price": 0.0,
             "last_heavy_ts": 0.0,
+
+            # ✅ NEW: runaway memory
+            "tick_used": float(tick_used),
+            "min_price_seen": 0.0,
+            "max_price_seen": 0.0,
+            "pullback_touched": False,
         }
 
     await _pending_save(force=True)
@@ -1288,7 +1332,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     continue
 
                 direction = str(st.get("direction") or "")
-                # Always recompute (older pending_state.json may contain the legacy opposite side)
                 close_side = _close_side_from_direction(direction)
                 pos_mode = str(st.get("pos_mode") or "one_way")
 
@@ -1351,7 +1394,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     if state in {"cancelled", "canceled", "rejected", "fail", "failed", "expired"}:
                         desk_log(logging.WARNING, "ARM_DROP", sym, tid, reason=f"entry_state={state}")
 
-                        # risk cleanup: entry cancelled / rejected
                         if bool(st.get("risk_confirmed", False)):
                             await _risk_close_trade(trader, sym, direction, reason=f"entry_state={state}", pnl_override=0.0)
                         else:
@@ -1376,50 +1418,136 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         # 1) TTL expiry
                         ttl_s = int(_entry_ttl_s(entry_type, setup))
                         if created_ts > 0 and age > float(ttl_s):
-                            await _cancel_pending_entry(trader, tid, st, reason="ttl_expired", age_s=int(age), ttl_s=int(ttl_s), setup=setup, entry_type=entry_type)
+                            await _cancel_pending_entry(
+                                trader, tid, st,
+                                reason="ttl_expired",
+                                age_s=int(age), ttl_s=int(ttl_s),
+                                setup=setup, entry_type=entry_type
+                            )
                             dirty = True
                             continue
 
-                        # 2) Runaway check (throttled, only if ATR known)
-                        atr = float(st.get("atr") or 0.0)
-                        if atr > 0 and entry > 0:
-                            now = time.time()
-                            last_price_ts = float(st.get("last_price_ts") or 0.0)
-                            last_price = float(st.get("last_price") or 0.0)
-
-                            if (now - last_price_ts) >= float(PRICE_CHECK_INTERVAL_S) or last_price <= 0:
-                                px = await _get_last_price(trader, sym)
-                                if px > 0:
-                                    st["last_price"] = float(px)
-                                    st["last_price_ts"] = now
-                                    last_price = float(px)
-                                    dirty = True
-
-                            if last_price > 0:
-                                mult = float(_runaway_mult(entry_type))
-                                if str(direction).upper() == "LONG" and last_price >= (entry + mult * atr):
-                                    await _cancel_pending_entry(trader, tid, st, reason="runaway_up", last=float(last_price), entry=float(entry), atr=float(atr), mult=float(mult))
-                                    dirty = True
-                                    continue
-                                if str(direction).upper() == "SHORT" and last_price <= (entry - mult * atr):
-                                    await _cancel_pending_entry(trader, tid, st, reason="runaway_down", last=float(last_price), entry=float(entry), atr=float(atr), mult=float(mult))
-                                    dirty = True
-                                    continue
-
-                        # 3) Invalidation check (heavy, throttled)
+                        # 2) Runaway check (throttled) with grace + min ticks + pullback condition
                         now = time.time()
-                        last_heavy_ts = float(st.get("last_heavy_ts") or 0.0)
-                        if (now - last_heavy_ts) >= float(HEAVY_CHECK_INTERVAL_S):
-                            st["last_heavy_ts"] = now
-                            dirty = True
-                            ok, why, extra = await _invalidation_check(trader.client, sym, direction, entry_price=entry)
-                            if not ok:
-                                await _cancel_pending_entry(trader, tid, st, reason=why or "invalidate", **(extra or {}))
+                        atr = float(st.get("atr") or 0.0)
+                        tick_used = float(st.get("tick_used") or 0.0)
+                        if tick_used <= 0:
+                            tick_used = _estimate_tick_from_price(entry)
+
+                        # fetch price sometimes
+                        last_price_ts = float(st.get("last_price_ts") or 0.0)
+                        last_price = float(st.get("last_price") or 0.0)
+                        if (now - last_price_ts) >= float(PRICE_CHECK_INTERVAL_S) or last_price <= 0:
+                            px = await _get_last_price(trader, sym)
+                            if px > 0:
+                                st["last_price"] = float(px)
+                                st["last_price_ts"] = now
+                                last_price = float(px)
                                 dirty = True
-                                continue
-                            if extra and isinstance(extra, dict) and extra.get("mid"):
-                                st["pd_mid"] = float(extra["mid"])
+
+                                # update min/max seen
+                                min_seen = float(st.get("min_price_seen") or 0.0)
+                                max_seen = float(st.get("max_price_seen") or 0.0)
+                                if min_seen <= 0:
+                                    min_seen = last_price
+                                if max_seen <= 0:
+                                    max_seen = last_price
+                                min_seen = min(min_seen, last_price)
+                                max_seen = max(max_seen, last_price)
+                                st["min_price_seen"] = float(min_seen)
+                                st["max_price_seen"] = float(max_seen)
+
+                                # pullback touched = price got close enough to entry at least once
+                                touched = bool(st.get("pullback_touched", False))
+                                if atr > 0:
+                                    touch_buf = max(float(RUNAWAY_TOUCH_ATR) * atr, float(RUNAWAY_TOUCH_TICKS) * tick_used)
+                                else:
+                                    touch_buf = float(RUNAWAY_TOUCH_TICKS) * tick_used
+                                if entry > 0 and abs(last_price - entry) <= touch_buf:
+                                    touched = True
+                                st["pullback_touched"] = bool(touched)
                                 dirty = True
+
+                        # Evaluate runaway only after grace
+                        if entry > 0 and last_price > 0:
+                            grace_s = int(_runaway_grace_s(entry_type))
+                            if age >= float(grace_s):
+                                mult = float(_runaway_mult(entry_type))
+                                dist_atr = (mult * atr) if atr > 0 else 0.0
+                                dist_min = float(RUNAWAY_MIN_TICKS) * tick_used
+                                runaway_dist = max(dist_atr, dist_min)
+
+                                is_market = _is_market_entry(entry_type)
+                                touched = bool(st.get("pullback_touched", False))
+
+                                if str(direction).upper() == "LONG":
+                                    runaway = last_price >= (entry + runaway_dist)
+                                    if runaway and (is_market or (not touched)):
+                                        await _cancel_pending_entry(
+                                            trader, tid, st,
+                                            reason="runaway_up",
+                                            age_s=int(age),
+                                            grace_s=int(grace_s),
+                                            last=float(last_price),
+                                            entry=float(entry),
+                                            atr=float(atr),
+                                            mult=float(mult),
+                                            runaway_dist=float(runaway_dist),
+                                            touched=str(touched),
+                                            entry_type=entry_type,
+                                            setup=setup,
+                                        )
+                                        dirty = True
+                                        continue
+
+                                if str(direction).upper() == "SHORT":
+                                    runaway = last_price <= (entry - runaway_dist)
+                                    if runaway and (is_market or (not touched)):
+                                        await _cancel_pending_entry(
+                                            trader, tid, st,
+                                            reason="runaway_down",
+                                            age_s=int(age),
+                                            grace_s=int(grace_s),
+                                            last=float(last_price),
+                                            entry=float(entry),
+                                            atr=float(atr),
+                                            mult=float(mult),
+                                            runaway_dist=float(runaway_dist),
+                                            touched=str(touched),
+                                            entry_type=entry_type,
+                                            setup=setup,
+                                        )
+                                        dirty = True
+                                        continue
+
+                        # 3) Invalidation check (heavy, throttled) with grace
+                        heavy_grace = int(_heavy_grace_s(entry_type))
+                        if age >= float(heavy_grace):
+                            last_heavy_ts = float(st.get("last_heavy_ts") or 0.0)
+                            if (now - last_heavy_ts) >= float(HEAVY_CHECK_INTERVAL_S):
+                                st["last_heavy_ts"] = now
+                                dirty = True
+
+                                ok, why, extra = await _invalidation_check(
+                                    trader.client,
+                                    sym,
+                                    direction,
+                                    entry_price=entry,
+                                    entry_type=entry_type,
+                                )
+                                if not ok:
+                                    await _cancel_pending_entry(
+                                        trader, tid, st,
+                                        reason=why or "invalidate",
+                                        age_s=int(age),
+                                        heavy_grace_s=int(heavy_grace),
+                                        **(extra or {})
+                                    )
+                                    dirty = True
+                                    continue
+                                if extra and isinstance(extra, dict) and extra.get("mid"):
+                                    st["pd_mid"] = float(extra["mid"])
+                                    dirty = True
 
                         continue
 
@@ -1447,6 +1575,8 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                     tick_meta = await _get_tick_cached(trader, sym)
                     tick_used = _sanitize_tick(sym, entry, tick_meta, tid)
+                    st["tick_used"] = float(tick_used)
+                    dirty = True
 
                     q_sl = _q_sl(sl, tick_used, direction)
                     q_tp1 = _q_tp_limit(tp1, tick_used, direction)
@@ -1501,7 +1631,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                         if not _is_ok(sl_resp):
                             code2 = str(sl_resp.get("code", ""))
-                            # 22002 = No position to close -> wait for position visibility
                             if code2 == "22002":
                                 st["last_arm_fail_ts"] = time.time()
                                 dirty = True
@@ -1550,7 +1679,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                         code = str(tp1_resp.get("code", ""))
 
-                        # Soft-handle: position not ready yet (avoid spam)
                         if (not _is_ok(tp1_resp)) and code == "22002":
                             st["last_arm_fail_ts"] = time.time()
                             dirty = True
@@ -1599,7 +1727,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                 # Phase 2: BE after TP1 filled
                 if bool(st.get("armed", False)) and (not bool(st.get("be_done", False))):
-                    # If position already closed (SL/manual), finalize and free risk
                     pos_total = await _get_position_total(trader, sym, direction)
                     if pos_total >= 0 and pos_total <= 0:
                         await _risk_close_trade(trader, sym, direction, reason="position_closed_before_tp1")
@@ -1641,6 +1768,8 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                     tick_meta = await _get_tick_cached(trader, sym)
                     tick_used = _sanitize_tick(sym, entry, tick_meta, tid)
+                    st["tick_used"] = float(tick_used)
+                    dirty = True
 
                     be_ticks = int(BE_FEE_BUFFER_TICKS or 0)
                     be_delta = float(be_ticks) * float(tick_used)
@@ -1690,7 +1819,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                     await send_telegram(_mk_exec_msg("BE_OK", sym, tid, be=be_q, planId=new_plan, runner_qty=qty_rem))
 
-                    # keep monitoring runner until position is fully closed
                     st["runner_monitor"] = True
                     st["runner_qty"] = qty_rem
                     dirty = True
@@ -1776,7 +1904,6 @@ async def scan_once(client, trader: BitgetTrader) -> None:
     elif ALERT_MODE == "NONE":
         alert_list = []
     else:
-        # fallback safe
         alert_list = ranked[: max(0, int(MAX_ALERTS_PER_SCAN))]
 
     # Send alerts sequentially (no race)
