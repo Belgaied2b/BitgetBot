@@ -178,7 +178,6 @@ if RR_MIN_DESK_PRIORITY > RR_MIN_STRICT:
 if RR_MIN_TOLERATED_WITH_INST > RR_MIN_STRICT:
     RR_MIN_TOLERATED_WITH_INST = RR_MIN_STRICT
 if INST_SCORE_DESK_PRIORITY < MIN_INST_SCORE and DESK_EV_MODE:
-    # desk priority can't be below min floor if we rely on it
     INST_SCORE_DESK_PRIORITY = MIN_INST_SCORE
 
 # Commitment (optional future use)
@@ -198,6 +197,7 @@ ATR_MULT_SL_CAP = _get_float("ATR_MULT_SL_CAP", 3.5, min_v=0.5, max_v=15.0)
 if ATR_MULT_SL_CAP < ATR_MULT_SL:
     ATR_MULT_SL_CAP = ATR_MULT_SL
 
+# --- Stops base buffers ---
 SL_BUFFER_PCT = _get_float("SL_BUFFER_PCT", 0.0020, min_v=0.0, max_v=0.05)
 SL_BUFFER_TICKS = _get_int("SL_BUFFER_TICKS", 3, min_v=0, max_v=50)
 MIN_SL_TICKS = _get_int("MIN_SL_TICKS", 3, min_v=0, max_v=50)
@@ -208,7 +208,26 @@ STRUCT_LOOKBACK = _get_int("STRUCT_LOOKBACK", 20, min_v=10, max_v=200)
 # Break-even buffer
 BE_FEE_BUFFER_TICKS = _get_int("BE_FEE_BUFFER_TICKS", 1, min_v=0, max_v=25)
 
-# TP policy
+# --- Liquidity zones (used by structure/stops) ---
+LIQ_LOOKBACK = _get_int("LIQ_LOOKBACK", 60, min_v=20, max_v=500)
+LIQ_BUFFER_PCT = _get_float("LIQ_BUFFER_PCT", 0.0008, min_v=0.0, max_v=0.02)
+LIQ_BUFFER_TICKS = _get_int("LIQ_BUFFER_TICKS", 3, min_v=0, max_v=50)
+
+# --- Stops v3 (optional / new) ---
+# Extra padding using ATR to "hide" behind liquidity (stop-hunt buffer)
+LIQ_BUFFER_ATR_MULT = _get_float("LIQ_BUFFER_ATR_MULT", 0.12, min_v=0.0, max_v=2.0)
+
+# Optional: general SL buffer can include ATR too (often 0)
+SL_BUFFER_ATR_MULT = _get_float("SL_BUFFER_ATR_MULT", 0.00, min_v=0.0, max_v=2.0)
+
+# Policies: order of preference among "LIQ,SWING,ATR" (comma-separated)
+# If SL_POLICY_DEFAULT="TIGHT": legacy behavior (pick tightest valid among all).
+SL_POLICY_DEFAULT = _get_str("SL_POLICY_DEFAULT", "TIGHT").strip().upper()
+SL_POLICY_BOS = _get_str("SL_POLICY_BOS", "SWING,LIQ,ATR").strip().upper()
+SL_POLICY_OTE = _get_str("SL_POLICY_OTE", "LIQ,SWING,ATR").strip().upper()
+SL_POLICY_INST = _get_str("SL_POLICY_INST", "LIQ,SWING,ATR").strip().upper()
+
+# --- TP policy ---
 TP1_R_CLAMP_MIN = _get_float("TP1_R_CLAMP_MIN", 1.4, min_v=0.5, max_v=5.0)
 TP1_R_CLAMP_MAX = _get_float("TP1_R_CLAMP_MAX", 1.6, min_v=0.5, max_v=6.0)
 if TP1_R_CLAMP_MAX < TP1_R_CLAMP_MIN:
@@ -221,10 +240,21 @@ TP1_R_BY_VOL = _get_bool("TP1_R_BY_VOL", True)
 STOP_TRIGGER_TYPE_SL = _get_str("STOP_TRIGGER_TYPE_SL", "MP")  # "MP" or "FP"
 STOP_TRIGGER_TYPE_TP = _get_str("STOP_TRIGGER_TYPE_TP", "TP")  # kept for compatibility
 
-# Liquidity zones
-LIQ_LOOKBACK = _get_int("LIQ_LOOKBACK", 60, min_v=20, max_v=500)
-LIQ_BUFFER_PCT = _get_float("LIQ_BUFFER_PCT", 0.0008, min_v=0.0, max_v=0.02)
-LIQ_BUFFER_TICKS = _get_int("LIQ_BUFFER_TICKS", 3, min_v=0, max_v=50)
+# --- TP v3 (optional / new) ---
+TP1_USE_EQUAL_LEVELS = _get_bool("TP1_USE_EQUAL_LEVELS", True)
+TP1_USE_SWINGS = _get_bool("TP1_USE_SWINGS", True)
+
+# Liquidity TP acceptance policy
+# 1.00 => only if closer than RR target, >1.00 allows slightly further
+TP1_LIQ_MAX_DIST_FACTOR = _get_float("TP1_LIQ_MAX_DIST_FACTOR", 1.00, min_v=0.2, max_v=3.0)
+
+# Allow liq TP RR >= rr_min - eps (small tolerance)
+TP1_LIQ_MIN_RR_EPS = _get_float("TP1_LIQ_MIN_RR_EPS", 0.08, min_v=0.0, max_v=0.50)
+
+# Front-run buffer for EQH/EQL / swings liquidity TP
+TP_LIQ_BUFFER_PCT = _get_float("TP_LIQ_BUFFER_PCT", 0.0000, min_v=0.0, max_v=0.01)
+TP_LIQ_BUFFER_TICKS = _get_int("TP_LIQ_BUFFER_TICKS", 1, min_v=0, max_v=20)
+TP_LIQ_BUFFER_ATR_MULT = _get_float("TP_LIQ_BUFFER_ATR_MULT", 0.06, min_v=0.0, max_v=1.0)
 
 # Vol regime for indicators.volatility_regime
 VOL_REGIME_ATR_PCT_LOW = _get_float("VOL_REGIME_ATR_PCT_LOW", 0.015, min_v=0.001, max_v=0.20)
@@ -298,6 +328,7 @@ class DeskSettings:
     min_inst_score: int
     rr_min_strict: float
     rr_min_desk_priority: float
+
 
 def snapshot() -> DeskSettings:
     return DeskSettings(
