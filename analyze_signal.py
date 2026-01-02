@@ -709,7 +709,7 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
     return {
         "entry_used": float(entry_mkt),
         "entry_type": "MARKET",
-        "order_type": "LIMIT",
+        "order_type": "LIMIT",  # (tu laisses LIMIT même si entry_type=MARKET)
         "in_zone": False,
         "note": "no_zone_entry",
         "entry_mkt": entry_mkt,
@@ -1057,12 +1057,14 @@ class SignalAnalyzer:
         entry_pick = _pick_entry(df_h1, struct, bias)
         entry = float(entry_pick["entry_used"])
         entry_type = str(entry_pick["entry_type"])
+        order_type = str(entry_pick.get("order_type") or "LIMIT")  # ✅ PROPAGATED
         atr14 = float(entry_pick.get("atr") or _atr(df_h1, 14))
 
         LOGGER.info(
-            "[EVAL_PRE] %s ENTRY_PICK type=%s entry_mkt=%s entry_used=%s in_zone=%s note=%s atr=%.6g",
+            "[EVAL_PRE] %s ENTRY_PICK type=%s order_type=%s entry_mkt=%s entry_used=%s in_zone=%s note=%s atr=%.6g",
             symbol,
             entry_type,
+            order_type,
             entry_pick.get("entry_mkt"),
             entry_pick.get("entry_used"),
             entry_pick.get("in_zone"),
@@ -1079,6 +1081,7 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
+                    order_type=order_type,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                 )
@@ -1089,6 +1092,7 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
+                    order_type=order_type,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                 )
@@ -1101,6 +1105,7 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
+                    order_type=order_type,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                 )
@@ -1111,6 +1116,7 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
+                    order_type=order_type,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                 )
@@ -1124,6 +1130,7 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
+                    order_type=order_type,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                 )
@@ -1134,6 +1141,7 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
+                    order_type=order_type,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                 )
@@ -1236,6 +1244,7 @@ class SignalAnalyzer:
                 "sl_invalid_after_liq_adj",
                 institutional=inst,
                 structure=struct,
+                order_type=order_type,
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
             )
@@ -1255,8 +1264,8 @@ class SignalAnalyzer:
         sl_meta_out["post_adjust"] = sl_adj
 
         LOGGER.info(
-            "[EVAL_PRE] %s EXITS entry=%s sl=%s tp1=%s tick=%s RR=%s raw_rr=%s entry_type=%s setup_hint=%s",
-            symbol, entry, sl, tp1, tick, rr, exits.get("rr_used"), entry_type, setup_hint
+            "[EVAL_PRE] %s EXITS entry=%s sl=%s tp1=%s tick=%s RR=%s raw_rr=%s entry_type=%s order_type=%s setup_hint=%s",
+            symbol, entry, sl, tp1, tick, rr, exits.get("rr_used"), entry_type, order_type, setup_hint
         )
 
         if rr is None or rr <= 0:
@@ -1266,6 +1275,7 @@ class SignalAnalyzer:
                 institutional=inst,
                 structure=struct,
                 entry_pick=entry_pick,
+                order_type=order_type,
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
             )
@@ -1310,6 +1320,7 @@ class SignalAnalyzer:
                 "bias": bias,
                 "entry": entry,
                 "entry_type": entry_type,
+                "order_type": order_type,  # ✅ ADDED
                 "sl": float(sl),
                 "tp1": float(tp1),
                 "tp2": None,
@@ -1362,6 +1373,7 @@ class SignalAnalyzer:
                 "bias": bias,
                 "entry": entry,
                 "entry_type": entry_type,
+                "order_type": order_type,  # ✅ ADDED
                 "sl": float(sl),
                 "tp1": float(tp1),
                 "tp2": None,
@@ -1415,6 +1427,7 @@ class SignalAnalyzer:
                 "bias": bias,
                 "entry": entry,
                 "entry_type": entry_type,
+                "order_type": order_type,  # ✅ ADDED
                 "sl": float(sl),
                 "tp1": float(tp1),
                 "tp2": None,
@@ -1472,6 +1485,7 @@ class SignalAnalyzer:
                     "bias": bias,
                     "entry": entry,
                     "entry_type": entry_type,
+                    "order_type": order_type,  # ✅ ADDED
                     "sl": float(sl),
                     "tp1": float(tp1),
                     "tp2": None,
@@ -1508,6 +1522,8 @@ class SignalAnalyzer:
             "institutional": inst,
             "bos_quality": bos_q,
             "entry_pick": entry_pick,
+            "entry_type": entry_type,
+            "order_type": order_type,  # ✅ ADDED
             "rr": float(rr),
             "inst_gate": int(gate),
             "inst_ok_count": int(ok_count),
