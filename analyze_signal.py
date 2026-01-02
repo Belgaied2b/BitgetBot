@@ -1,5 +1,6 @@
 # =====================================================================
 # analyze_signal.py — Desk institutional analyzer (TTL-compatible setup)
+# Aligned with institutional_data.py (BITGET institutional + BINANCE liquidations)
 # =====================================================================
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ LOGGER = logging.getLogger(__name__)
 
 REQUIRED_COLS = ("open", "high", "low", "close", "volume")
 
-# Optional: allow technical fallback if Binance is banned/down (default False)
+# Optional: allow technical fallback if institutional provider is down (default False)
 ALLOW_TECH_FALLBACK_WHEN_INST_DOWN = str(os.getenv("ALLOW_TECH_FALLBACK_WHEN_INST_DOWN", "0")).strip() == "1"
 
 # =====================================================================
@@ -189,7 +190,7 @@ def _pre_grade_candidate(
         p = _downgrade(p, 1)
         reasons.append("pre:bias_fallback")
 
-    # Penalize overextension (still can be valid, but less worth PASS2)
+    # Penalize overextension
     if ext.startswith("OVEREXTENDED"):
         p = _downgrade(p, 1)
         reasons.append("pre:overextended")
@@ -774,6 +775,7 @@ def _inst_gate_value(inst: Dict[str, Any]) -> Tuple[int, int]:
 def _desk_inst_gate_override(inst: Dict[str, Any], bias: str, gate: int) -> Tuple[int, Optional[str]]:
     """
     If flow is clearly strong and crowding is not risky, allow bumping gate to MIN_INST_SCORE.
+    NOTE: With Bitget, in LIGHT mode flow/cvd may be None; override usually triggers only in NORMAL/FULL.
     """
     try:
         if gate >= int(MIN_INST_SCORE):
@@ -863,14 +865,13 @@ class SignalAnalyzer:
         LOGGER.info("[EVAL_PRE] %s VOL_REGIME=%s EXTENSION=%s", symbol, vol_reg, ext_sig)
 
         # ---------------------------------------------------------------
-        # PRE-FILTERS (cheap) BEFORE institutional call (anti-ban)
+        # PRE-FILTERS (cheap) BEFORE institutional call
         # ---------------------------------------------------------------
         bos_flag = bool(struct.get("bos", False))
         raid_ok = bool(isinstance(struct.get("raid_displacement"), dict) and struct["raid_displacement"].get("ok"))
         liq_sweep_pre = liquidity_sweep_details(df_h1, bias, lookback=180)
         sweep_ok = bool(isinstance(liq_sweep_pre, dict) and liq_sweep_pre.get("ok"))
 
-        # REQUIRE_STRUCTURE: keep strict only outside desk mode.
         if REQUIRE_STRUCTURE and used_bias_fallback and (not DESK_EV_MODE):
             LOGGER.info("[EVAL_REJECT] %s no_clear_trend_range", symbol)
             return _reject("no_clear_trend_range", structure=struct, momentum=mom, composite=comp)
@@ -880,12 +881,10 @@ class SignalAnalyzer:
                 LOGGER.info("[EVAL_REJECT] %s htf_veto", symbol)
                 return _reject("htf_veto", structure=struct)
 
-        # In non-desk mode, require at least one structural trigger (BOS or RAID or SWEEP)
         if (not DESK_EV_MODE) and (not (bos_flag or raid_ok or sweep_ok)):
             LOGGER.info("[EVAL_REJECT] %s no_structure_trigger", symbol)
             return _reject("no_structure_trigger", structure=struct, sweep=liq_sweep_pre)
 
-        # Momentum gating (cheap)
         if REQUIRE_MOMENTUM:
             if bias == "LONG" and mom not in ("BULLISH", "STRONG_BULLISH"):
                 LOGGER.info("[EVAL_REJECT] %s momentum_not_bullish", symbol)
@@ -919,7 +918,9 @@ class SignalAnalyzer:
         )
 
         # ===============================================================
-        # 1) INSTITUTIONAL — 2-PASS (anti-ban) + Liquidations
+        # 1) INSTITUTIONAL — 2-PASS + Liquidations
+        #    IMPORTANT CHANGE (Bitget alignment):
+        #      - We do NOT require binance_symbol for inst availability (it's only for liq mapping).
         # ===============================================================
         inst: Dict[str, Any]
 
@@ -943,7 +944,7 @@ class SignalAnalyzer:
             }
 
         available = bool(inst.get("available", False))
-        binance_symbol = inst.get("binance_symbol")
+        binance_symbol = inst.get("binance_symbol")  # may be None (liq mapping only)
 
         gate, ok_count = _inst_gate_value(inst)
         gate, override = _desk_inst_gate_override(inst, bias, int(gate))
@@ -957,7 +958,7 @@ class SignalAnalyzer:
         )
 
         # If inst not available: strict reject unless fallback enabled
-        if (not available) or (binance_symbol is None):
+        if not available:
             if ALLOW_TECH_FALLBACK_WHEN_INST_DOWN:
                 LOGGER.warning("[INST_DOWN] %s tech_fallback_enabled", symbol)
             else:
@@ -977,7 +978,6 @@ class SignalAnalyzer:
             INST_PASS2_ENABLED
             and pass2_allowed_by_priority
             and available
-            and (binance_symbol is not None)
             and (int(gate) >= int(INST_PASS2_MIN_GATE) or bool(DESK_EV_MODE))
         )
 
@@ -1000,7 +1000,8 @@ class SignalAnalyzer:
                     "score_meta": {"raw_components_sum": 0, "ok_count": 0, "mode": INST_PASS2_MODE},
                 }
 
-            if isinstance(inst2, dict) and bool(inst2.get("available")) and (inst2.get("binance_symbol") is not None):
+            # ✅ Bitget alignment: do not require binance_symbol here either
+            if isinstance(inst2, dict) and bool(inst2.get("available")):
                 inst = inst2
 
                 available = bool(inst.get("available", False))
@@ -1251,7 +1252,7 @@ class SignalAnalyzer:
         except Exception:
             pass
 
-        # ✅ tick-grid rounding AFTER adjustments (exchange hygiene)
+        # ✅ tick-grid rounding AFTER adjustments
         sl = _round_sl_for_side(sl, entry, bias, tick)
         sl_adj["sl_post_round"] = float(sl)
 
@@ -1344,8 +1345,8 @@ class SignalAnalyzer:
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": setup_ttl,          # ✅ TTL-compatible for scanner.py
-                "setup_type_core": setup_core,    # ✅ canonical for debug
+                "setup_type": setup_ttl,          # ✅ TTL-compatible
+                "setup_type_core": setup_core,    # ✅ canonical
                 "setup_variant": bos_variant,
                 "priority": priority,
                 "priority_reasons": priority_reasons,
@@ -1401,7 +1402,7 @@ class SignalAnalyzer:
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": setup_ttl,          # ✅ TTL-compatible
+                "setup_type": setup_ttl,
                 "setup_type_core": setup_core,
                 "setup_variant": variant,
                 "priority": priority,
@@ -1459,7 +1460,7 @@ class SignalAnalyzer:
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": setup_ttl,          # ✅ TTL-compatible
+                "setup_type": setup_ttl,
                 "setup_type_core": setup_core,
                 "setup_variant": variant,
                 "priority": priority,
@@ -1521,7 +1522,7 @@ class SignalAnalyzer:
                     "tp2": None,
                     "rr": float(rr),
                     "qty": 1,
-                    "setup_type": setup_ttl,          # ✅ TTL-compatible
+                    "setup_type": setup_ttl,
                     "setup_type_core": setup_core,
                     "setup_variant": "INST_CONTINUATION",
                     "priority": priority,
