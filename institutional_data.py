@@ -17,6 +17,11 @@
 # Liquidations:
 # - If WS hub provides liquidation metrics -> we use them.
 # - Else, we can consume the all-market stream: !forceOrder@arr (single connection, in-memory aggregation).
+#
+# Updates (compat & robustness):
+# - WS hub running check now supports bool/property/method is_running
+# - Adds legacy keys (openInterest, fundingRate, ...) to avoid KeyError in older analyze/log code
+# - Soft-cooldown warning is surfaced while still allowing WS-only data collection
 # =====================================================================
 
 from __future__ import annotations
@@ -623,13 +628,26 @@ def _map_symbol_to_binance(symbol: str, binance_symbols: Set[str]) -> Optional[s
 # =====================================================================
 # Optional: WS snapshot reader
 # =====================================================================
+def _ws_hub_running() -> bool:
+    """Safer check: HUB.is_running can be bool, property, or method."""
+    if _WS_HUB is None:
+        return False
+    try:
+        v = getattr(_WS_HUB, "is_running", False)
+        if callable(v):
+            return bool(v())
+        return bool(v)
+    except Exception:
+        return False
+
+
 def _ws_snapshot(binance_symbol: str) -> Optional[Dict[str, Any]]:
     if not INST_USE_WS_HUB:
         return None
     if _WS_HUB is None:
         return None
     try:
-        if not getattr(_WS_HUB, "is_running", False):
+        if not _ws_hub_running():
             return None
         snap = _WS_HUB.get_snapshot(binance_symbol)
         if not isinstance(snap, dict) or not snap.get("available"):
@@ -1293,6 +1311,11 @@ async def compute_full_institutional_analysis(
     - Liquidations:
         * If WS hub is running & provides liq metrics -> uses it.
         * Else uses all-market WS !forceOrder@arr when enabled.
+
+    Returns a payload that includes BOTH:
+      - "new" keys: oi, funding_rate, tape_delta_5m, ...
+      - legacy compatibility keys: openInterest, fundingRate, ...
+        (useful if your analyze_signal / logs were expecting those exact names)
     """
     bias = (bias or "").upper().strip()
     eff_mode = (mode or INST_MODE).upper().strip()
@@ -1332,7 +1355,14 @@ async def compute_full_institutional_analysis(
             "liquidation_intensity": None,
             "ws_snapshot_used": False,
             "data_sources": {},
+            # legacy keys
+            "openInterest": None,
+            "fundingRate": None,
         }
+
+    if _is_soft_blocked():
+        # do NOT early return: WS hub / WS liquidations may still deliver data without REST.
+        warnings.append(f"binance_soft_cooldown_until_ms={_BINANCE_SOFT_UNTIL_MS}")
 
     # Resolve Binance symbol
     binance_symbols = await _get_binance_symbols()
@@ -1363,6 +1393,9 @@ async def compute_full_institutional_analysis(
             "liquidation_intensity": None,
             "ws_snapshot_used": False,
             "data_sources": {},
+            # legacy keys
+            "openInterest": None,
+            "fundingRate": None,
         }
 
     # -------------------------
@@ -1612,7 +1645,6 @@ async def compute_full_institutional_analysis(
     )
 
     # Compatibility field for analyze_signal logs:
-    # analyze_signal checks: inst.get("liquidation_intensity") is not None
     liquidation_intensity: Optional[float] = None
     try:
         if liq_total_usd_5m is not None:
@@ -1678,6 +1710,16 @@ async def compute_full_institutional_analysis(
         # WS hub info
         "ws_snapshot_used": bool(ws_used),
         "data_sources": sources,
+
+        # ------------------------------------------------------------
+        # Legacy/compat keys (avoid KeyError in older analyze/log code)
+        # ------------------------------------------------------------
+        "openInterest": oi_value,
+        "fundingRate": funding_rate,
+        "basisPct": basis_pct,
+        "tapeDelta5m": tape_5m,
+        "orderbookImb25bps": ob_25,
+        "cvdSlope": cvd_slope,
     }
 
     comps = _available_components_list(payload)
