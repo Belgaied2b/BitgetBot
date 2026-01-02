@@ -6,13 +6,17 @@
 #   - Provide a real-time cache that analyze/institutional_data can read
 #     without making per-symbol REST calls.
 #
-# WS docs (USD-M Futures):
+# WS docs (USD-M Futures Streams):
 #   - Base: wss://fstream.binance.com/ws (live subscribe)
-#   - Combined payloads can be enabled via SET_PROPERTY ["combined", true]
-#   - Max 1024 streams per connection (combined/subscribe limits)
+#   - Max 1024 streams per connection (subscribe limits)
 #
 # Dependency:
 #   pip install websockets
+#
+# Notes:
+#   - This hub is OPTIONAL. If you don't enable it (INST_WS_HUB_ENABLE=0),
+#     scanner/analyze can still work, but institutional_data may rely more
+#     on REST and hit rate limits on large scans.
 # =====================================================================
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -27,16 +32,19 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 LOGGER = logging.getLogger(__name__)
 
-BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
+BINANCE_FUTURES_WS = os.getenv("BINANCE_FUTURES_WS", "wss://fstream.binance.com/ws")
 
 # ---- internal knobs ----
-_DEFAULT_MARK_SPEED = "1s"   # markPrice update speed (1s/3s depending on Binance)
-_MAX_STREAMS_PER_CONN = 1024
+_DEFAULT_MARK_SPEED = str(os.getenv("BINANCE_WS_MARK_SPEED", "1s")).strip()  # "1s" or "3s"
+_MAX_STREAMS_PER_CONN = int(os.getenv("BINANCE_WS_MAX_STREAMS", "1024"))
 
 # rolling windows
 _TAPE_WIN_1M = 60.0
 _TAPE_WIN_5M = 300.0
 _LIQ_WIN_5M = 300.0
+
+# snapshot freshness (purely informational)
+_STALE_AFTER_S = float(os.getenv("BINANCE_WS_STALE_AFTER_S", "30"))
 
 
 def _now() -> float:
@@ -86,7 +94,7 @@ class _SymbolState:
     mark_price: float = 0.0
     index_price: float = 0.0
     funding_rate: float = 0.0
-    next_funding_time: Optional[int] = None
+    next_funding_time: Optional[int] = None  # ms epoch in Binance payload
 
     best_bid: float = 0.0
     best_ask: float = 0.0
@@ -109,11 +117,13 @@ class InstitutionalWSHub:
       - await hub.stop()
       - await hub.set_symbols(symbols)
       - hub.get_snapshot(symbol) -> dict
-      - hub.is_running
+      - hub.get_snapshots(symbols) -> dict[symbol]=snapshot
+      - hub.is_running -> bool
     """
 
     def __init__(self, *, mark_speed: str = _DEFAULT_MARK_SPEED) -> None:
         self._mark_speed = (mark_speed or _DEFAULT_MARK_SPEED).strip()
+
         self._desired_symbols: Set[str] = set()
         self._subscribed_streams: Set[str] = set()
 
@@ -124,6 +134,10 @@ class InstitutionalWSHub:
         self._stop_evt = asyncio.Event()
 
         self._id_counter = 1
+
+        # for debug / observability
+        self._connected_ts: float = 0.0
+        self._last_msg_ts: float = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -151,7 +165,7 @@ class InstitutionalWSHub:
     # control
     # -----------------------------
     async def start(self, symbols: Optional[List[str]] = None) -> None:
-        if symbols:
+        if symbols is not None:
             await self.set_symbols(symbols)
 
         if self.is_running:
@@ -190,19 +204,28 @@ class InstitutionalWSHub:
         liq_total_5m, liq_buy_5m, liq_sell_5m, liq_delta_ratio_5m, liq_count_5m = self._compute_liq_5m_breakdown(st)
         ob_imb = self._compute_book_imbalance(st)
 
+        age_s = float(_now() - float(st.last_update_ts or 0.0)) if st.last_update_ts else 1e9
+        stale = bool(age_s > float(_STALE_AFTER_S))
+
+        # Keep backward-compatible keys.
         return {
             "available": True,
             "symbol": sym,
             "ts": st.last_update_ts,
+            "age_s": age_s,
+            "stale": stale,
+
             "mark_price": st.mark_price,
             "index_price": st.index_price,
             "funding_rate": st.funding_rate,
             "next_funding_time": st.next_funding_time,
+
             "best_bid": st.best_bid,
             "best_ask": st.best_ask,
             "bid_qty": st.bid_qty,
             "ask_qty": st.ask_qty,
             "orderbook_imbalance": ob_imb,
+
             "tape_delta_1m": tape_1m,
             "tape_delta_5m": tape_5m,
             "tape_abs_1m": tape_1m_abs,
@@ -216,7 +239,20 @@ class InstitutionalWSHub:
             "liq_sell_usd_5m": liq_sell_5m,
             "liq_delta_ratio_5m": liq_delta_ratio_5m,
             "liq_count_5m": liq_count_5m,
+
+            # connection observability (optional)
+            "hub_connected_ts": self._connected_ts,
+            "hub_last_msg_ts": self._last_msg_ts,
         }
+
+    def get_snapshots(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        for s in (symbols or []):
+            sym = _norm_symbol(s)
+            if not sym:
+                continue
+            out[sym] = self.get_snapshot(sym)
+        return out
 
     # -----------------------------
     # internals: rolling metrics
@@ -349,7 +385,7 @@ class InstitutionalWSHub:
         price = _safe_float(data.get("p"), 0.0)
         qty = _safe_float(data.get("q"), 0.0)
         notional = abs(price * qty)
-        m = bool(data.get("m", False))
+        m = bool(data.get("m", False))  # True = buyer is maker => aggressive sell
         delta = (-notional) if m else (+notional)
         st.tape.append(_TapeRec(ts=_now(), delta_notional=delta, notional=notional))
         st.last_update_ts = _now()
@@ -427,16 +463,15 @@ class InstitutionalWSHub:
                     max_queue=1024,
                 ) as ws:
                     LOGGER.info("[WS_HUB] connected %s", BINANCE_FUTURES_WS)
+                    self._connected_ts = _now()
+                    self._last_msg_ts = 0.0
                     backoff = 1.0
                     self._subscribed_streams = set()
 
-                    # ✅ Enable combined payloads so messages come as {"stream": "...", "data": {...}}
-                    # Still supports raw in case Binance keeps raw payloads.
+                    # Best-effort: enable combined payloads (some environments may ignore it).
                     await self._send(ws, {"method": "SET_PROPERTY", "params": ["combined", True], "id": self._next_id()})
 
-                    # initial subscribe
                     await self._sync_subscriptions(ws)
-
                     last_sync = _now()
 
                     while not self._stop_evt.is_set():
@@ -451,6 +486,8 @@ class InstitutionalWSHub:
 
                         if not msg:
                             continue
+
+                        self._last_msg_ts = _now()
 
                         try:
                             payload = json.loads(msg)
