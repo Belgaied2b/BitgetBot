@@ -46,6 +46,7 @@ from settings import (
     STOP_TRIGGER_TYPE_SL,
     BE_FEE_BUFFER_TICKS,
     POSITION_MODE,
+    INST_WS_HUB_ENABLE,
 )
 
 from bitget_client import get_client
@@ -57,6 +58,13 @@ from structure_utils import analyze_structure, htf_trend_ok
 from duplicate_guard import DuplicateGuard, fingerprint as make_fingerprint
 from risk_manager import RiskManager
 from retry_utils import retry_async
+
+# Institutional WS hub (Binance) — optional (realtime liquidations/tape/funding)
+try:
+    from institutional_ws_hub import HUB as INST_HUB  # type: ignore
+except Exception:
+    INST_HUB = None  # type: ignore
+
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +154,64 @@ TICK_LOCK = asyncio.Lock()
 # Macro/options caches (single fetch per scan)
 MACRO_CACHE = MacroCache() if MacroCache else None
 OPTIONS_CACHE = OptionsCache() if OptionsCache else None
+
+# ---------------------------------------------------------------------
+# Institutional WS hub bootstrap (Binance) — optional
+# ---------------------------------------------------------------------
+_HUB_MAX_SYMBOLS = 256  # 1024 streams / 4 per symbol (aggTrade, bookTicker, markPrice, forceOrder)
+_HUB_WS_AVAILABLE: Optional[bool] = None
+_HUB_WARNED: bool = False
+
+def _hub_ws_available() -> bool:
+    """Return True if `websockets` is installed (cached)."""
+    global _HUB_WS_AVAILABLE
+    if _HUB_WS_AVAILABLE is None:
+        try:
+            import websockets  # type: ignore  # noqa: F401
+            _HUB_WS_AVAILABLE = True
+        except Exception:
+            _HUB_WS_AVAILABLE = False
+    return bool(_HUB_WS_AVAILABLE)
+
+async def _sync_inst_ws_hub(symbols: List[str]) -> None:
+    """
+    Start/update Institutional WS hub if enabled.
+    Provides realtime liquidation/tape/ob/funding to institutional_data.py without REST spam.
+    """
+    global _HUB_WARNED
+
+    if not INST_WS_HUB_ENABLE or INST_HUB is None:
+        return
+
+    if not _hub_ws_available():
+        if not _HUB_WARNED:
+            logger.warning("INST_WS_HUB_ENABLE=1 but `websockets` is not installed -> WS hub disabled. Add `websockets` to requirements.txt")
+            _HUB_WARNED = True
+        return
+
+    syms = [str(s).upper() for s in (symbols or []) if str(s).strip()]
+    if not syms:
+        return
+
+    # cap to WS limits
+    syms = syms[:_HUB_MAX_SYMBOLS]
+
+    try:
+        await INST_HUB.set_symbols(syms)
+        running = False
+        try:
+            running = bool(INST_HUB.is_running)  # property
+        except Exception:
+            try:
+                running = bool(INST_HUB.is_running())  # callable
+            except Exception:
+                running = False
+
+        if not running:
+            await INST_HUB.start(syms)
+
+    except Exception as e:
+        logger.warning("inst ws hub sync failed: %s", e)
 
 
 def _pending_serializable(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1851,6 +1917,7 @@ async def scan_once(client, trader: BitgetTrader) -> None:
         return
 
     symbols = sorted(set(map(str.upper, symbols)))[: int(TOP_N_SYMBOLS)]
+    await _sync_inst_ws_hub(symbols)
     logger.info("📊 Scan %d symboles (TOP_N_SYMBOLS=%s)", len(symbols), TOP_N_SYMBOLS)
 
     analyze_sem = asyncio.Semaphore(int(MAX_CONCURRENT_ANALYZE))
