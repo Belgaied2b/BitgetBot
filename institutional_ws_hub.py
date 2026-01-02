@@ -7,7 +7,8 @@
 #     without making per-symbol REST calls.
 #
 # WS docs (USD-M Futures):
-#   - Base: wss://fstream.binance.com/ws (live subscriptions)
+#   - Base: wss://fstream.binance.com/ws (live subscribe)
+#   - Combined payloads can be enabled via SET_PROPERTY ["combined", true]
 #   - Max 1024 streams per connection (combined/subscribe limits)
 #
 # Dependency:
@@ -133,13 +134,12 @@ class InstitutionalWSHub:
     # -----------------------------
     def _streams_for_symbol(self, sym: str) -> List[str]:
         s = sym.lower()
-        out = [
+        return [
             f"{s}@aggTrade",
             f"{s}@bookTicker",
             f"{s}@markPrice@{self._mark_speed}",
             f"{s}@forceOrder",
         ]
-        return out
 
     def _streams_for_symbols(self, symbols: Set[str]) -> Set[str]:
         streams: Set[str] = set()
@@ -173,7 +173,6 @@ class InstitutionalWSHub:
         desired = {_norm_symbol(s) for s in (symbols or []) if _norm_symbol(s)}
         async with self._lock:
             self._desired_symbols = desired
-            # ensure state entries exist
             for sym in desired:
                 self._state.setdefault(sym, _SymbolState())
         return
@@ -212,12 +211,10 @@ class InstitutionalWSHub:
             # Backward-compatible field
             "liq_notional_5m": liq_total_5m,
 
-            # NEW: liquidation breakdown for better A/B grading
-            # Note: Binance "forceOrder" side is the order side ("S") in payload.
-            # Interpretation (longs vs shorts liquidated) depends on context; we expose raw buy/sell notionals.
+            # NEW: liquidation breakdown
             "liq_buy_usd_5m": liq_buy_5m,
             "liq_sell_usd_5m": liq_sell_5m,
-            "liq_delta_ratio_5m": liq_delta_ratio_5m,  # (buy - sell) / (buy + sell)
+            "liq_delta_ratio_5m": liq_delta_ratio_5m,
             "liq_count_5m": liq_count_5m,
         }
 
@@ -233,7 +230,6 @@ class InstitutionalWSHub:
 
     def _compute_tape(self, st: _SymbolState) -> Tuple[float, float, float, float]:
         now = _now()
-        # prune to 5m
         self._prune_left(st.tape, now - (_TAPE_WIN_5M + 2.0))
 
         d1 = 0.0
@@ -248,21 +244,11 @@ class InstitutionalWSHub:
                 d1 += rec.delta_notional
                 n1 += rec.notional
 
-        # normalize to [-1..+1] if possible
         tape_1m = (d1 / n1) if n1 > 1e-9 else 0.0
         tape_5m = (d5 / n5) if n5 > 1e-9 else 0.0
         return float(tape_1m), float(tape_5m), float(n1), float(n5)
 
-    def _compute_liq_5m(self, st: _SymbolState) -> float:
-        total, *_ = self._compute_liq_5m_breakdown(st)
-        return float(total)
-
     def _compute_liq_5m_breakdown(self, st: _SymbolState) -> Tuple[float, float, float, float, int]:
-        """
-        Returns:
-          total_abs, buy_abs, sell_abs, delta_ratio, count
-        delta_ratio = (buy - sell) / (buy + sell) in [-1..+1] when total>0 else 0
-        """
         now = _now()
         self._prune_left(st.liquidations, now - (_LIQ_WIN_5M + 2.0))
 
@@ -282,17 +268,9 @@ class InstitutionalWSHub:
                 buy_abs += n
             elif s == "SELL":
                 sell_abs += n
-            else:
-                # unknown side -> count toward total but don't skew delta
-                buy_abs += 0.0
-                sell_abs += 0.0
 
         total = float(buy_abs + sell_abs)
-        if total > 1e-12:
-            delta_ratio = float((buy_abs - sell_abs) / total)
-        else:
-            delta_ratio = 0.0
-
+        delta_ratio = float((buy_abs - sell_abs) / total) if total > 1e-12 else 0.0
         return float(total), float(buy_abs), float(sell_abs), float(delta_ratio), int(cnt)
 
     def _compute_book_imbalance(self, st: _SymbolState) -> float:
@@ -302,7 +280,7 @@ class InstitutionalWSHub:
         return float((st.bid_qty - st.ask_qty) / denom)
 
     # -----------------------------
-    # WS loop
+    # WS loop + handlers
     # -----------------------------
     async def _send(self, ws, payload: Dict[str, Any]) -> None:
         try:
@@ -320,7 +298,7 @@ class InstitutionalWSHub:
 
         desired_streams = self._streams_for_symbols(desired)
 
-        # safety: cap (rough guard)
+        # safety: cap
         if len(desired_streams) > _MAX_STREAMS_PER_CONN:
             desired_list = sorted(list(desired))
             keep: Set[str] = set()
@@ -344,60 +322,91 @@ class InstitutionalWSHub:
             for s in to_add:
                 self._subscribed_streams.add(s)
 
-    async def _handle_data(self, stream: str, data: Dict[str, Any]) -> None:
-        sym = _stream_symbol(stream)
+    async def _ensure_state(self, sym: str) -> _SymbolState:
+        sym = _norm_symbol(sym)
+        async with self._lock:
+            return self._state.setdefault(sym, _SymbolState())
+
+    async def _handle_event_mark(self, sym: str, data: Dict[str, Any]) -> None:
+        st = await self._ensure_state(sym)
+        st.mark_price = _safe_float(data.get("p"), st.mark_price)
+        st.index_price = _safe_float(data.get("i"), st.index_price)
+        st.funding_rate = _safe_float(data.get("r"), st.funding_rate)
+        nft = data.get("T")
+        st.next_funding_time = int(nft) if nft is not None else st.next_funding_time
+        st.last_update_ts = _now()
+
+    async def _handle_event_book(self, sym: str, data: Dict[str, Any]) -> None:
+        st = await self._ensure_state(sym)
+        st.best_bid = _safe_float(data.get("b"), st.best_bid)
+        st.best_ask = _safe_float(data.get("a"), st.best_ask)
+        st.bid_qty = _safe_float(data.get("B"), st.bid_qty)
+        st.ask_qty = _safe_float(data.get("A"), st.ask_qty)
+        st.last_update_ts = _now()
+
+    async def _handle_event_aggtrade(self, sym: str, data: Dict[str, Any]) -> None:
+        st = await self._ensure_state(sym)
+        price = _safe_float(data.get("p"), 0.0)
+        qty = _safe_float(data.get("q"), 0.0)
+        notional = abs(price * qty)
+        m = bool(data.get("m", False))
+        delta = (-notional) if m else (+notional)
+        st.tape.append(_TapeRec(ts=_now(), delta_notional=delta, notional=notional))
+        st.last_update_ts = _now()
+
+    async def _handle_event_forceorder(self, sym: str, data: Dict[str, Any]) -> None:
+        st = await self._ensure_state(sym)
+        o = data.get("o") if isinstance(data.get("o"), dict) else {}
+        side = str(o.get("S") or "").upper()
+        if side not in ("BUY", "SELL"):
+            side = "UNKNOWN"
+        price = _safe_float(o.get("p"), 0.0)
+        qty = _safe_float(o.get("q"), 0.0)
+        notional = abs(price * qty)
+        if notional > 0:
+            st.liquidations.append(_LiqRec(ts=_now(), notional=notional, side=side))
+            st.last_update_ts = _now()
+
+    async def _handle_combined(self, stream: str, data: Dict[str, Any]) -> None:
+        # combined format: {"stream":"btcusdt@aggTrade","data":{...}}
+        sym = _stream_symbol(stream) or _norm_symbol(str(data.get("s") or ""))
         if not sym:
             return
 
-        async with self._lock:
-            st = self._state.setdefault(sym, _SymbolState())
+        sl = (stream or "").lower()
+        et = str(data.get("e") or "").lower()
 
-        # ---- markPrice stream ----
-        if "@markprice" in stream.lower():
-            st.mark_price = _safe_float(data.get("p"), st.mark_price)
-            st.index_price = _safe_float(data.get("i"), st.index_price)
-            st.funding_rate = _safe_float(data.get("r"), st.funding_rate)
-            nft = data.get("T")
-            st.next_funding_time = int(nft) if nft is not None else st.next_funding_time
-            st.last_update_ts = _now()
+        if ("@markprice" in sl) or (et == "markpriceupdate"):
+            await self._handle_event_mark(sym, data)
+            return
+        if ("@bookticker" in sl) or (et == "bookticker"):
+            await self._handle_event_book(sym, data)
+            return
+        if ("@aggtrade" in sl) or (et == "aggtrade"):
+            await self._handle_event_aggtrade(sym, data)
+            return
+        if ("@forceorder" in sl) or (et == "forceorder"):
+            await self._handle_event_forceorder(sym, data)
             return
 
-        # ---- bookTicker ----
-        if "@bookticker" in stream.lower():
-            st.best_bid = _safe_float(data.get("b"), st.best_bid)
-            st.best_ask = _safe_float(data.get("a"), st.best_ask)
-            st.bid_qty = _safe_float(data.get("B"), st.bid_qty)
-            st.ask_qty = _safe_float(data.get("A"), st.ask_qty)
-            st.last_update_ts = _now()
+    async def _handle_raw(self, payload: Dict[str, Any]) -> None:
+        # raw format: {"e":"aggTrade","s":"BTCUSDT", ...}
+        et = str(payload.get("e") or "").lower()
+        sym = _norm_symbol(str(payload.get("s") or payload.get("symbol") or ""))
+        if not et or not sym:
             return
 
-        # ---- aggTrade ----
-        if "@aggtrade" in stream.lower():
-            # Binance aggTrade:
-            #   p price, q qty, m: is buyer maker?
-            # If buyer is maker -> seller is taker (aggressive sell) => delta negative.
-            price = _safe_float(data.get("p"), 0.0)
-            qty = _safe_float(data.get("q"), 0.0)
-            notional = abs(price * qty)
-            m = bool(data.get("m", False))
-            delta = (-notional) if m else (+notional)
-
-            st.tape.append(_TapeRec(ts=_now(), delta_notional=delta, notional=notional))
-            st.last_update_ts = _now()
+        if et == "markpriceupdate":
+            await self._handle_event_mark(sym, payload)
             return
-
-        # ---- forceOrder (liquidation) ----
-        if "@forceorder" in stream.lower():
-            o = data.get("o") if isinstance(data.get("o"), dict) else {}
-            side = str(o.get("S") or "").upper()  # BUY/SELL
-            if side not in ("BUY", "SELL"):
-                side = "UNKNOWN"
-            price = _safe_float(o.get("p"), 0.0)
-            qty = _safe_float(o.get("q"), 0.0)
-            notional = abs(price * qty)
-            if notional > 0:
-                st.liquidations.append(_LiqRec(ts=_now(), notional=notional, side=side))
-                st.last_update_ts = _now()
+        if et == "bookticker":
+            await self._handle_event_book(sym, payload)
+            return
+        if et == "aggtrade":
+            await self._handle_event_aggtrade(sym, payload)
+            return
+        if et == "forceorder":
+            await self._handle_event_forceorder(sym, payload)
             return
 
     async def _run_loop(self) -> None:
@@ -421,13 +430,16 @@ class InstitutionalWSHub:
                     backoff = 1.0
                     self._subscribed_streams = set()
 
+                    # ✅ Enable combined payloads so messages come as {"stream": "...", "data": {...}}
+                    # Still supports raw in case Binance keeps raw payloads.
+                    await self._send(ws, {"method": "SET_PROPERTY", "params": ["combined", True], "id": self._next_id()})
+
                     # initial subscribe
                     await self._sync_subscriptions(ws)
 
                     last_sync = _now()
 
                     while not self._stop_evt.is_set():
-                        # periodic subscription sync (in case set_symbols() changed)
                         if _now() - last_sync >= 2.0:
                             await self._sync_subscriptions(ws)
                             last_sync = _now()
@@ -445,27 +457,27 @@ class InstitutionalWSHub:
                         except Exception:
                             continue
 
-                        # subscription acks (result: null)
+                        # acks / property responses
                         if isinstance(payload, dict) and "result" in payload and "id" in payload:
                             continue
 
-                        # combined format: {"stream":"btcusdt@aggTrade","data":{...}}
+                        # combined format
                         if (
                             isinstance(payload, dict)
                             and isinstance(payload.get("stream"), str)
                             and isinstance(payload.get("data"), dict)
                         ):
-                            await self._handle_data(payload["stream"], payload["data"])
+                            await self._handle_combined(payload["stream"], payload["data"])
                             continue
 
-                        # sometimes Binance can send raw event (rare when using /ws)
+                        # raw events
                         if isinstance(payload, dict) and isinstance(payload.get("e"), str):
+                            await self._handle_raw(payload)
                             continue
 
             except Exception as e:
                 LOGGER.warning("[WS_HUB] disconnected: %s", e)
 
-            # backoff reconnect
             await asyncio.sleep(min(20.0, backoff))
             backoff = min(20.0, backoff * 1.8)
 
