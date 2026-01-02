@@ -1,3 +1,7 @@
+# =====================================================================
+# analyze_signal.py — Desk institutional analyzer (TTL-compatible setup)
+# =====================================================================
+
 from __future__ import annotations
 
 import logging
@@ -50,6 +54,34 @@ REQUIRED_COLS = ("open", "high", "low", "close", "volume")
 
 # Optional: allow technical fallback if Binance is banned/down (default False)
 ALLOW_TECH_FALLBACK_WHEN_INST_DOWN = str(os.getenv("ALLOW_TECH_FALLBACK_WHEN_INST_DOWN", "0")).strip() == "1"
+
+# =====================================================================
+# ✅ scanner.py compatibility helper (TTL policy uses setup string)
+# =====================================================================
+def _setup_ttl_compatible(setup_type: str, entry_type: str) -> str:
+    """
+    scanner.py uses _entry_ttl_s(entry_type, setup) but looks for OTE/FVG in setup.
+    We keep the canonical setup type, and append a suffix when needed so TTL works.
+
+    Rules:
+      - If entry_type contains RAID => suffix _RAID (do NOT add _FVG, or TTL would pick FVG before RAID)
+      - Else if entry_type contains OTE => suffix _OTE
+      - Else if entry_type contains FVG => suffix _FVG
+    """
+    base = str(setup_type or "").strip()
+    if not base:
+        base = "OTHER"
+    s = base.upper()
+    et = str(entry_type or "").upper()
+
+    if "RAID" in et and ("RAID" not in s and "SWEEP" not in s):
+        return f"{base}_RAID"
+    if "OTE" in et and "OTE" not in s:
+        return f"{base}_OTE"
+    if "FVG" in et and "FVG" not in s:
+        return f"{base}_FVG"
+    return base
+
 
 # =====================================================================
 # ✅ Liquidations + 2-pass institutional policy
@@ -192,7 +224,6 @@ def _final_grade(
 
     # Base from setup type
     if st == "BOS_STRICT":
-        # Strongest path
         if "RR_STRICT" in sv and int(gate) >= int(MIN_INST_SCORE) and bos_quality_ok:
             p = "A"
             reasons.append("setup:BOS_STRICT+RR_STRICT")
@@ -200,7 +231,6 @@ def _final_grade(
             p = "B"
             reasons.append("setup:BOS_STRICT")
     elif st in ("RAID_DISPLACEMENT", "LIQ_SWEEP"):
-        # Desk setups: good but usually below BOS strict
         if int(gate) >= int(INST_SCORE_DESK_PRIORITY):
             p = "B"
             reasons.append(f"setup:{st}+inst_ok")
@@ -214,15 +244,12 @@ def _final_grade(
         p = "D"
         reasons.append("setup:OTHER")
 
-    # Facts
     reasons.append(f"rr:{float(rr):.3f}")
     reasons.append(f"inst_gate:{int(gate)} ok_count:{int(ok_count)}")
     if bos_quality_ok:
         reasons.append("bos_quality:ok")
 
-    # Risk / uncertainty downgrades
     if not inst_available:
-        # Only possible if tech fallback is enabled; degrade because blind
         p = _downgrade(p, 1)
         reasons.append("downgrade:inst_unavailable")
 
@@ -242,7 +269,6 @@ def _final_grade(
         p = _downgrade(p, 1)
         reasons.append("downgrade:overextended")
 
-    # Positive bump (small)
     if m in ("STRONG_BULLISH", "STRONG_BEARISH"):
         p = _upgrade(p, 1)
         reasons.append("upgrade:strong_momentum")
@@ -709,7 +735,7 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
     return {
         "entry_used": float(entry_mkt),
         "entry_type": "MARKET",
-        "order_type": "LIMIT",  # (tu laisses LIMIT même si entry_type=MARKET)
+        "order_type": "LIMIT",
         "in_zone": False,
         "note": "no_zone_entry",
         "entry_mkt": entry_mkt,
@@ -869,7 +895,7 @@ class SignalAnalyzer:
                 return _reject("momentum_not_bearish", structure=struct)
 
         # ===============================================================
-        # PRE-PRIORITY (cheap) → controls PASS2 (settings.PASS2_ONLY_FOR_PRIORITY)
+        # PRE-PRIORITY (cheap) → controls PASS2
         # ===============================================================
         pre_priority, pre_priority_reasons = _pre_grade_candidate(
             bos_flag=bos_flag,
@@ -1057,14 +1083,12 @@ class SignalAnalyzer:
         entry_pick = _pick_entry(df_h1, struct, bias)
         entry = float(entry_pick["entry_used"])
         entry_type = str(entry_pick["entry_type"])
-        order_type = str(entry_pick.get("order_type") or "LIMIT")  # ✅ PROPAGATED
         atr14 = float(entry_pick.get("atr") or _atr(df_h1, 14))
 
         LOGGER.info(
-            "[EVAL_PRE] %s ENTRY_PICK type=%s order_type=%s entry_mkt=%s entry_used=%s in_zone=%s note=%s atr=%.6g",
+            "[EVAL_PRE] %s ENTRY_PICK type=%s entry_mkt=%s entry_used=%s in_zone=%s note=%s atr=%.6g",
             symbol,
             entry_type,
-            order_type,
             entry_pick.get("entry_mkt"),
             entry_pick.get("entry_used"),
             entry_pick.get("in_zone"),
@@ -1081,7 +1105,6 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
-                    order_type=order_type,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                 )
@@ -1092,7 +1115,6 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
-                    order_type=order_type,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                 )
@@ -1105,7 +1127,6 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
-                    order_type=order_type,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                 )
@@ -1116,7 +1137,6 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
-                    order_type=order_type,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                 )
@@ -1130,7 +1150,6 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
-                    order_type=order_type,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                 )
@@ -1141,7 +1160,6 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
-                    order_type=order_type,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                 )
@@ -1172,7 +1190,6 @@ class SignalAnalyzer:
 
         sl = float(exits["sl"])
         tp1 = float(exits["tp1"])
-
         rr = _safe_rr(entry, sl, tp1, bias)
 
         # SL hygiene (push beyond sweep / eq levels) + keep tick rounding consistent
@@ -1244,12 +1261,11 @@ class SignalAnalyzer:
                 "sl_invalid_after_liq_adj",
                 institutional=inst,
                 structure=struct,
-                order_type=order_type,
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
             )
 
-        # ✅ recalc TP1 after SL adjustments (keeps RR logic consistent)
+        # ✅ recalc TP1 after SL adjustments
         try:
             tp1, _rr_used2 = compute_tp1(entry, sl, bias, df=df_h1, tick=tick)
             tp1 = float(tp1)
@@ -1264,8 +1280,8 @@ class SignalAnalyzer:
         sl_meta_out["post_adjust"] = sl_adj
 
         LOGGER.info(
-            "[EVAL_PRE] %s EXITS entry=%s sl=%s tp1=%s tick=%s RR=%s raw_rr=%s entry_type=%s order_type=%s setup_hint=%s",
-            symbol, entry, sl, tp1, tick, rr, exits.get("rr_used"), entry_type, order_type, setup_hint
+            "[EVAL_PRE] %s EXITS entry=%s sl=%s tp1=%s tick=%s RR=%s raw_rr=%s entry_type=%s setup_hint=%s",
+            symbol, entry, sl, tp1, tick, rr, exits.get("rr_used"), entry_type, setup_hint
         )
 
         if rr is None or rr <= 0:
@@ -1275,7 +1291,6 @@ class SignalAnalyzer:
                 institutional=inst,
                 structure=struct,
                 entry_pick=entry_pick,
-                order_type=order_type,
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
             )
@@ -1313,6 +1328,10 @@ class SignalAnalyzer:
                 unfavorable_market=bool(unfavorable_market),
                 mom=str(mom),
             )
+
+            setup_core = "BOS_STRICT"
+            setup_ttl = _setup_ttl_compatible(setup_core, entry_type)
+
             return {
                 "valid": True,
                 "symbol": symbol,
@@ -1320,13 +1339,13 @@ class SignalAnalyzer:
                 "bias": bias,
                 "entry": entry,
                 "entry_type": entry_type,
-                "order_type": order_type,  # ✅ ADDED
                 "sl": float(sl),
                 "tp1": float(tp1),
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": "BOS_STRICT",
+                "setup_type": setup_ttl,          # ✅ TTL-compatible for scanner.py
+                "setup_type_core": setup_core,    # ✅ canonical for debug
                 "setup_variant": bos_variant,
                 "priority": priority,
                 "priority_reasons": priority_reasons,
@@ -1366,6 +1385,10 @@ class SignalAnalyzer:
                 unfavorable_market=bool(unfavorable_market),
                 mom=str(mom),
             )
+
+            setup_core = "RAID_DISPLACEMENT"
+            setup_ttl = _setup_ttl_compatible(setup_core, entry_type)
+
             return {
                 "valid": True,
                 "symbol": symbol,
@@ -1373,13 +1396,13 @@ class SignalAnalyzer:
                 "bias": bias,
                 "entry": entry,
                 "entry_type": entry_type,
-                "order_type": order_type,  # ✅ ADDED
                 "sl": float(sl),
                 "tp1": float(tp1),
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": "RAID_DISPLACEMENT",
+                "setup_type": setup_ttl,          # ✅ TTL-compatible
+                "setup_type_core": setup_core,
                 "setup_variant": variant,
                 "priority": priority,
                 "priority_reasons": priority_reasons,
@@ -1420,6 +1443,10 @@ class SignalAnalyzer:
                 unfavorable_market=bool(unfavorable_market),
                 mom=str(mom),
             )
+
+            setup_core = "LIQ_SWEEP"
+            setup_ttl = _setup_ttl_compatible(setup_core, entry_type)
+
             return {
                 "valid": True,
                 "symbol": symbol,
@@ -1427,13 +1454,13 @@ class SignalAnalyzer:
                 "bias": bias,
                 "entry": entry,
                 "entry_type": entry_type,
-                "order_type": order_type,  # ✅ ADDED
                 "sl": float(sl),
                 "tp1": float(tp1),
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": "LIQ_SWEEP",
+                "setup_type": setup_ttl,          # ✅ TTL-compatible
+                "setup_type_core": setup_core,
                 "setup_variant": variant,
                 "priority": priority,
                 "priority_reasons": priority_reasons,
@@ -1478,6 +1505,10 @@ class SignalAnalyzer:
                     unfavorable_market=bool(unfavorable_market),
                     mom=str(mom),
                 )
+
+                setup_core = "INST_CONTINUATION"
+                setup_ttl = _setup_ttl_compatible(setup_core, entry_type)
+
                 return {
                     "valid": True,
                     "symbol": symbol,
@@ -1485,13 +1516,13 @@ class SignalAnalyzer:
                     "bias": bias,
                     "entry": entry,
                     "entry_type": entry_type,
-                    "order_type": order_type,  # ✅ ADDED
                     "sl": float(sl),
                     "tp1": float(tp1),
                     "tp2": None,
                     "rr": float(rr),
                     "qty": 1,
-                    "setup_type": "INST_CONTINUATION",
+                    "setup_type": setup_ttl,          # ✅ TTL-compatible
+                    "setup_type_core": setup_core,
                     "setup_variant": "INST_CONTINUATION",
                     "priority": priority,
                     "priority_reasons": priority_reasons,
@@ -1522,8 +1553,6 @@ class SignalAnalyzer:
             "institutional": inst,
             "bos_quality": bos_q,
             "entry_pick": entry_pick,
-            "entry_type": entry_type,
-            "order_type": order_type,  # ✅ ADDED
             "rr": float(rr),
             "inst_gate": int(gate),
             "inst_ok_count": int(ok_count),
