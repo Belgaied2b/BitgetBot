@@ -6,6 +6,8 @@
 # - cohérence des seuils (RR / inst / modes) avec garde-fous
 # - valeurs par défaut “safe prod” (pas trop strict = évite 0 signal)
 # - centralise product type / margin coin / execution modes
+# - + (NEW) grading A→E + règles d’exécution associées (auto-order vs alert-only)
+# - + (NEW) TTL / runaway / WS hub flags centralisés
 # =====================================================================
 
 from __future__ import annotations
@@ -308,6 +310,73 @@ if PRICE_NUDGE_TICKS_MAX < PRICE_NUDGE_TICKS_MIN:
     PRICE_NUDGE_TICKS_MAX = PRICE_NUDGE_TICKS_MIN
 
 SLIPPAGE_TICKS_LIMIT = _get_int("SLIPPAGE_TICKS_LIMIT", 2, min_v=0, max_v=50)
+
+
+# =====================================================================
+# PRIORITY (A→E) + EXECUTION POLICY (NEW)
+# =====================================================================
+
+PRIORITY_LEVELS: Tuple[str, ...] = ("A", "B", "C", "D", "E")
+
+_PRIORITY_RANK = {"A": 5, "B": 4, "C": 3, "D": 2, "E": 1}
+
+
+def _get_priority(name: str, default: str = "C") -> str:
+    """
+    Parse une priorité A/B/C/D/E depuis ENV. Si invalide → default.
+    """
+    v = _get_str(name, default).strip().upper()
+    return v if v in PRIORITY_LEVELS else str(default).strip().upper()
+
+
+def priority_rank(p: str) -> int:
+    """
+    A=5 ... E=1, invalide=0
+    """
+    if not p:
+        return 0
+    return int(_PRIORITY_RANK.get(str(p).strip().upper(), 0))
+
+
+def priority_at_least(p: str, min_p: str) -> bool:
+    """
+    True si p >= min_p (en ranking A>B>...>E)
+    """
+    return priority_rank(p) >= priority_rank(min_p)
+
+
+# Auto-order seulement si priority >= AUTO_ORDER_MIN_PRIORITY
+# Exemple: "C" => A/B/C auto-order ; D/E => alert-only
+AUTO_ORDER_MIN_PRIORITY = _get_priority("AUTO_ORDER_MIN_PRIORITY", "C")
+
+# Pass2 (= datafeeds/inst lourd) seulement si pre_priority >= PASS2_ONLY_FOR_PRIORITY
+# Exemple: "C" => on calcule pass2 pour A/B/C ; D/E on skip pass2
+PASS2_ONLY_FOR_PRIORITY = _get_priority("PASS2_ONLY_FOR_PRIORITY", "C")
+
+
+# =====================================================================
+# SIGNAL TTL / RUNAWAY / PENDING POLICY (NEW)
+# =====================================================================
+
+# Temps max (minutes) pendant lequel un "pending entry" reste éligible (alerte/ordre).
+# Le scanner utilisera ça pour expirer pending_state.json proprement.
+ENTRY_TTL_MINUTES = _get_int("ENTRY_TTL_MINUTES", 45, min_v=1, max_v=24 * 60)
+
+# Si le prix part trop loin avant fill (runaway), on invalide le pending.
+# Interprétation: distance relative entre prix actuel et entry (ex: 0.006 = 0.6%)
+RUNAWAY_PCT = _get_float("RUNAWAY_PCT", 0.006, min_v=0.0, max_v=0.20)
+
+# Intervalle mini (secondes) entre checks de pending par symbole (anti-spam API)
+PENDING_RECHECK_INTERVAL_S = _get_float("PENDING_RECHECK_INTERVAL_S", 20.0, min_v=0.0, max_v=600.0)
+
+
+# =====================================================================
+# INSTITUTIONAL WS HUB FLAGS (NEW)
+# =====================================================================
+
+# Active le hub WS institutionnel (liquidations/trades/orderbook selon ton implémentation).
+# Alias rétro-compatible : ENABLE_INST_WS_HUB
+INST_WS_HUB_ENABLE = _get_bool("INST_WS_HUB_ENABLE", _get_bool("ENABLE_INST_WS_HUB", False))
 
 
 # =====================================================================
