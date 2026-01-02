@@ -76,7 +76,7 @@ class _TapeRec:
 class _LiqRec:
     ts: float
     notional: float
-    side: str  # BUY/SELL in liquidation message meaning? we store raw
+    side: str  # BUY/SELL as received in Binance forceOrder payload ("S")
 
 
 @dataclass
@@ -176,9 +176,6 @@ class InstitutionalWSHub:
             # ensure state entries exist
             for sym in desired:
                 self._state.setdefault(sym, _SymbolState())
-
-        # if running: resubscribe dynamically
-        # (we don't block; the ws loop reads desired state and updates subs)
         return
 
     # -----------------------------
@@ -191,7 +188,7 @@ class InstitutionalWSHub:
             return {"available": False, "symbol": sym, "reason": "no_state"}
 
         tape_1m, tape_5m, tape_1m_abs, tape_5m_abs = self._compute_tape(st)
-        liq_5m = self._compute_liq_5m(st)
+        liq_total_5m, liq_buy_5m, liq_sell_5m, liq_delta_ratio_5m, liq_count_5m = self._compute_liq_5m_breakdown(st)
         ob_imb = self._compute_book_imbalance(st)
 
         return {
@@ -211,7 +208,17 @@ class InstitutionalWSHub:
             "tape_delta_5m": tape_5m,
             "tape_abs_1m": tape_1m_abs,
             "tape_abs_5m": tape_5m_abs,
-            "liq_notional_5m": liq_5m,
+
+            # Backward-compatible field
+            "liq_notional_5m": liq_total_5m,
+
+            # NEW: liquidation breakdown for better A/B grading
+            # Note: Binance "forceOrder" side is the order side ("S") in payload.
+            # Interpretation (longs vs shorts liquidated) depends on context; we expose raw buy/sell notionals.
+            "liq_buy_usd_5m": liq_buy_5m,
+            "liq_sell_usd_5m": liq_sell_5m,
+            "liq_delta_ratio_5m": liq_delta_ratio_5m,  # (buy - sell) / (buy + sell)
+            "liq_count_5m": liq_count_5m,
         }
 
     # -----------------------------
@@ -247,13 +254,46 @@ class InstitutionalWSHub:
         return float(tape_1m), float(tape_5m), float(n1), float(n5)
 
     def _compute_liq_5m(self, st: _SymbolState) -> float:
+        total, *_ = self._compute_liq_5m_breakdown(st)
+        return float(total)
+
+    def _compute_liq_5m_breakdown(self, st: _SymbolState) -> Tuple[float, float, float, float, int]:
+        """
+        Returns:
+          total_abs, buy_abs, sell_abs, delta_ratio, count
+        delta_ratio = (buy - sell) / (buy + sell) in [-1..+1] when total>0 else 0
+        """
         now = _now()
         self._prune_left(st.liquidations, now - (_LIQ_WIN_5M + 2.0))
-        total = 0.0
+
+        buy_abs = 0.0
+        sell_abs = 0.0
+        cnt = 0
+
         for rec in st.liquidations:
-            if rec.ts >= now - _LIQ_WIN_5M:
-                total += abs(rec.notional)
-        return float(total)
+            if rec.ts < now - _LIQ_WIN_5M:
+                continue
+            n = abs(float(rec.notional))
+            if n <= 0:
+                continue
+            cnt += 1
+            s = str(rec.side or "").upper()
+            if s == "BUY":
+                buy_abs += n
+            elif s == "SELL":
+                sell_abs += n
+            else:
+                # unknown side -> count toward total but don't skew delta
+                buy_abs += 0.0
+                sell_abs += 0.0
+
+        total = float(buy_abs + sell_abs)
+        if total > 1e-12:
+            delta_ratio = float((buy_abs - sell_abs) / total)
+        else:
+            delta_ratio = 0.0
+
+        return float(total), float(buy_abs), float(sell_abs), float(delta_ratio), int(cnt)
 
     def _compute_book_imbalance(self, st: _SymbolState) -> float:
         denom = (abs(st.bid_qty) + abs(st.ask_qty))
@@ -282,7 +322,6 @@ class InstitutionalWSHub:
 
         # safety: cap (rough guard)
         if len(desired_streams) > _MAX_STREAMS_PER_CONN:
-            # keep deterministic order
             desired_list = sorted(list(desired))
             keep: Set[str] = set()
             for sym in desired_list:
@@ -351,6 +390,8 @@ class InstitutionalWSHub:
         if "@forceorder" in stream.lower():
             o = data.get("o") if isinstance(data.get("o"), dict) else {}
             side = str(o.get("S") or "").upper()  # BUY/SELL
+            if side not in ("BUY", "SELL"):
+                side = "UNKNOWN"
             price = _safe_float(o.get("p"), 0.0)
             qty = _safe_float(o.get("q"), 0.0)
             notional = abs(price * qty)
@@ -409,14 +450,16 @@ class InstitutionalWSHub:
                             continue
 
                         # combined format: {"stream":"btcusdt@aggTrade","data":{...}}
-                        if isinstance(payload, dict) and isinstance(payload.get("stream"), str) and isinstance(payload.get("data"), dict):
+                        if (
+                            isinstance(payload, dict)
+                            and isinstance(payload.get("stream"), str)
+                            and isinstance(payload.get("data"), dict)
+                        ):
                             await self._handle_data(payload["stream"], payload["data"])
                             continue
 
                         # sometimes Binance can send raw event (rare when using /ws)
                         if isinstance(payload, dict) and isinstance(payload.get("e"), str):
-                            # try to infer by event type
-                            # we ignore for now
                             continue
 
             except Exception as e:
