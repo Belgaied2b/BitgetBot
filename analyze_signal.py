@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -39,6 +39,9 @@ from settings import (
     REQUIRE_HTF_ALIGN,
     REQUIRE_BOS_QUALITY,
     RR_MIN_TOLERATED_WITH_INST,
+    # NEW (grading / pass2 policy)
+    PASS2_ONLY_FOR_PRIORITY,
+    priority_at_least,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -60,7 +63,7 @@ def _env_str(name: str, default: str) -> str:
 
 
 # Liquidations enabled (global)
-INST_ENABLE_LIQUIDATIONS = _env_flag("INST_ENABLE_LIQUIDATIONS", "1")  # ✅ default ON (comme tu veux)
+INST_ENABLE_LIQUIDATIONS = _env_flag("INST_ENABLE_LIQUIDATIONS", "1")  # ✅ default ON
 
 # If 1: only call liquidations on PASS2 (recommended)
 INST_LIQ_PASS2_ONLY = _env_flag("INST_LIQ_PASS2_ONLY", "1")  # ✅ default ON (anti-ban)
@@ -82,6 +85,169 @@ if INST_PASS1_MODE not in ("LIGHT", "NORMAL", "FULL"):
     INST_PASS1_MODE = "LIGHT"
 if INST_PASS2_MODE not in ("LIGHT", "NORMAL", "FULL"):
     INST_PASS2_MODE = "NORMAL"
+
+
+# =====================================================================
+# Priority helpers (A→E)
+# =====================================================================
+_PRIORITY_ORDER = ("A", "B", "C", "D", "E")
+_PRIORITY_IDX = {p: i for i, p in enumerate(_PRIORITY_ORDER)}  # A=0 ... E=4
+
+
+def _prio_norm(p: str, default: str = "C") -> str:
+    s = (p or "").strip().upper()
+    return s if s in _PRIORITY_IDX else default
+
+
+def _downgrade(p: str, steps: int = 1) -> str:
+    p = _prio_norm(p)
+    i = _PRIORITY_IDX[p]
+    i2 = min(len(_PRIORITY_ORDER) - 1, i + max(0, int(steps)))
+    return _PRIORITY_ORDER[i2]
+
+
+def _upgrade(p: str, steps: int = 1) -> str:
+    p = _prio_norm(p)
+    i = _PRIORITY_IDX[p]
+    i2 = max(0, i - max(0, int(steps)))
+    return _PRIORITY_ORDER[i2]
+
+
+def _pre_grade_candidate(
+    *,
+    bos_flag: bool,
+    raid_ok: bool,
+    sweep_ok: bool,
+    mom: str,
+    comp_score: float,
+    used_bias_fallback: bool,
+    ext_sig: str,
+) -> Tuple[str, List[str]]:
+    """
+    PRE-grade "cheap" (avant PASS2) pour limiter les appels institutionnels lourds.
+    """
+    reasons: List[str] = []
+    m = (mom or "").upper()
+    ext = (ext_sig or "").upper()
+
+    # Base bucket from structure triggers
+    if bos_flag:
+        p = "B"
+        reasons.append("pre:bos_trigger")
+    elif raid_ok or sweep_ok:
+        p = "C"
+        reasons.append("pre:raid_or_sweep")
+    else:
+        p = "D"
+        reasons.append("pre:no_trigger")
+
+    # Momentum & composite bump
+    if m in ("STRONG_BULLISH", "STRONG_BEARISH"):
+        p = _upgrade(p, 1)
+        reasons.append("pre:strong_momentum")
+    if float(comp_score) >= 67.0:
+        p = _upgrade(p, 1)
+        reasons.append("pre:high_composite")
+    elif float(comp_score) <= 45.0:
+        p = _downgrade(p, 1)
+        reasons.append("pre:weak_composite")
+
+    # Penalize uncertainty
+    if used_bias_fallback:
+        p = _downgrade(p, 1)
+        reasons.append("pre:bias_fallback")
+
+    # Penalize overextension (still can be valid, but less worth PASS2)
+    if ext.startswith("OVEREXTENDED"):
+        p = _downgrade(p, 1)
+        reasons.append("pre:overextended")
+
+    return _prio_norm(p), reasons
+
+
+def _final_grade(
+    *,
+    setup_type: str,
+    setup_variant: str,
+    rr: float,
+    gate: int,
+    ok_count: int,
+    inst_available: bool,
+    bos_quality_ok: bool,
+    used_bias_fallback: bool,
+    entry_type: str,
+    ext_sig: str,
+    unfavorable_market: bool,
+    mom: str,
+) -> Tuple[str, List[str]]:
+    """
+    Grade final A→E + reasons. (A meilleur)
+    """
+    reasons: List[str] = []
+    st = (setup_type or "").upper()
+    sv = (setup_variant or "").upper()
+    et = (entry_type or "").upper()
+    ext = (ext_sig or "").upper()
+    m = (mom or "").upper()
+
+    # Base from setup type
+    if st == "BOS_STRICT":
+        # Strongest path
+        if "RR_STRICT" in sv and int(gate) >= int(MIN_INST_SCORE) and bos_quality_ok:
+            p = "A"
+            reasons.append("setup:BOS_STRICT+RR_STRICT")
+        else:
+            p = "B"
+            reasons.append("setup:BOS_STRICT")
+    elif st in ("RAID_DISPLACEMENT", "LIQ_SWEEP"):
+        # Desk setups: good but usually below BOS strict
+        if int(gate) >= int(INST_SCORE_DESK_PRIORITY):
+            p = "B"
+            reasons.append(f"setup:{st}+inst_ok")
+        else:
+            p = "C"
+            reasons.append(f"setup:{st}")
+    elif st == "INST_CONTINUATION":
+        p = "C"
+        reasons.append("setup:INST_CONTINUATION")
+    else:
+        p = "D"
+        reasons.append("setup:OTHER")
+
+    # Facts
+    reasons.append(f"rr:{float(rr):.3f}")
+    reasons.append(f"inst_gate:{int(gate)} ok_count:{int(ok_count)}")
+    if bos_quality_ok:
+        reasons.append("bos_quality:ok")
+
+    # Risk / uncertainty downgrades
+    if not inst_available:
+        # Only possible if tech fallback is enabled; degrade because blind
+        p = _downgrade(p, 1)
+        reasons.append("downgrade:inst_unavailable")
+
+    if used_bias_fallback:
+        p = _downgrade(p, 1)
+        reasons.append("downgrade:bias_fallback")
+
+    if et == "MARKET":
+        p = _downgrade(p, 1)
+        reasons.append("downgrade:market_entry")
+
+    if unfavorable_market:
+        p = _downgrade(p, 1)
+        reasons.append("downgrade:premium_discount_veto_path")
+
+    if ext.startswith("OVEREXTENDED"):
+        p = _downgrade(p, 1)
+        reasons.append("downgrade:overextended")
+
+    # Positive bump (small)
+    if m in ("STRONG_BULLISH", "STRONG_BEARISH"):
+        p = _upgrade(p, 1)
+        reasons.append("upgrade:strong_momentum")
+
+    return _prio_norm(p), reasons
 
 
 # =====================================================================
@@ -181,7 +347,6 @@ def _round_sl_for_side(sl: float, entry: float, bias: str, tick: float) -> float
     if b == "LONG":
         sl_f = _floor_to_tick(sl_f, t)
         if sl_f >= entry_f:
-            # force minimal safe gap if something went wrong after liquidity adjustments
             gap = max((2.0 * t if t > 0 else 0.0), abs(entry_f) * 0.001)
             sl_f = _floor_to_tick(entry_f - gap, t)
         return float(sl_f)
@@ -223,13 +388,11 @@ def _composite_bias_fallback(score: float, label: str, mom: str) -> Optional[str
         lab = str(label or "").upper()
         m = str(mom or "").upper()
 
-        # hard momentum wins
         if m in ("STRONG_BULLISH", "BULLISH"):
             return "LONG"
         if m in ("STRONG_BEARISH", "BEARISH"):
             return "SHORT"
 
-        # composite
         if (s >= 58.0) or ("BULL" in lab and s >= 55.0):
             return "LONG"
         if (s <= 42.0) or ("BEAR" in lab and s <= 45.0):
@@ -706,7 +869,31 @@ class SignalAnalyzer:
                 return _reject("momentum_not_bearish", structure=struct)
 
         # ===============================================================
-        # 1) INSTITUTIONAL — 2-PASS (anti-ban) + Liquidations (re-enabled)
+        # PRE-PRIORITY (cheap) → controls PASS2 (settings.PASS2_ONLY_FOR_PRIORITY)
+        # ===============================================================
+        pre_priority, pre_priority_reasons = _pre_grade_candidate(
+            bos_flag=bos_flag,
+            raid_ok=raid_ok,
+            sweep_ok=sweep_ok,
+            mom=mom,
+            comp_score=comp_score,
+            used_bias_fallback=used_bias_fallback,
+            ext_sig=ext_sig,
+        )
+
+        pass2_allowed_by_priority = priority_at_least(pre_priority, PASS2_ONLY_FOR_PRIORITY)
+
+        LOGGER.info(
+            "[EVAL_PRE] %s PRE_PRIORITY=%s (min_for_pass2=%s) pass2_allowed=%s reasons=%s",
+            symbol,
+            pre_priority,
+            PASS2_ONLY_FOR_PRIORITY,
+            pass2_allowed_by_priority,
+            pre_priority_reasons,
+        )
+
+        # ===============================================================
+        # 1) INSTITUTIONAL — 2-PASS (anti-ban) + Liquidations
         # ===============================================================
         inst: Dict[str, Any]
 
@@ -749,18 +936,27 @@ class SignalAnalyzer:
                 LOGGER.warning("[INST_DOWN] %s tech_fallback_enabled", symbol)
             else:
                 LOGGER.info("[EVAL_REJECT] %s inst_unavailable", symbol)
-                return _reject("inst_unavailable", institutional=inst, structure=struct, momentum=mom, composite=comp)
+                return _reject(
+                    "inst_unavailable",
+                    institutional=inst,
+                    structure=struct,
+                    momentum=mom,
+                    composite=comp,
+                    pre_priority=pre_priority,
+                    pre_priority_reasons=pre_priority_reasons,
+                )
 
         # Pass2: only for “candidates” + liquidations ON here
         do_pass2 = bool(
             INST_PASS2_ENABLED
+            and pass2_allowed_by_priority
             and available
             and (binance_symbol is not None)
             and (int(gate) >= int(INST_PASS2_MIN_GATE) or bool(DESK_EV_MODE))
         )
 
         if do_pass2:
-            pass2_liq = bool(INST_ENABLE_LIQUIDATIONS)  # ✅ liquidations re-enabled here
+            pass2_liq = bool(INST_ENABLE_LIQUIDATIONS)  # ✅ liquidations ON here
             try:
                 inst2 = await compute_full_institutional_analysis(
                     symbol,
@@ -794,11 +990,32 @@ class SignalAnalyzer:
                     "[INST_RAW] %s pass=2 mode=%s liq_req=%s liq_ok=%s inst_score=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s",
                     symbol, mode_eff_2, pass2_liq, liq_eff_2, inst.get("institutional_score"), ok_count, gate, override, available, binance_symbol, bias
                 )
+        else:
+            LOGGER.info(
+                "[INST_RAW] %s pass=2 SKIP (enabled=%s allowed_by_priority=%s pre_priority=%s min_for_pass2=%s gate=%s min_gate=%s desk=%s available=%s)",
+                symbol,
+                INST_PASS2_ENABLED,
+                pass2_allowed_by_priority,
+                pre_priority,
+                PASS2_ONLY_FOR_PRIORITY,
+                gate,
+                INST_PASS2_MIN_GATE,
+                DESK_EV_MODE,
+                available,
+            )
 
         # Hard gate (if inst up)
         if (not ALLOW_TECH_FALLBACK_WHEN_INST_DOWN) and int(gate) < int(MIN_INST_SCORE):
             LOGGER.info("[EVAL_REJECT] %s inst_gate_low gate=%s < %s", symbol, gate, MIN_INST_SCORE)
-            return _reject("inst_gate_low", institutional=inst, structure=struct, inst_gate=int(gate), ok_count=int(ok_count))
+            return _reject(
+                "inst_gate_low",
+                institutional=inst,
+                structure=struct,
+                inst_gate=int(gate),
+                ok_count=int(ok_count),
+                pre_priority=pre_priority,
+                pre_priority_reasons=pre_priority_reasons,
+            )
 
         # ===============================================================
         # 2) STRUCTURE / QUALITY / ENTRY / EXITS
@@ -822,7 +1039,14 @@ class SignalAnalyzer:
 
         if REQUIRE_BOS_QUALITY and not bos_quality_ok:
             LOGGER.info("[EVAL_REJECT] %s bos_quality_low", symbol)
-            return _reject("bos_quality_low", institutional=inst, structure=struct, bos_quality=bos_q)
+            return _reject(
+                "bos_quality_low",
+                institutional=inst,
+                structure=struct,
+                bos_quality=bos_q,
+                pre_priority=pre_priority,
+                pre_priority_reasons=pre_priority_reasons,
+            )
 
         premium, discount = compute_premium_discount(df_h1)
         LOGGER.info("[EVAL_PRE] %s PREMIUM=%s DISCOUNT=%s", symbol, premium, discount)
@@ -850,27 +1074,69 @@ class SignalAnalyzer:
         if ext_sig == "OVEREXTENDED_LONG" and bias == "LONG":
             if entry_type == "MARKET":
                 LOGGER.info("[EVAL_REJECT] %s overextended_long_market", symbol)
-                return _reject("overextended_long_market", institutional=inst, structure=struct, entry_pick=entry_pick)
+                return _reject(
+                    "overextended_long_market",
+                    institutional=inst,
+                    structure=struct,
+                    entry_pick=entry_pick,
+                    pre_priority=pre_priority,
+                    pre_priority_reasons=pre_priority_reasons,
+                )
             if not _entry_pullback_ok(entry, entry_mkt, bias, atr14):
                 LOGGER.info("[EVAL_REJECT] %s overextended_long_no_pullback", symbol)
-                return _reject("overextended_long_no_pullback", institutional=inst, structure=struct, entry_pick=entry_pick)
+                return _reject(
+                    "overextended_long_no_pullback",
+                    institutional=inst,
+                    structure=struct,
+                    entry_pick=entry_pick,
+                    pre_priority=pre_priority,
+                    pre_priority_reasons=pre_priority_reasons,
+                )
 
         if ext_sig == "OVEREXTENDED_SHORT" and bias == "SHORT":
             if entry_type == "MARKET":
                 LOGGER.info("[EVAL_REJECT] %s overextended_short_market", symbol)
-                return _reject("overextended_short_market", institutional=inst, structure=struct, entry_pick=entry_pick)
+                return _reject(
+                    "overextended_short_market",
+                    institutional=inst,
+                    structure=struct,
+                    entry_pick=entry_pick,
+                    pre_priority=pre_priority,
+                    pre_priority_reasons=pre_priority_reasons,
+                )
             if not _entry_pullback_ok(entry, entry_mkt, bias, atr14):
                 LOGGER.info("[EVAL_REJECT] %s overextended_short_no_pullback", symbol)
-                return _reject("overextended_short_no_pullback", institutional=inst, structure=struct, entry_pick=entry_pick)
+                return _reject(
+                    "overextended_short_no_pullback",
+                    institutional=inst,
+                    structure=struct,
+                    entry_pick=entry_pick,
+                    pre_priority=pre_priority,
+                    pre_priority_reasons=pre_priority_reasons,
+                )
 
         unfavorable_market = bool(entry_type == "MARKET" and ((bias == "LONG" and premium) or (bias == "SHORT" and discount)))
         if unfavorable_market and (not DESK_EV_MODE):
             if bias == "LONG" and premium:
                 LOGGER.info("[EVAL_REJECT] %s long_in_premium_market", symbol)
-                return _reject("long_in_premium_market", institutional=inst, structure=struct, entry_pick=entry_pick)
+                return _reject(
+                    "long_in_premium_market",
+                    institutional=inst,
+                    structure=struct,
+                    entry_pick=entry_pick,
+                    pre_priority=pre_priority,
+                    pre_priority_reasons=pre_priority_reasons,
+                )
             if bias == "SHORT" and discount:
                 LOGGER.info("[EVAL_REJECT] %s short_in_discount_market", symbol)
-                return _reject("short_in_discount_market", institutional=inst, structure=struct, entry_pick=entry_pick)
+                return _reject(
+                    "short_in_discount_market",
+                    institutional=inst,
+                    structure=struct,
+                    entry_pick=entry_pick,
+                    pre_priority=pre_priority,
+                    pre_priority_reasons=pre_priority_reasons,
+                )
 
         # --------------------------
         # Exits (policy-aware SL v3)
@@ -893,7 +1159,7 @@ class SignalAnalyzer:
             tick=tick,
             setup=setup_hint,
             entry_type=entry_type,
-            htf_df=df_h4,  # enables optional HTF swing/liq candidates in stops.py v3
+            htf_df=df_h4,
         )
 
         sl = float(exits["sl"])
@@ -966,9 +1232,15 @@ class SignalAnalyzer:
 
         if sl <= 0:
             LOGGER.info("[EVAL_REJECT] %s sl_invalid_after_liq_adj sl=%s", symbol, sl)
-            return _reject("sl_invalid_after_liq_adj", institutional=inst, structure=struct)
+            return _reject(
+                "sl_invalid_after_liq_adj",
+                institutional=inst,
+                structure=struct,
+                pre_priority=pre_priority,
+                pre_priority_reasons=pre_priority_reasons,
+            )
 
-        # ✅ IMPORTANT: recalc TP1 after SL adjustments (keeps RR logic consistent)
+        # ✅ recalc TP1 after SL adjustments (keeps RR logic consistent)
         try:
             tp1, _rr_used2 = compute_tp1(entry, sl, bias, df=df_h1, tick=tick)
             tp1 = float(tp1)
@@ -989,7 +1261,14 @@ class SignalAnalyzer:
 
         if rr is None or rr <= 0:
             LOGGER.info("[EVAL_REJECT] %s rr_invalid", symbol)
-            return _reject("rr_invalid", institutional=inst, structure=struct, entry_pick=entry_pick)
+            return _reject(
+                "rr_invalid",
+                institutional=inst,
+                structure=struct,
+                entry_pick=entry_pick,
+                pre_priority=pre_priority,
+                pre_priority_reasons=pre_priority_reasons,
+            )
 
         # ===============================================================
         # SETUPS
@@ -1010,6 +1289,20 @@ class SignalAnalyzer:
                 bos_variant = "RR_RELAX_WITH_INST"
 
         if bos_ok:
+            priority, priority_reasons = _final_grade(
+                setup_type="BOS_STRICT",
+                setup_variant=bos_variant,
+                rr=float(rr),
+                gate=int(gate),
+                ok_count=int(ok_count),
+                inst_available=bool(available),
+                bos_quality_ok=bool(bos_quality_ok),
+                used_bias_fallback=bool(used_bias_fallback),
+                entry_type=str(entry_type),
+                ext_sig=str(ext_sig),
+                unfavorable_market=bool(unfavorable_market),
+                mom=str(mom),
+            )
             return {
                 "valid": True,
                 "symbol": symbol,
@@ -1024,6 +1317,11 @@ class SignalAnalyzer:
                 "qty": 1,
                 "setup_type": "BOS_STRICT",
                 "setup_variant": bos_variant,
+                "priority": priority,
+                "priority_reasons": priority_reasons,
+                "pre_priority": pre_priority,
+                "pre_priority_reasons": pre_priority_reasons,
+                "pass2_done": bool(do_pass2),
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
@@ -1042,6 +1340,21 @@ class SignalAnalyzer:
 
         # 2) RAID_DISPLACEMENT (desk)
         if DESK_EV_MODE and can_raid and float(rr) >= float(RR_MIN_DESK_PRIORITY):
+            variant = str((struct.get("raid_displacement") or {}).get("note") or "raid_ok")
+            priority, priority_reasons = _final_grade(
+                setup_type="RAID_DISPLACEMENT",
+                setup_variant=variant,
+                rr=float(rr),
+                gate=int(gate),
+                ok_count=int(ok_count),
+                inst_available=bool(available),
+                bos_quality_ok=bool(bos_quality_ok),
+                used_bias_fallback=bool(used_bias_fallback),
+                entry_type=str(entry_type),
+                ext_sig=str(ext_sig),
+                unfavorable_market=bool(unfavorable_market),
+                mom=str(mom),
+            )
             return {
                 "valid": True,
                 "symbol": symbol,
@@ -1055,7 +1368,12 @@ class SignalAnalyzer:
                 "rr": float(rr),
                 "qty": 1,
                 "setup_type": "RAID_DISPLACEMENT",
-                "setup_variant": str((struct.get("raid_displacement") or {}).get("note") or "raid_ok"),
+                "setup_variant": variant,
+                "priority": priority,
+                "priority_reasons": priority_reasons,
+                "pre_priority": pre_priority,
+                "pre_priority_reasons": pre_priority_reasons,
+                "pass2_done": bool(do_pass2),
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
@@ -1075,6 +1393,21 @@ class SignalAnalyzer:
 
         # 3) LIQ_SWEEP (desk)
         if DESK_EV_MODE and can_sweep and float(rr) >= float(RR_MIN_DESK_PRIORITY):
+            variant = str(liq_sweep.get("kind") if isinstance(liq_sweep, dict) else "liq_ok")
+            priority, priority_reasons = _final_grade(
+                setup_type="LIQ_SWEEP",
+                setup_variant=variant,
+                rr=float(rr),
+                gate=int(gate),
+                ok_count=int(ok_count),
+                inst_available=bool(available),
+                bos_quality_ok=bool(bos_quality_ok),
+                used_bias_fallback=bool(used_bias_fallback),
+                entry_type=str(entry_type),
+                ext_sig=str(ext_sig),
+                unfavorable_market=bool(unfavorable_market),
+                mom=str(mom),
+            )
             return {
                 "valid": True,
                 "symbol": symbol,
@@ -1088,7 +1421,12 @@ class SignalAnalyzer:
                 "rr": float(rr),
                 "qty": 1,
                 "setup_type": "LIQ_SWEEP",
-                "setup_variant": str(liq_sweep.get("kind") if isinstance(liq_sweep, dict) else "liq_ok"),
+                "setup_variant": variant,
+                "priority": priority,
+                "priority_reasons": priority_reasons,
+                "pre_priority": pre_priority,
+                "pre_priority_reasons": pre_priority_reasons,
+                "pass2_done": bool(do_pass2),
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
@@ -1113,6 +1451,20 @@ class SignalAnalyzer:
             good_comp = _composite_bias_ok(bias, comp_score, comp_label, thr=65.0)
 
             if good_inst and good_rr and good_comp:
+                priority, priority_reasons = _final_grade(
+                    setup_type="INST_CONTINUATION",
+                    setup_variant="INST_CONTINUATION",
+                    rr=float(rr),
+                    gate=int(gate),
+                    ok_count=int(ok_count),
+                    inst_available=bool(available),
+                    bos_quality_ok=bool(bos_quality_ok),
+                    used_bias_fallback=bool(used_bias_fallback),
+                    entry_type=str(entry_type),
+                    ext_sig=str(ext_sig),
+                    unfavorable_market=bool(unfavorable_market),
+                    mom=str(mom),
+                )
                 return {
                     "valid": True,
                     "symbol": symbol,
@@ -1127,6 +1479,11 @@ class SignalAnalyzer:
                     "qty": 1,
                     "setup_type": "INST_CONTINUATION",
                     "setup_variant": "INST_CONTINUATION",
+                    "priority": priority,
+                    "priority_reasons": priority_reasons,
+                    "pre_priority": pre_priority,
+                    "pre_priority_reasons": pre_priority_reasons,
+                    "pass2_done": bool(do_pass2),
                     "structure": struct,
                     "bos_quality": bos_q,
                     "institutional": inst,
@@ -1158,4 +1515,6 @@ class SignalAnalyzer:
             "composite_score": comp_score,
             "composite_label": comp_label,
             "sl_meta": sl_meta_out,
+            "pre_priority": pre_priority,
+            "pre_priority_reasons": pre_priority_reasons,
         }
