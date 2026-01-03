@@ -6,6 +6,10 @@
 # ✅ Macro/options fetch independent (works if only one is available)
 # ✅ Pending persistence includes options fields
 # ✅ Watcher fix stays (no immediate cancel after ENTRY_OK etc.)
+# ✅ NEW: Deep pullback policy (OTE_PULLBACK):
+#    - Dedicated TTL (ENTRY_TTL_OTE_PULLBACK_S)
+#    - Runaway cancel disabled when entry is "deep" vs ref_price_at_signal (>= DEEP_PULLBACK_ATR_THRESHOLD * ATR)
+#    - Prevents cancelling a BOS_STRICT pullback just because price ran first
 # =====================================================================
 
 from __future__ import annotations
@@ -89,16 +93,34 @@ MAX_CONCURRENT_ANALYZE = 6  # limite Binance/institutional
 TP1_CLOSE_PCT = 0.50
 WATCH_INTERVAL_S = 3.0
 
-# Entry watcher policy
+# =====================================================================
+# Entry watcher policy — TTL / runaway / invalidations
+# =====================================================================
+
+# TTLs (seconds)
 ENTRY_TTL_MARKET_S = int(os.getenv("ENTRY_TTL_MARKET_S", "300"))
 ENTRY_TTL_OTE_S = int(os.getenv("ENTRY_TTL_OTE_S", "3600"))
 ENTRY_TTL_FVG_S = int(os.getenv("ENTRY_TTL_FVG_S", "2700"))
 ENTRY_TTL_RAID_S = int(os.getenv("ENTRY_TTL_RAID_S", "1800"))
 ENTRY_TTL_DEFAULT_S = int(os.getenv("ENTRY_TTL_DEFAULT_S", "1800"))
 
-# Run-away cancel
+# ✅ NEW: dedicated TTL for OTE_PULLBACK (default 1800s)
+# If not provided, falls back to ENTRY_TTL_OTE_S.
+ENTRY_TTL_OTE_PULLBACK_S = int(os.getenv("ENTRY_TTL_OTE_PULLBACK_S", str(max(900, ENTRY_TTL_OTE_S // 2))))
+
+# Run-away cancel knobs (legacy)
 RUNAWAY_ATR_MULT_MARKET = float(os.getenv("RUNAWAY_ATR_MULT_MARKET", "1.0"))
 RUNAWAY_ATR_MULT_PULLBACK = float(os.getenv("RUNAWAY_ATR_MULT_PULLBACK", "1.5"))
+
+# ✅ NEW runaway policy flags
+RUNAWAY_ENABLE = str(os.getenv("RUNAWAY_ENABLE", "1")).strip() == "1"
+
+# If you want separate multipliers:
+RUNAWAY_ATR_MULT_NEAR = float(os.getenv("RUNAWAY_ATR_MULT_NEAR", str(RUNAWAY_ATR_MULT_PULLBACK)))
+RUNAWAY_ATR_MULT_DEEP = float(os.getenv("RUNAWAY_ATR_MULT_DEEP", "3.0"))
+
+# Deep pullback definition: abs(ref_price_at_signal - entry) >= threshold * ATR
+DEEP_PULLBACK_ATR_THRESHOLD = float(os.getenv("DEEP_PULLBACK_ATR_THRESHOLD", "2.0"))
 
 # grace periods so it never cancels immediately
 RUNAWAY_GRACE_S_MARKET = int(os.getenv("RUNAWAY_GRACE_S_MARKET", "30"))
@@ -254,6 +276,7 @@ def _pending_serializable(state: Dict[str, Any]) -> Dict[str, Any]:
         # needed for TTL/runaway/invalidation after restart
         "atr",
         "pd_mid",
+        "ref_price_at_signal",   # ✅ NEW: deep pullback reference (entry_mkt at signal time)
         "last_price_ts",
         "last_price",
         "last_heavy_ts",
@@ -653,27 +676,36 @@ def _pd_mid(df: pd.DataFrame, lookback: int = 80) -> float:
         return 0.0
 
 
+def _is_market_entry(entry_type: str) -> bool:
+    return "MARKET" in str(entry_type or "").upper()
+
+
+def _is_ote_pullback(entry_type: str) -> bool:
+    return "OTE_PULLBACK" in str(entry_type or "").upper()
+
+
 def _entry_ttl_s(entry_type: str, setup: str) -> int:
     et = str(entry_type or "").upper()
     sp = str(setup or "").upper()
+
     if "MARKET" in et:
         return int(ENTRY_TTL_MARKET_S)
-    if "OTE" in sp:
+
+    # ✅ Dedicated TTL for OTE_PULLBACK
+    if "OTE_PULLBACK" in et:
+        return int(ENTRY_TTL_OTE_PULLBACK_S)
+
+    # OTE can be detected by setup suffix or entry_type
+    if ("OTE" in et) or ("OTE" in sp):
         return int(ENTRY_TTL_OTE_S)
-    if "FVG" in sp:
+
+    if "FVG" in sp or "FVG" in et:
         return int(ENTRY_TTL_FVG_S)
-    if "RAID" in sp or "SWEEP" in sp:
+
+    if ("RAID" in sp) or ("SWEEP" in sp) or ("RAID" in et):
         return int(ENTRY_TTL_RAID_S)
+
     return int(ENTRY_TTL_DEFAULT_S)
-
-
-def _runaway_mult(entry_type: str) -> float:
-    et = str(entry_type or "").upper()
-    return float(RUNAWAY_ATR_MULT_MARKET if "MARKET" in et else RUNAWAY_ATR_MULT_PULLBACK)
-
-
-def _is_market_entry(entry_type: str) -> bool:
-    return "MARKET" in str(entry_type or "").upper()
 
 
 def _runaway_grace_s(entry_type: str) -> int:
@@ -682,6 +714,33 @@ def _runaway_grace_s(entry_type: str) -> int:
 
 def _heavy_grace_s(entry_type: str) -> int:
     return int(HEAVY_GRACE_S_MARKET if _is_market_entry(entry_type) else HEAVY_GRACE_S_PULLBACK)
+
+
+def _deep_pullback(entry: float, ref_price: float, atr: float) -> bool:
+    """
+    Deep pullback if distance between entry and ref_price_at_signal is big vs ATR.
+    Used to disable runaway cancel for OTE_PULLBACK-type entries.
+    """
+    try:
+        entry = float(entry)
+        ref_price = float(ref_price)
+        atr = float(atr)
+        if atr <= 0 or (not math.isfinite(atr)):
+            return False
+        if entry <= 0 or ref_price <= 0:
+            return False
+        d = abs(ref_price - entry)
+        return d >= float(DEEP_PULLBACK_ATR_THRESHOLD) * atr
+    except Exception:
+        return False
+
+
+def _runaway_mult(entry_type: str, deep: bool) -> float:
+    et = str(entry_type or "").upper()
+    if "MARKET" in et:
+        return float(RUNAWAY_ATR_MULT_MARKET)
+    # pullbacks:
+    return float(RUNAWAY_ATR_MULT_DEEP if deep else RUNAWAY_ATR_MULT_NEAR)
 
 
 # =====================================================================
@@ -1151,6 +1210,10 @@ async def analyze_symbol(
         atr14 = _calc_atr14(df_h1, 14)
         mid_pd = _pd_mid(df_h1, 80)
 
+        # ✅ NEW: reference price at signal time (for deep pullback detection in watcher)
+        entry_pick = result.get("entry_pick") if isinstance(result.get("entry_pick"), dict) else {}
+        ref_price_at_signal = _safe_float(entry_pick.get("entry_mkt"), 0.0)
+
         fp_alert = make_fingerprint(
             sym, side, q_entry_fp, q_sl_fp, q_tp1_fp,
             extra=f"{setup}|{entry_type}|{pos_mode}",
@@ -1177,6 +1240,7 @@ async def analyze_symbol(
             "analyze_ms": analyze_ms,
             "atr": float(atr14),
             "pd_mid": float(mid_pd),
+            "ref_price_at_signal": float(ref_price_at_signal),  # ✅ NEW
             "options": opt_ctx,
             "opt_regime": opt_regime,
             "opt_score": opt_score,
@@ -1460,6 +1524,7 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
             "q_sl": None,
             "atr": float(candidate.get("atr") or 0.0),
             "pd_mid": float(candidate.get("pd_mid") or 0.0),
+            "ref_price_at_signal": float(candidate.get("ref_price_at_signal") or 0.0),  # ✅ NEW
             "last_price_ts": 0.0,
             "last_price": 0.0,
             "last_heavy_ts": 0.0,
@@ -1612,6 +1677,14 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         if tick_used <= 0:
                             tick_used = _estimate_tick_from_price(entry)
 
+                        # ✅ Deep pullback detection uses ref_price_at_signal (preferred), then pd_mid, then entry.
+                        ref_px = float(st.get("ref_price_at_signal") or 0.0) or float(st.get("pd_mid") or 0.0) or float(entry)
+                        deep = _deep_pullback(entry=float(entry), ref_price=float(ref_px), atr=float(atr))
+                        # Persist (debug)
+                        if st.get("deep_pullback") != deep:
+                            st["deep_pullback"] = bool(deep)
+                            dirty = True
+
                         last_price_ts = float(st.get("last_price_ts") or 0.0)
                         last_price = float(st.get("last_price") or 0.0)
                         if (now - last_price_ts) >= float(PRICE_CHECK_INTERVAL_S) or last_price <= 0:
@@ -1638,62 +1711,75 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                                     touch_buf = max(float(RUNAWAY_TOUCH_ATR) * atr, float(RUNAWAY_TOUCH_TICKS) * tick_used)
                                 else:
                                     touch_buf = float(RUNAWAY_TOUCH_TICKS) * tick_used
+
                                 if entry > 0 and abs(last_price - entry) <= touch_buf:
                                     touched = True
                                 st["pullback_touched"] = bool(touched)
                                 dirty = True
 
                         # Evaluate runaway only after grace
-                        if entry > 0 and last_price > 0:
+                        if RUNAWAY_ENABLE and entry > 0 and last_price > 0:
                             grace_s = int(_runaway_grace_s(entry_type))
                             if age >= float(grace_s):
-                                mult = float(_runaway_mult(entry_type))
-                                dist_atr = (mult * atr) if atr > 0 else 0.0
-                                dist_min = float(RUNAWAY_MIN_TICKS) * tick_used
-                                runaway_dist = max(dist_atr, dist_min)
-
                                 is_market = _is_market_entry(entry_type)
                                 touched = bool(st.get("pullback_touched", False))
 
-                                if str(direction).upper() == "LONG":
-                                    runaway = last_price >= (entry + runaway_dist)
-                                    if runaway and (is_market or (not touched)):
-                                        await _cancel_pending_entry(
-                                            trader, tid, st,
-                                            reason="runaway_up",
-                                            age_s=int(age),
-                                            grace_s=int(grace_s),
-                                            last=float(last_price),
-                                            entry=float(entry),
-                                            atr=float(atr),
-                                            mult=float(mult),
-                                            runaway_dist=float(runaway_dist),
-                                            touched=str(touched),
-                                            entry_type=entry_type,
-                                            setup=setup,
-                                        )
-                                        dirty = True
-                                        continue
+                                # ✅ Key fix:
+                                # - If this is a deep pullback (typical OTE_PULLBACK far from signal price),
+                                #   we DO NOT runaway-cancel. TTL handles it.
+                                runaway_allowed = True
+                                if (not is_market) and deep:
+                                    runaway_allowed = False
 
-                                if str(direction).upper() == "SHORT":
-                                    runaway = last_price <= (entry - runaway_dist)
-                                    if runaway and (is_market or (not touched)):
-                                        await _cancel_pending_entry(
-                                            trader, tid, st,
-                                            reason="runaway_down",
-                                            age_s=int(age),
-                                            grace_s=int(grace_s),
-                                            last=float(last_price),
-                                            entry=float(entry),
-                                            atr=float(atr),
-                                            mult=float(mult),
-                                            runaway_dist=float(runaway_dist),
-                                            touched=str(touched),
-                                            entry_type=entry_type,
-                                            setup=setup,
-                                        )
-                                        dirty = True
-                                        continue
+                                if runaway_allowed:
+                                    mult = float(_runaway_mult(entry_type, deep=deep))
+                                    dist_atr = (mult * atr) if atr > 0 else 0.0
+                                    dist_min = float(RUNAWAY_MIN_TICKS) * tick_used
+                                    runaway_dist = max(dist_atr, dist_min)
+
+                                    if str(direction).upper() == "LONG":
+                                        runaway = last_price >= (entry + runaway_dist)
+                                        if runaway and (is_market or (not touched)):
+                                            await _cancel_pending_entry(
+                                                trader, tid, st,
+                                                reason="runaway_up",
+                                                age_s=int(age),
+                                                grace_s=int(grace_s),
+                                                last=float(last_price),
+                                                entry=float(entry),
+                                                atr=float(atr),
+                                                mult=float(mult),
+                                                runaway_dist=float(runaway_dist),
+                                                touched=str(touched),
+                                                deep_pullback=str(deep),
+                                                ref_px=float(ref_px),
+                                                entry_type=entry_type,
+                                                setup=setup,
+                                            )
+                                            dirty = True
+                                            continue
+
+                                    if str(direction).upper() == "SHORT":
+                                        runaway = last_price <= (entry - runaway_dist)
+                                        if runaway and (is_market or (not touched)):
+                                            await _cancel_pending_entry(
+                                                trader, tid, st,
+                                                reason="runaway_down",
+                                                age_s=int(age),
+                                                grace_s=int(grace_s),
+                                                last=float(last_price),
+                                                entry=float(entry),
+                                                atr=float(atr),
+                                                mult=float(mult),
+                                                runaway_dist=float(runaway_dist),
+                                                touched=str(touched),
+                                                deep_pullback=str(deep),
+                                                ref_px=float(ref_px),
+                                                entry_type=entry_type,
+                                                setup=setup,
+                                            )
+                                            dirty = True
+                                            continue
 
                         # 3) Invalidation check (heavy, throttled) with grace
                         heavy_grace = int(_heavy_grace_s(entry_type))
@@ -1764,6 +1850,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     req_qty = _q_qty_ceil((min_usdt / max(q_tp1, 1e-12)), qty_step)
                     if min_qty > 0:
                         req_qty = max(req_qty, min_qty)
+                    req_qty = min(req_qty, qty_total)
                     qty_tp1 = max(base_tp1, req_qty)
                     qty_tp1 = min(qty_tp1, qty_total)
 
