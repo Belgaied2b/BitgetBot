@@ -9,15 +9,13 @@
 # ✅ Tilt cooldown + daily loss hard stop
 # ✅ Snapshot for logs/monitoring
 #
-# Important integration change (scanner recommended):
-#   - Call can_trade(...) -> if allowed, it returns a reservation_id
-#   - If order fails => cancel_reservation(reservation_id)
-#   - If order sent OK => confirm_open(reservation_id, symbol, side, notional, risk)
-#   - When position closes => register_closed(...)
-#
-# Backward compatible:
-#   - can_trade(...) still returns (allowed, reason) if you don't use reservation
-#     but you should upgrade scanner to use reservation for accuracy.
+# NEW (non-breaking):
+# ✅ Reservation TTL cleanup (stale reservations won't block exposure forever)
+# ✅ Partial fills support (confirm_open filled_notional/filled_risk + apply_fill)
+# ✅ Time-stop helpers (scanner can query due positions)
+# ✅ Optional volatility-targeted risk sizing (if you pass volatility_atr_pct)
+# ✅ Net RR helper (compute_rr_net) + rr_net support in gating when provided
+# ✅ Safety fix: forbid opening a new position on a symbol that already has one
 # =====================================================================
 
 from __future__ import annotations
@@ -27,7 +25,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List
 
 from settings import (
     RISK_USDT,
@@ -77,6 +75,23 @@ class RiskConfig:
     max_gross_exposure: float = float(MAX_GROSS_EXPOSURE)     # e.g. 2.0 => 2x equity notional
     max_symbol_exposure: float = float(MAX_SYMBOL_EXPOSURE)   # e.g. 0.25 => 25% equity per symbol
 
+    # reservations: prevent stuck exposure if order flow never confirms
+    reservation_ttl_seconds: int = 6 * 60  # 6 minutes
+
+    # time-stop helper (scanner decides how to close)
+    max_position_age_seconds: int = 12 * 60 * 60  # 12h
+
+    # optional volatility targeting:
+    # if you pass volatility_atr_pct (ATR/price), risk can be scaled.
+    # Example: volatility_atr_pct=0.01 means 1% ATR.
+    use_volatility_targeting: bool = False
+    target_atr_pct: float = 0.010  # 1%
+    vol_risk_min_factor: float = 0.35
+    vol_risk_max_factor: float = 1.25
+
+    # daily reset mode (keeps current default behavior: localtime)
+    day_reset_use_utc: bool = False
+
 
 # =====================================================================
 # INTERNAL STATE
@@ -97,6 +112,9 @@ class PositionState:
     notional: float
     risk: float
     opened_at: float = field(default_factory=lambda: time.time())
+    # for partial fill tracking
+    filled_notional: float = 0.0
+    avg_entry: Optional[float] = None  # optional, if you want to store it later
 
 
 @dataclass
@@ -122,7 +140,7 @@ class RiskManager:
       if not allowed: return
       send order...
       if fail: await rm.cancel_reservation(rid)
-      if ok:   await rm.confirm_open(rid)
+      if ok:   await rm.confirm_open(rid, filled_notional=..., filled_risk=...)
 
     Backward compatible:
       allowed, reason = rm.can_trade(...)
@@ -155,7 +173,23 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def _current_date_key(self) -> str:
+        if bool(self.config.day_reset_use_utc):
+            return time.strftime("%Y-%m-%d", time.gmtime())
         return time.strftime("%Y-%m-%d", time.localtime())
+
+    def _purge_expired_reservations_nolock(self) -> None:
+        """
+        Prevent stale reservations from blocking exposure caps forever.
+        """
+        try:
+            ttl = int(max(30, self.config.reservation_ttl_seconds))
+            now = time.time()
+            expired = [rid for rid, r in self._reservations.items() if (now - float(r.created_at)) >= ttl]
+            for rid in expired:
+                self._reservations.pop(rid, None)
+        except Exception:
+            # never break risk flow
+            return
 
     def _ensure_daily_state(self) -> None:
         today = self._current_date_key()
@@ -163,10 +197,10 @@ class RiskManager:
             self._daily = DailyState(date_key=today)
             self._tilt_active = False
             self._tilt_activated_at = 0.0
-
-            # daily reset does NOT auto-close open positions (runtime memory);
-            # but it clears reservations to avoid stuck state after restarts.
+            # do not auto-close open positions; clear reservations to avoid stuck state
             self._reservations.clear()
+        # also keep the reservation map clean in runtime
+        self._purge_expired_reservations_nolock()
 
     def _daily_loss(self) -> float:
         self._ensure_daily_state()
@@ -251,8 +285,10 @@ class RiskManager:
         if s == "SHORT" and self.direction_counts.get("SHORT", 0) >= self.config.max_short_positions:
             return False, "max_short_exposure"
 
-        if sym in self.open_positions and self.open_positions[sym].side == s:
-            return False, "position_already_open_same_side"
+        # SAFETY FIX:
+        # with open_positions keyed by symbol, allowing opposite-side opens would overwrite state.
+        if sym in self.open_positions:
+            return False, "position_already_open_symbol"
 
         return True, "OK"
 
@@ -265,8 +301,8 @@ class RiskManager:
         Legacy API: returns (allowed, reason).
         This DOES NOT reserve. Prefer reserve_trade() in scanner for accuracy.
         """
-        symbol, side, notional, rr, inst_score, commitment = self._extract_args(args, kwargs)
-        allowed, reason = self._can_trade_core(symbol, side, notional, rr, inst_score, commitment)
+        extracted = self._extract_args(args, kwargs)
+        allowed, reason = self._can_trade_core(**extracted)
         if not allowed:
             return False, reason
         return True, "OK"
@@ -282,21 +318,36 @@ class RiskManager:
         side: str,
         notional: float,
         rr: Optional[float] = None,
+        rr_net: Optional[float] = None,
         inst_score: Optional[int] = None,
         commitment: Optional[float] = None,
+        volatility_atr_pct: Optional[float] = None,
+        **_extra: Any,
     ) -> Tuple[bool, str, Optional[str]]:
         """
         Returns (allowed, reason, reservation_id).
         If allowed, reserves exposure immediately (prevents overfill in concurrent scan tasks).
+
+        Pass volatility_atr_pct if you want volatility targeting.
+        Pass rr_net if you computed net RR (fees/funding/slippage).
         """
         async with self._lock:
             self._ensure_daily_state()
 
-            allowed, reason = self._can_trade_core(symbol, side, notional, rr, inst_score, commitment)
+            allowed, reason = self._can_trade_core(
+                symbol=symbol,
+                side=side,
+                notional=notional,
+                rr=rr,
+                rr_net=rr_net,
+                inst_score=inst_score,
+                commitment=commitment,
+                volatility_atr_pct=volatility_atr_pct,
+            )
             if not allowed:
                 return False, reason, None
 
-            risk_used = self.risk_for_this_trade()
+            risk_used = self.risk_for_this_trade(volatility_atr_pct=volatility_atr_pct)
 
             rid = uuid.uuid4().hex[:12]
             sym = (symbol or "UNKNOWN").upper()
@@ -318,28 +369,110 @@ class RiskManager:
         async with self._lock:
             self._reservations.pop(str(rid), None)
 
-    async def confirm_open(self, rid: str) -> None:
+    async def confirm_open(
+        self,
+        rid: str,
+        *,
+        filled_notional: Optional[float] = None,
+        filled_risk: Optional[float] = None,
+        avg_entry: Optional[float] = None,
+        **_extra: Any,
+    ) -> None:
         """
         Turns reservation into an open position and increments daily trades.
+        Supports partial fills:
+          - filled_notional: if None, uses reserved notional
+          - filled_risk: if None, uses reserved risk
         """
         async with self._lock:
             self._ensure_daily_state()
             r = self._reservations.pop(str(rid), None)
             if not r:
                 return
-            self._register_open_nolock(r.symbol, r.side, r.notional, r.risk)
+
+            notional = float(filled_notional) if (filled_notional is not None) else float(r.notional)
+            risk = float(filled_risk) if (filled_risk is not None) else float(r.risk)
+
+            # If filled is 0 => treat as no position opened (avoid polluting state)
+            if notional <= 0:
+                return
+
+            self._register_open_nolock(r.symbol, r.side, notional, risk, filled_notional=notional, avg_entry=avg_entry)
+
+    async def apply_fill(
+        self,
+        symbol: str,
+        side: str,
+        *,
+        fill_notional_delta: float,
+        risk_delta: float = 0.0,
+        avg_entry: Optional[float] = None,
+    ) -> None:
+        """
+        Apply incremental fills to an already-open position (partial fills / adds).
+        This does NOT bypass exposure gates; scanner should reserve/confirm for adds.
+
+        - fill_notional_delta can be positive (more filled) or negative (reduce)
+        """
+        async with self._lock:
+            self._ensure_daily_state()
+            sym = (symbol or "UNKNOWN").upper()
+            s = self._norm_side(side)
+            p = self.open_positions.get(sym)
+            if not p:
+                return
+            if p.side != s:
+                return
+
+            p.notional = float(max(0.0, p.notional + float(fill_notional_delta)))
+            p.risk = float(max(0.0, p.risk + float(risk_delta)))
+            p.filled_notional = float(max(0.0, p.filled_notional + float(fill_notional_delta)))
+            if avg_entry is not None:
+                p.avg_entry = float(avg_entry)
+
+            # If position is effectively gone
+            if p.notional <= 0.0:
+                self.open_positions.pop(sym, None)
+                self.direction_counts[s] = max(0, self.direction_counts.get(s, 0) - 1)
 
     # ------------------------------------------------------------------
     # Risk sizing
     # ------------------------------------------------------------------
 
-    def risk_for_this_trade(self) -> float:
+    def risk_for_this_trade(self, *, volatility_atr_pct: Optional[float] = None) -> float:
+        """
+        Base risk sizing with optional drawdown reduction + optional volatility targeting.
+
+        Volatility targeting requires passing volatility_atr_pct (ATR/price).
+        If not passed, this returns baseline risk (with drawdown reducer only).
+        """
         self._ensure_daily_state()
         base = float(self.config.risk_per_trade)
+
+        # drawdown reducer
         dloss = self._daily_loss()
         if dloss < -2.0 * base:
-            return float(base * self.config.drawdown_risk_factor)
-        return base
+            base = float(base * self.config.drawdown_risk_factor)
+
+        # optional volatility targeting
+        if not self.config.use_volatility_targeting:
+            return float(base)
+
+        v = None
+        try:
+            if volatility_atr_pct is not None:
+                v = float(volatility_atr_pct)
+        except Exception:
+            v = None
+
+        if v is None or v <= 0:
+            return float(base)
+
+        tgt = float(max(1e-9, self.config.target_atr_pct))
+        # scale risk inversely to volatility
+        factor = tgt / v
+        factor = float(max(self.config.vol_risk_min_factor, min(self.config.vol_risk_max_factor, factor)))
+        return float(base * factor)
 
     # ------------------------------------------------------------------
     # Register open/close (legacy + internal)
@@ -352,10 +485,31 @@ class RiskManager:
         self._ensure_daily_state()
         s = self._norm_side(side)
         sym = (symbol or "UNKNOWN").upper()
-        self._register_open_nolock(sym, s, float(notional), float(risk))
 
-    def _register_open_nolock(self, sym: str, side: str, notional: float, risk: float) -> None:
-        self.open_positions[sym] = PositionState(symbol=sym, side=side, notional=notional, risk=risk)
+        # keep same safety rule as can_open
+        if sym in self.open_positions:
+            return
+
+        self._register_open_nolock(sym, s, float(notional), float(risk), filled_notional=float(notional))
+
+    def _register_open_nolock(
+        self,
+        sym: str,
+        side: str,
+        notional: float,
+        risk: float,
+        *,
+        filled_notional: float = 0.0,
+        avg_entry: Optional[float] = None,
+    ) -> None:
+        self.open_positions[sym] = PositionState(
+            symbol=sym,
+            side=side,
+            notional=float(notional),
+            risk=float(risk),
+            filled_notional=float(filled_notional),
+            avg_entry=float(avg_entry) if avg_entry is not None else None,
+        )
         self.direction_counts[side] = self.direction_counts.get(side, 0) + 1
         if self._daily:
             self._daily.trades_opened += 1
@@ -385,21 +539,57 @@ class RiskManager:
             self.direction_counts[s] = max(0, self.direction_counts.get(s, 0) - 1)
 
     # ------------------------------------------------------------------
+    # Time-stop helper
+    # ------------------------------------------------------------------
+
+    def position_age_seconds(self, symbol: str) -> Optional[float]:
+        sym = (symbol or "").upper()
+        p = self.open_positions.get(sym)
+        if not p:
+            return None
+        return float(max(0.0, time.time() - float(p.opened_at)))
+
+    def time_stop_due(self, symbol: str, *, max_age_seconds: Optional[int] = None) -> bool:
+        p_age = self.position_age_seconds(symbol)
+        if p_age is None:
+            return False
+        limit = int(max_age_seconds) if max_age_seconds is not None else int(self.config.max_position_age_seconds)
+        return bool(p_age >= float(max(60, limit)))
+
+    def positions_due_time_stop(self, *, max_age_seconds: Optional[int] = None) -> List[Dict[str, Any]]:
+        limit = int(max_age_seconds) if max_age_seconds is not None else int(self.config.max_position_age_seconds)
+        limit = int(max(60, limit))
+        out: List[Dict[str, Any]] = []
+        for sym, p in self.open_positions.items():
+            age = float(max(0.0, time.time() - float(p.opened_at)))
+            if age >= limit:
+                out.append({"symbol": sym, "side": p.side, "age_s": age, "notional": float(p.notional), "risk": float(p.risk)})
+        return out
+
+    # ------------------------------------------------------------------
     # Core gating logic
     # ------------------------------------------------------------------
 
     def _can_trade_core(
         self,
+        *,
         symbol: str,
         side: str,
         notional: float,
         rr: Optional[float],
+        rr_net: Optional[float],
         inst_score: Optional[int],
         commitment: Optional[float],
+        volatility_atr_pct: Optional[float],
     ) -> Tuple[bool, str]:
         sym = (symbol or "UNKNOWN").upper()
         s = self._norm_side(side)
-        notional = float(notional or 0.0)
+
+        try:
+            notional = float(notional or 0.0)
+        except Exception:
+            notional = 0.0
+
         if notional <= 0:
             return False, "notional_invalid"
 
@@ -420,28 +610,44 @@ class RiskManager:
         if sym_after > sym_cap:
             return False, "symbol_exposure_cap"
 
-        # Optional EV sanity gates (light + non-destructive)
-        # Keep analysis logic in analyze_signal; this is just a final desk veto.
-        if rr is not None:
+        # Optional EV sanity gates.
+        # Prefer rr_net if provided, else rr.
+        rr_used = None
+        if rr_net is not None:
             try:
-                rr_f = float(rr)
+                rr_used = float(rr_net)
             except Exception:
-                rr_f = None
+                rr_used = None
+        if rr_used is None and rr is not None:
+            try:
+                rr_used = float(rr)
+            except Exception:
+                rr_used = None
 
-            if rr_f is not None and rr_f > 0:
-                # If no/low institutional info and rr below strict => veto
-                if (inst_score is None or int(inst_score) < int(MIN_INST_SCORE)) and rr_f < float(RR_MIN_STRICT):
-                    return False, "rr_below_strict_no_inst"
+        if rr_used is not None and rr_used > 0:
+            # If no/low institutional info and rr below strict => veto
+            if (inst_score is None or int(inst_score) < int(MIN_INST_SCORE)) and rr_used < float(RR_MIN_STRICT):
+                return False, "rr_below_strict_no_inst"
 
-                # If inst strong, allow down to tolerated threshold
-                if inst_score is not None and int(inst_score) >= int(MIN_INST_SCORE):
-                    if rr_f < float(RR_MIN_TOLERATED_WITH_INST):
-                        return False, "rr_below_tolerated_even_with_inst"
+            # If inst strong, allow down to tolerated threshold
+            if inst_score is not None and int(inst_score) >= int(MIN_INST_SCORE):
+                if rr_used < float(RR_MIN_TOLERATED_WITH_INST):
+                    return False, "rr_below_tolerated_even_with_inst"
 
-        # Commitment (optional): never hard-veto by default
-        # If you want later: add gating under DESK_EV_MODE.
+        # Commitment (optional): left non-blocking unless DESK_EV_MODE later evolves
         if DESK_EV_MODE and commitment is not None:
             pass
+
+        # Optional volatility targeting check (non-blocking): if targeting is enabled
+        # and volatility is extremely high, you might want a desk veto.
+        if self.config.use_volatility_targeting and volatility_atr_pct is not None:
+            try:
+                v = float(volatility_atr_pct)
+                if v > 0.0 and v >= 4.5 * float(self.config.target_atr_pct):
+                    # very volatile regime -> veto to avoid nasty spreads/liquidations
+                    return False, "volatility_too_high"
+            except Exception:
+                pass
 
         return True, "OK"
 
@@ -449,17 +655,30 @@ class RiskManager:
     # Flexible args extraction (compat with your scanner)
     # ------------------------------------------------------------------
 
-    def _extract_args(
-        self,
-        args: Tuple[Any, ...],
-        kwargs: Dict[str, Any],
-    ) -> Tuple[str, str, float, Optional[float], Optional[int], Optional[float]]:
+    def _extract_args(self, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Returns a dict matching _can_trade_core signature.
+
+        Supported kw aliases:
+          - notional_usdt / size_notional
+          - rr_actual (gross) / rr_net (preferred)
+          - inst_score / institutional_score
+          - volatility_atr_pct / atr_pct / vol_atr_pct
+        """
         symbol = kwargs.get("symbol")
         side = kwargs.get("side")
         notional = kwargs.get("notional") or kwargs.get("notional_usdt") or kwargs.get("size_notional")
         rr = kwargs.get("rr") or kwargs.get("rr_actual")
+        rr_net = kwargs.get("rr_net") or kwargs.get("rr_after_fees")
         inst_score = kwargs.get("inst_score") or kwargs.get("institutional_score")
         commitment = kwargs.get("commitment")
+
+        volatility_atr_pct = (
+            kwargs.get("volatility_atr_pct")
+            or kwargs.get("atr_pct")
+            or kwargs.get("vol_atr_pct")
+            or kwargs.get("volatility")
+        )
 
         str_args = [a for a in args if isinstance(a, str)]
         num_args = [a for a in args if isinstance(a, (int, float))]
@@ -500,7 +719,100 @@ class RiskManager:
             except Exception:
                 commitment = None
 
-        return str(symbol), str(side), float(notional), (float(rr) if rr is not None else None), inst_score, commitment
+        # normalize rr/rr_net
+        rr_f = None
+        rr_net_f = None
+        try:
+            if rr is not None:
+                rr_f = float(rr)
+        except Exception:
+            rr_f = None
+        try:
+            if rr_net is not None:
+                rr_net_f = float(rr_net)
+        except Exception:
+            rr_net_f = None
+
+        # normalize volatility_atr_pct
+        vol_f = None
+        try:
+            if volatility_atr_pct is not None:
+                vol_f = float(volatility_atr_pct)
+        except Exception:
+            vol_f = None
+
+        return {
+            "symbol": str(symbol),
+            "side": str(side),
+            "notional": float(notional),
+            "rr": rr_f,
+            "rr_net": rr_net_f,
+            "inst_score": inst_score,
+            "commitment": commitment,
+            "volatility_atr_pct": vol_f,
+        }
+
+    # ------------------------------------------------------------------
+    # Net RR helper (explicit inputs, no guessing)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def compute_rr_net(
+        *,
+        entry: float,
+        stop: float,
+        tp: float,
+        side: str,
+        fee_rate_roundtrip: float = 0.0,     # e.g. 0.001 means 0.10% total entry+exit
+        funding_rate_per_hour: float = 0.0,  # e.g. 0.00001 means 0.001%/hour
+        funding_hours: float = 0.0,
+        slippage_bps_roundtrip: float = 0.0, # e.g. 5 => 5 bps total
+    ) -> Optional[float]:
+        """
+        Computes a net R:R using explicit parameters only.
+        Returns None if inputs invalid.
+
+        - fee_rate_roundtrip is applied on notional, approximated as price cost in move terms.
+        - slippage_bps_roundtrip is converted to a rate (bps -> fraction).
+        - funding cost is applied as rate = funding_rate_per_hour * funding_hours.
+
+        This is a simplification; it avoids hidden assumptions.
+        """
+        try:
+            e = float(entry)
+            st = float(stop)
+            t = float(tp)
+            if e <= 0 or st <= 0 or t <= 0:
+                return None
+
+            s = (side or "").upper()
+            if s not in ("LONG", "SHORT", "BUY", "SELL"):
+                s = "LONG"
+            if s == "BUY":
+                s = "LONG"
+            if s == "SELL":
+                s = "SHORT"
+
+            risk = abs(e - st)
+            reward = abs(t - e)
+            if risk <= 0:
+                return None
+
+            rr_gross = reward / risk
+
+            fee = float(max(0.0, fee_rate_roundtrip))
+            slip = float(max(0.0, slippage_bps_roundtrip)) / 10000.0
+            funding = float(max(0.0, funding_rate_per_hour)) * float(max(0.0, funding_hours))
+
+            # Convert rates into an approximate "price move" cost:
+            # cost_move ≈ entry * total_rate; then convert to R units via / risk
+            total_rate = fee + slip + funding
+            cost_move = e * total_rate
+            rr_net = rr_gross - (cost_move / risk)
+
+            return float(max(0.0, rr_net))
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Snapshot
@@ -520,6 +832,9 @@ class RiskManager:
                     "notional": float(pos.notional),
                     "risk": float(pos.risk),
                     "opened_at": float(pos.opened_at),
+                    "age_s": float(max(0.0, time.time() - float(pos.opened_at))),
+                    "filled_notional": float(pos.filled_notional),
+                    "avg_entry": float(pos.avg_entry) if pos.avg_entry is not None else None,
                 }
                 for sym, pos in self.open_positions.items()
             },
@@ -530,10 +845,23 @@ class RiskManager:
                     "notional": float(r.notional),
                     "risk": float(r.risk),
                     "created_at": float(r.created_at),
+                    "age_s": float(max(0.0, time.time() - float(r.created_at))),
                 }
                 for rid, r in self._reservations.items()
             },
             "direction_counts": dict(self.direction_counts),
             "gross_open_notional": float(self._gross_open_notional()),
             "gross_reserved_notional": float(self._gross_reserved_notional()),
+            "time_stop_due": self.positions_due_time_stop(),
+            "config": {
+                "risk_per_trade": float(self.config.risk_per_trade),
+                "max_daily_loss": float(self.config.max_daily_loss),
+                "max_open_positions": int(self.config.max_open_positions),
+                "max_gross_exposure": float(self.config.max_gross_exposure),
+                "max_symbol_exposure": float(self.config.max_symbol_exposure),
+                "reservation_ttl_seconds": int(self.config.reservation_ttl_seconds),
+                "max_position_age_seconds": int(self.config.max_position_age_seconds),
+                "use_volatility_targeting": bool(self.config.use_volatility_targeting),
+                "target_atr_pct": float(self.config.target_atr_pct),
+            },
         }
