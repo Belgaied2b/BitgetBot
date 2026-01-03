@@ -1,19 +1,22 @@
 # =====================================================================
-# institutional_data.py — Ultra Desk 2.0
+# institutional_data.py — Ultra Desk 3.1 (max institutional)
 # Binance USDT-M Futures (public endpoints + optional WebSocket orderflow)
 #
-# Ajouts majeurs :
-# - WS orderflow natif Binance (fallback) : aggTrade + bookTicker + markPrice@1s
-#   -> réduit fortement les appels REST (tape/ob/funding/basis en WS)
-# - Normalisation (rolling z-scores) pour tape / OI slope / OB / basis / liq total
-# - Scoring v2 “regime-aware” (tout en gardant un score v1 raw pour debug)
+# + Microstructure upgrade:
+#   - spread_bps / mid / microprice / book_skew
+#   - depth_usd within bands (10/25/50 bps) + depth_ratio
+#   - tape delta in qty AND notional + large trade imbalance
+#
+# + Regime upgrade:
+#   - build-up regime (price change vs OI change) in FULL mode
+#   - optional scoring v3 (quality-aware) via env INST_SCORE_VERSION=3
 #
 # Robustesse scan multi-coins :
 # - Rate limiter global (semaphore + pacing)
-# - Circuit breaker "hard ban" (418 / -1003 avec ban-until) + "soft cooldown" (429 / -1003 / 5xx)
+# - Circuit breaker hard ban (418 / -1003 avec ban-until) + soft cooldown (429 / -1003 / 5xx)
 # - Backoff / cooldown par symbole (évite de marteler le même coin)
-# - Shared aiohttp session (pas de session par call)
-# - Modes LIGHT/NORMAL/FULL + override par paramètre (scanner pass1/pass2)
+# - Shared aiohttp session
+# - Modes LIGHT/NORMAL/FULL + override par paramètre
 # - Sortie enrichie : available_components_count + available_components + ban info + mode effectif
 #
 # WS integration (preferred):
@@ -25,7 +28,7 @@
 # - Sinon fallback : stream all-market !forceOrder@arr (single connection, agrégation mémoire)
 #
 # Compat:
-# - Ajoute/maintient les clés legacy (openInterest, fundingRate, ...) pour éviter KeyError
+# - Maintient les clés legacy (openInterest, fundingRate, ...) pour éviter KeyError
 # =====================================================================
 
 from __future__ import annotations
@@ -266,19 +269,40 @@ class _BinanceOrderflowHub:
         if (now - self._last_msg_ts) > float(WS_STALE_SEC):
             return None
 
-        tape_1m = self._tape_delta(st.trades, window_sec=60)
-        tape_5m = self._tape_delta(st.trades, window_sec=300)
+        tape_1m = self._tape_delta_qty(st.trades, window_sec=60)
+        tape_5m = self._tape_delta_qty(st.trades, window_sec=300)
+        tape_1m_notional = self._tape_delta_notional(st.trades, window_sec=60)
+        tape_5m_notional = self._tape_delta_notional(st.trades, window_sec=300)
+
         cvd_notional_5m = self._cvd_notional(st.trades, window_sec=300)
+        buy_usd_5m, sell_usd_5m = self._buy_sell_notional(st.trades, window_sec=300)
+
         ob_imb = self._tob_imbalance(st.book)
+
+        # microstructure quality
+        spread_bps, mid, microprice, book_skew = self._book_micro(st.book)
 
         return {
             "available": True,
             "ts": now,
+
             "tape_delta_1m": tape_1m,
             "tape_delta_5m": tape_5m,
+            "tape_delta_1m_notional": tape_1m_notional,
+            "tape_delta_5m_notional": tape_5m_notional,
+
             "cvd_notional_5m": cvd_notional_5m,
+            "buy_notional_5m": buy_usd_5m,
+            "sell_notional_5m": sell_usd_5m,
+
             "orderbook_imbalance": ob_imb,
+            "spread_bps": spread_bps,
+            "mid_price": mid,
+            "microprice": microprice,
+            "book_skew": book_skew,
+
             "book_ts_ms": int(st.book.ts_ms or 0),
+
             "mark_price": st.mark.mark_price,
             "index_price": st.mark.index_price,
             "funding_rate": st.mark.funding_rate,
@@ -304,7 +328,7 @@ class _BinanceOrderflowHub:
             trades.popleft()
 
     @staticmethod
-    def _tape_delta(trades: Deque[_TradeEvent], window_sec: int) -> Optional[float]:
+    def _tape_delta_qty(trades: Deque[_TradeEvent], window_sec: int) -> Optional[float]:
         if not trades:
             return None
         cutoff = _now_ms() - int(window_sec) * 1000
@@ -321,6 +345,41 @@ class _BinanceOrderflowHub:
         if den <= 0:
             return None
         return float((buy - sell) / den)
+
+    @staticmethod
+    def _tape_delta_notional(trades: Deque[_TradeEvent], window_sec: int) -> Optional[float]:
+        if not trades:
+            return None
+        cutoff = _now_ms() - int(window_sec) * 1000
+        buy = 0.0
+        sell = 0.0
+        for ev in reversed(trades):
+            if ev.ts_ms < cutoff:
+                break
+            if ev.side == "BUY":
+                buy += ev.notional
+            else:
+                sell += ev.notional
+        den = buy + sell
+        if den <= 0:
+            return None
+        return float((buy - sell) / den)
+
+    @staticmethod
+    def _buy_sell_notional(trades: Deque[_TradeEvent], window_sec: int) -> Tuple[Optional[float], Optional[float]]:
+        if not trades:
+            return None, None
+        cutoff = _now_ms() - int(window_sec) * 1000
+        buy = 0.0
+        sell = 0.0
+        for ev in reversed(trades):
+            if ev.ts_ms < cutoff:
+                break
+            if ev.side == "BUY":
+                buy += ev.notional
+            else:
+                sell += ev.notional
+        return float(buy), float(sell)
 
     @staticmethod
     def _cvd_notional(trades: Deque[_TradeEvent], window_sec: int) -> Optional[float]:
@@ -347,6 +406,27 @@ class _BinanceOrderflowHub:
             return float((bid_val - ask_val) / den)
         except Exception:
             return None
+
+    @staticmethod
+    def _book_micro(book: _BookTicker) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+        """
+        Returns: (spread_bps, mid, microprice, book_skew)
+        """
+        try:
+            bp = float(book.bid_p)
+            ap = float(book.ask_p)
+            bq = float(book.bid_q)
+            aq = float(book.ask_q)
+            if bp <= 0 or ap <= 0 or ap <= bp:
+                return None, None, None, None
+            mid = (bp + ap) / 2.0
+            spread_bps = ((ap - bp) / mid) * 10000.0 if mid > 0 else None
+            den_q = (bq + aq)
+            book_skew = ((bq - aq) / den_q) if den_q > 0 else None
+            microprice = ((bp * aq) + (ap * bq)) / den_q if den_q > 0 else None
+            return float(spread_bps) if spread_bps is not None else None, float(mid), float(microprice) if microprice is not None else None, float(book_skew) if book_skew is not None else None
+        except Exception:
+            return None, None, None, None
 
     async def _run(self) -> None:
         self._last_msg_ts = time.time()
@@ -934,6 +1014,14 @@ OI_HIST_TTL = float(os.getenv("INST_OI_HIST_TTL", "300"))
 BINANCE_SYMBOLS_TTL = float(os.getenv("INST_EXCHANGEINFO_TTL", os.getenv("BINANCE_SYMBOLS_TTL_S", "900")))
 LSR_TTL = float(os.getenv("INST_LSR_TTL", "300"))
 
+# scoring version (1/2/3)
+INST_SCORE_VERSION = str(os.getenv("INST_SCORE_VERSION", "2")).strip()
+
+# v3 quality thresholds
+INST_SPREAD_MAX_BPS = float(os.getenv("INST_SPREAD_MAX_BPS", "12.0"))
+INST_DEPTH_MIN_USD_25BPS = float(os.getenv("INST_DEPTH_MIN_USD_25BPS", "250000"))
+INST_LARGE_TRADE_USD = float(os.getenv("INST_LARGE_TRADE_USD", "250000"))
+
 
 # =====================================================================
 # Binance symbols (exchangeInfo)
@@ -977,17 +1065,27 @@ def _map_symbol_to_binance(symbol: str, binance_symbols: Set[str]) -> Optional[s
     Map KuCoin/Bitget symbols to Binance USDT-M perp symbol.
     Handles:
       - direct
-      - 1000TOKENUSDT -> TOKENUSDT
-      - TOKENUSDT_UMCBL / BTCUSDTM / BTC-USDT -> BTCUSDT
+      - TOKENUSDT_UMCBL / BTCUSDTM / BTC-USDT / BTCUSDT_PERP -> BTCUSDT
+      - 1000TOKENUSDT -> TOKENUSDT (only if direct not found)
+      - leading digits cleanup only if still not found (safe fallback)
     """
     s = (symbol or "").upper().replace("-", "").replace("_", "")
-    s = s.replace("UMCBL", "").replace("USDTM", "USDT")
+    s = s.replace("UMCBL", "").replace("USDTM", "USDT").replace("PERP", "")
     if s in binance_symbols:
         return s
+
     if s.startswith("1000"):
         alt = s[4:]
         if alt in binance_symbols:
             return alt
+
+    # last resort: remove leading digits (only if still not mapped)
+    m = re.match(r"^(\d+)([A-Z].+)$", s)
+    if m:
+        alt2 = m.group(2)
+        if alt2 in binance_symbols:
+            return alt2
+
     return None
 
 
@@ -1192,16 +1290,24 @@ def _extract_lsr_stats(lsr: Optional[List[Dict[str, Any]]]) -> Tuple[Optional[fl
 # =====================================================================
 def _compute_orderbook_imbalance(depth: Dict[str, Any], band_bps: float = 25.0) -> Optional[float]:
     """Imbalance in [-1,+1] computed within +/- band_bps around mid."""
+    imb, _, _ = _compute_orderbook_band_metrics(depth, band_bps=band_bps)
+    return imb
+
+
+def _compute_orderbook_band_metrics(depth: Dict[str, Any], band_bps: float = 25.0) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Returns: (imbalance, bid_usd, ask_usd) within +/- band_bps around mid.
+    """
     try:
         bids = depth.get("bids") or []
         asks = depth.get("asks") or []
         if not bids or not asks:
-            return None
+            return None, None, None
 
         b0p = float(bids[0][0])
         a0p = float(asks[0][0])
         if a0p <= 0 or b0p <= 0:
-            return None
+            return None, None, None
 
         mid = (b0p + a0p) / 2.0
         band = float(band_bps) / 10000.0
@@ -1225,8 +1331,43 @@ def _compute_orderbook_imbalance(depth: Dict[str, Any], band_bps: float = 25.0) 
 
         den = bid_val + ask_val
         if den <= 0:
+            return None, float(bid_val), float(ask_val)
+        imb = float((bid_val - ask_val) / den)
+        return imb, float(bid_val), float(ask_val)
+    except Exception:
+        return None, None, None
+
+
+def _compute_spread_bps_from_depth(depth: Dict[str, Any]) -> Optional[float]:
+    try:
+        bids = depth.get("bids") or []
+        asks = depth.get("asks") or []
+        if not bids or not asks:
             return None
-        return float((bid_val - ask_val) / den)
+        bp = float(bids[0][0])
+        ap = float(asks[0][0])
+        if bp <= 0 or ap <= 0 or ap <= bp:
+            return None
+        mid = (bp + ap) / 2.0
+        if mid <= 0:
+            return None
+        return float(((ap - bp) / mid) * 10000.0)
+    except Exception:
+        return None
+
+
+def _compute_microprice_from_depth(depth: Dict[str, Any]) -> Optional[float]:
+    try:
+        bids = depth.get("bids") or []
+        asks = depth.get("asks") or []
+        if not bids or not asks:
+            return None
+        bp = float(bids[0][0]); bq = float(bids[0][1])
+        ap = float(asks[0][0]); aq = float(asks[0][1])
+        den = bq + aq
+        if bp <= 0 or ap <= 0 or den <= 0:
+            return None
+        return float(((bp * aq) + (ap * bq)) / den)
     except Exception:
         return None
 
@@ -1266,6 +1407,78 @@ def _compute_tape_delta(trades: List[Dict[str, Any]], window_sec: int = 300) -> 
         return float((buy - sell) / den)
     except Exception:
         return None
+
+
+def _compute_tape_delta_notional(trades: List[Dict[str, Any]], window_sec: int = 300) -> Optional[float]:
+    """Notional-based taker delta in [-1,+1] over last window_sec."""
+    try:
+        if not trades:
+            return None
+        now_ms = _now_ms()
+        cutoff = now_ms - int(window_sec) * 1000
+
+        buy = 0.0
+        sell = 0.0
+        for t in reversed(trades):
+            ts = int(t.get("T") or 0)
+            if ts < cutoff:
+                break
+            qty = float(t.get("q") or 0.0)
+            price = float(t.get("p") or 0.0)
+            if qty <= 0 or price <= 0:
+                continue
+            notional = qty * price
+            is_buyer_maker = bool(t.get("m", False))
+            if is_buyer_maker:
+                sell += notional
+            else:
+                buy += notional
+
+        den = buy + sell
+        if den <= 0:
+            return None
+        return float((buy - sell) / den)
+    except Exception:
+        return None
+
+
+def _compute_large_trade_imbalance(trades: List[Dict[str, Any]], window_sec: int = 300, threshold_usd: float = 250000.0) -> Tuple[Optional[float], Optional[int], Optional[int]]:
+    """
+    Large trades imbalance in [-1,+1] based on count of prints above threshold_usd.
+    Returns: (imbalance, buy_count, sell_count)
+    """
+    try:
+        if not trades:
+            return None, None, None
+        now_ms = _now_ms()
+        cutoff = now_ms - int(window_sec) * 1000
+        thr = float(threshold_usd)
+
+        buy = 0
+        sell = 0
+        for t in reversed(trades):
+            ts = int(t.get("T") or 0)
+            if ts < cutoff:
+                break
+            qty = float(t.get("q") or 0.0)
+            price = float(t.get("p") or 0.0)
+            if qty <= 0 or price <= 0:
+                continue
+            notional = qty * price
+            if notional < thr:
+                continue
+            is_buyer_maker = bool(t.get("m", False))
+            if is_buyer_maker:
+                sell += 1
+            else:
+                buy += 1
+
+        den = buy + sell
+        if den <= 0:
+            return None, int(buy), int(sell)
+        return float((buy - sell) / den), int(buy), int(sell)
+    except Exception:
+        return None, None, None
 
 
 def _mean_std(vals: List[float]) -> Tuple[Optional[float], Optional[float]]:
@@ -1342,6 +1555,22 @@ def _compute_oi_hist_slope(oi_hist: Optional[List[Dict[str, Any]]]) -> Optional[
         return None
 
 
+def _extract_oi_usd_from_hist(oi_hist: Optional[List[Dict[str, Any]]]) -> Optional[float]:
+    """
+    Try to extract latest open interest value in USD (sumOpenInterestValue) from openInterestHist.
+    """
+    try:
+        if not oi_hist:
+            return None
+        last = oi_hist[-1]
+        v = last.get("sumOpenInterestValue")
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
 def _compute_cvd_slope_from_klines(klines: List[List[Any]], window: int = 40) -> Optional[float]:
     """
     Approx CVD from futures klines:
@@ -1372,6 +1601,71 @@ def _compute_cvd_slope_from_klines(klines: List[List[Any]], window: int = 40) ->
         return float((end - start) / den)
     except Exception:
         return None
+
+
+def _compute_price_return_1h_from_klines(klines: List[List[Any]]) -> Optional[float]:
+    """Return (close_last - close_prev) / close_prev."""
+    try:
+        if not klines or len(klines) < 3:
+            return None
+        prev_close = float(klines[-2][4])
+        last_close = float(klines[-1][4])
+        if prev_close <= 0:
+            return None
+        return float((last_close - prev_close) / prev_close)
+    except Exception:
+        return None
+
+
+def _compute_realized_vol_24h_from_klines(klines: List[List[Any]]) -> Optional[float]:
+    """Std dev of 1h log returns over last 24 bars (approx)."""
+    try:
+        if not klines or len(klines) < 30:
+            return None
+        closes: List[float] = []
+        for k in klines[-30:]:
+            try:
+                closes.append(float(k[4]))
+            except Exception:
+                continue
+        if len(closes) < 26:
+            return None
+        rets: List[float] = []
+        for i in range(1, len(closes)):
+            if closes[i - 1] > 0 and closes[i] > 0:
+                rets.append(float(np.log(closes[i] / closes[i - 1])) if np is not None else float((closes[i] - closes[i - 1]) / closes[i - 1]))
+        if len(rets) < 10:
+            return None
+        _, std = _mean_std(rets[-24:])
+        return float(std) if std is not None else None
+    except Exception:
+        return None
+
+
+def _classify_build_up(bias: str, price_ret_1h: Optional[float], oi_slope: Optional[float]) -> str:
+    """
+    Classic OI/price interpretation:
+      - price up + OI up   => long_build_up
+      - price down + OI up => short_build_up
+      - price up + OI down => short_covering
+      - price down + OI down => long_liquidation
+    """
+    try:
+        if price_ret_1h is None or oi_slope is None:
+            return "unknown"
+        pr = float(price_ret_1h)
+        oi = float(oi_slope)
+        if pr > 0 and oi > 0:
+            return "long_build_up"
+        if pr < 0 and oi > 0:
+            return "short_build_up"
+        if pr > 0 and oi < 0:
+            return "short_covering"
+        if pr < 0 and oi < 0:
+            return "long_liquidation"
+        return "flat"
+    except Exception:
+        return "unknown"
 
 
 # =====================================================================
@@ -1556,7 +1850,7 @@ def _score_institutional_v1(
     liq_total_usd_5m: Optional[float],
 ) -> Tuple[int, Dict[str, int], Dict[str, Any]]:
     """
-    Score "legacy" en [0..4] (conservé pour debug).
+    Score legacy en [0..4] (conservé pour debug).
     """
     b = (bias or "").upper()
     comp: Dict[str, int] = {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0}
@@ -1809,6 +2103,66 @@ def _score_institutional_v2_regime(
     return total, comp, meta
 
 
+def _score_institutional_v3_quality(
+    bias: str,
+    *,
+    base_score: int,
+    base_components: Dict[str, int],
+    crowding_regime: str,
+    spread_bps: Optional[float],
+    depth_usd_25bps: Optional[float],
+    build_up_regime: str,
+    large_trade_imb_5m: Optional[float],
+) -> Tuple[int, Dict[str, int], Dict[str, Any]]:
+    """
+    Score v3: part de v2, puis ajuste avec microstructure quality + build-up.
+    Conserve la plage [0..4].
+    """
+    b = (bias or "").upper().strip()
+    score = int(base_score)
+    meta: Dict[str, Any] = {"penalties": [], "bonuses": []}
+    comp = dict(base_components or {})
+
+    # penalties quality
+    if spread_bps is not None and float(spread_bps) > float(INST_SPREAD_MAX_BPS):
+        score -= 1
+        meta["penalties"].append("spread_too_wide")
+
+    if depth_usd_25bps is not None and float(depth_usd_25bps) < float(INST_DEPTH_MIN_USD_25BPS):
+        score -= 1
+        meta["penalties"].append("depth_too_thin_25bps")
+
+    # crowding risky without strong flow
+    if isinstance(crowding_regime, str) and crowding_regime.endswith("_risky"):
+        if int(comp.get("flow", 0)) < 2:
+            score -= 1
+            meta["penalties"].append("crowding_risky_no_strong_flow")
+
+    # build-up bonus: if build-up aligns with bias and we already have flow+oi ok
+    aligns = False
+    if b == "LONG" and build_up_regime == "long_build_up":
+        aligns = True
+    if b == "SHORT" and build_up_regime == "short_build_up":
+        aligns = True
+
+    if aligns and int(comp.get("flow", 0)) >= 1 and int(comp.get("oi", 0)) >= 1:
+        score += 1
+        meta["bonuses"].append("build_up_aligns")
+
+    # large prints confirmation
+    if large_trade_imb_5m is not None:
+        x = float(large_trade_imb_5m)
+        if b == "LONG" and x >= 0.35:
+            score += 1
+            meta["bonuses"].append("large_prints_support")
+        if b == "SHORT" and x <= -0.35:
+            score += 1
+            meta["bonuses"].append("large_prints_support")
+
+    score = max(0, min(4, int(score)))
+    return score, comp, meta
+
+
 def _components_ok_count(components: Dict[str, int]) -> int:
     try:
         return int(sum(1 for v in (components or {}).values() if int(v) > 0))
@@ -1834,6 +2188,12 @@ def _available_components_list(payload: Dict[str, Any]) -> List[str]:
         out.append("funding_hist")
     if payload.get("liq_total_usd_5m") is not None:
         out.append("liquidations")
+    if payload.get("spread_bps") is not None:
+        out.append("spread")
+    if payload.get("depth_usd_25bps") is not None:
+        out.append("depth")
+    if payload.get("build_up_regime") not in (None, "unknown"):
+        out.append("build_up")
     if payload.get("ws_snapshot_used"):
         out.append("ws_hub")
     if payload.get("orderflow_ws_used"):
@@ -1870,6 +2230,8 @@ async def compute_full_institutional_analysis(
         return {
             "institutional_score": 0,
             "institutional_score_raw": 0,
+            "institutional_score_v2": 0,
+            "institutional_score_v3": 0,
             "binance_symbol": None,
             "available": False,
             "oi": None,
@@ -1910,6 +2272,8 @@ async def compute_full_institutional_analysis(
         return {
             "institutional_score": 0,
             "institutional_score_raw": 0,
+            "institutional_score_v2": 0,
+            "institutional_score_v3": 0,
             "binance_symbol": None,
             "available": False,
             "oi": None,
@@ -1940,7 +2304,7 @@ async def compute_full_institutional_analysis(
             "fundingRate": None,
         }
 
-    # Start internal orderflow hub early if relevant (NORMAL/FULL) or LIGHT if markPrice enabled
+    # Start internal orderflow hub early if relevant
     orderflow_ws_used = False
     need_of = False
     if INST_USE_INTERNAL_ORDERFLOW_WS:
@@ -1969,6 +2333,7 @@ async def compute_full_institutional_analysis(
     oi_value: Optional[float] = None
     oi_slope: Optional[float] = None
     oi_hist_slope: Optional[float] = None
+    oi_usd: Optional[float] = None
 
     funding_rate: Optional[float] = None
     funding_mean: Optional[float] = None
@@ -1976,12 +2341,34 @@ async def compute_full_institutional_analysis(
     funding_z: Optional[float] = None
 
     basis_pct: Optional[float] = None
+    next_funding_time_ms: Optional[int] = None
 
     tape_1m: Optional[float] = None
     tape_5m: Optional[float] = None
+    tape_1m_notional: Optional[float] = None
+    tape_5m_notional: Optional[float] = None
 
     ob_10: Optional[float] = None
     ob_25: Optional[float] = None
+
+    # depth microstructure
+    spread_bps: Optional[float] = None
+    microprice: Optional[float] = None
+    depth_bid_usd_10: Optional[float] = None
+    depth_ask_usd_10: Optional[float] = None
+    depth_usd_10: Optional[float] = None
+    depth_bid_usd_25: Optional[float] = None
+    depth_ask_usd_25: Optional[float] = None
+    depth_usd_25: Optional[float] = None
+    depth_bid_usd_50: Optional[float] = None
+    depth_ask_usd_50: Optional[float] = None
+    depth_usd_50: Optional[float] = None
+    depth_ratio_25: Optional[float] = None
+
+    # large prints (rest or ws if provided by hub)
+    large_trade_imb_5m: Optional[float] = None
+    large_buy_cnt_5m: Optional[int] = None
+    large_sell_cnt_5m: Optional[int] = None
 
     cvd_slope: Optional[float] = None  # FULL fallback (kline-based)
     cvd_notional_5m: Optional[float] = None  # WS micro-CVD
@@ -1992,6 +2379,11 @@ async def compute_full_institutional_analysis(
     liq_total_usd_5m: Optional[float] = None
     liq_delta_ratio_5m: Optional[float] = None
     liq_regime: str = "unknown"
+
+    # build-up / vol
+    price_ret_1h: Optional[float] = None
+    realized_vol_24h: Optional[float] = None
+    build_up_regime: str = "unknown"
 
     # Optional LSR
     lsr_global_last = lsr_global_slope = None
@@ -2041,7 +2433,7 @@ async def compute_full_institutional_analysis(
         except Exception:
             warnings.append("orderflow_markprice_parse_error")
 
-    if funding_rate is None or basis_pct is None:
+    if funding_rate is None or basis_pct is None or next_funding_time_ms is None:
         prem = await _fetch_premium_index(binance_symbol)
         if isinstance(prem, dict):
             try:
@@ -2064,6 +2456,14 @@ async def compute_full_institutional_analysis(
                 basis_pct = None
                 warnings.append("basis_parse_error")
                 sources["basis_pct"] = sources.get("basis_pct", "none")
+
+            try:
+                nft = prem.get("nextFundingTime")
+                if nft is not None:
+                    next_funding_time_ms = int(nft)
+                sources["next_funding_time"] = "rest" if next_funding_time_ms is not None else "none"
+            except Exception:
+                next_funding_time_ms = None
         else:
             warnings.append("no_premiumIndex")
 
@@ -2107,11 +2507,22 @@ async def compute_full_institutional_analysis(
                     tape_5m = float(tape_5m)
                 sources["tape"] = "ws" if tape_5m is not None else "none"
 
+                # extended micro
+                if ws_snap.get("tape_delta_1m_notional") is not None:
+                    tape_1m_notional = float(ws_snap.get("tape_delta_1m_notional"))
+                if ws_snap.get("tape_delta_5m_notional") is not None:
+                    tape_5m_notional = float(ws_snap.get("tape_delta_5m_notional"))
+
                 ob_25 = ws_snap.get("orderbook_imbalance")
                 if ob_25 is not None:
                     ob_25 = float(ob_25)
                     ob_10 = float(ob_25)
                     sources["orderbook"] = "ws"
+
+                if ws_snap.get("spread_bps") is not None:
+                    spread_bps = float(ws_snap.get("spread_bps"))
+                if ws_snap.get("microprice") is not None:
+                    microprice = float(ws_snap.get("microprice"))
 
                 cvd_notional_5m = ws_snap.get("cvd_notional_5m")
                 if cvd_notional_5m is not None:
@@ -2120,7 +2531,7 @@ async def compute_full_institutional_analysis(
             except Exception:
                 warnings.append("ws_micro_parse_error")
 
-        if (tape_5m is None or ob_25 is None) and of_snap is not None:
+        if (tape_5m is None or ob_25 is None or spread_bps is None) and of_snap is not None:
             try:
                 if tape_1m is None and of_snap.get("tape_delta_1m") is not None:
                     tape_1m = float(of_snap.get("tape_delta_1m"))
@@ -2128,10 +2539,20 @@ async def compute_full_institutional_analysis(
                     tape_5m = float(of_snap.get("tape_delta_5m"))
                     sources["tape"] = sources.get("tape", "ws_orderflow")
 
+                if tape_1m_notional is None and of_snap.get("tape_delta_1m_notional") is not None:
+                    tape_1m_notional = float(of_snap.get("tape_delta_1m_notional"))
+                if tape_5m_notional is None and of_snap.get("tape_delta_5m_notional") is not None:
+                    tape_5m_notional = float(of_snap.get("tape_delta_5m_notional"))
+
                 if ob_25 is None and of_snap.get("orderbook_imbalance") is not None:
                     ob_25 = float(of_snap.get("orderbook_imbalance"))
                     ob_10 = float(ob_25)
                     sources["orderbook"] = sources.get("orderbook", "ws_orderflow")
+
+                if spread_bps is None and of_snap.get("spread_bps") is not None:
+                    spread_bps = float(of_snap.get("spread_bps"))
+                if microprice is None and of_snap.get("microprice") is not None:
+                    microprice = float(of_snap.get("microprice"))
 
                 if cvd_notional_5m is None and of_snap.get("cvd_notional_5m") is not None:
                     cvd_notional_5m = float(of_snap.get("cvd_notional_5m"))
@@ -2139,7 +2560,7 @@ async def compute_full_institutional_analysis(
             except Exception:
                 warnings.append("orderflow_micro_parse_error")
 
-        if tape_5m is None or ob_25 is None:
+        if tape_5m is None or ob_25 is None or spread_bps is None or depth_usd_25 is None:
             trades, depth = await asyncio.gather(
                 _fetch_agg_trades(binance_symbol, limit=1000),
                 _fetch_depth(binance_symbol, limit=100),
@@ -2150,16 +2571,47 @@ async def compute_full_institutional_analysis(
                     tape_1m = _compute_tape_delta(trades, window_sec=60)
                 if tape_5m is None:
                     tape_5m = _compute_tape_delta(trades, window_sec=300)
+                if tape_1m_notional is None:
+                    tape_1m_notional = _compute_tape_delta_notional(trades, window_sec=60)
+                if tape_5m_notional is None:
+                    tape_5m_notional = _compute_tape_delta_notional(trades, window_sec=300)
+                if large_trade_imb_5m is None:
+                    large_trade_imb_5m, large_buy_cnt_5m, large_sell_cnt_5m = _compute_large_trade_imbalance(
+                        trades, window_sec=300, threshold_usd=float(INST_LARGE_TRADE_USD)
+                    )
                 sources["tape"] = sources.get("tape", "rest")
+                sources["large_trades"] = sources.get("large_trades", "rest")
             else:
                 warnings.append("no_trades")
 
             if isinstance(depth, dict):
                 if ob_10 is None:
-                    ob_10 = _compute_orderbook_imbalance(depth, band_bps=10.0)
-                if ob_25 is None:
-                    ob_25 = _compute_orderbook_imbalance(depth, band_bps=25.0)
+                    ob_10, b10, a10 = _compute_orderbook_band_metrics(depth, band_bps=10.0)
+                    depth_bid_usd_10, depth_ask_usd_10 = b10, a10
+                    if b10 is not None and a10 is not None:
+                        depth_usd_10 = float(b10 + a10)
+                if ob_25 is None or depth_usd_25 is None:
+                    ob_25, b25, a25 = _compute_orderbook_band_metrics(depth, band_bps=25.0)
+                    depth_bid_usd_25, depth_ask_usd_25 = b25, a25
+                    if b25 is not None and a25 is not None:
+                        depth_usd_25 = float(b25 + a25)
+                        den = float(depth_usd_25)
+                        if den > 0:
+                            depth_ratio_25 = float((float(b25) - float(a25)) / den)
+                if depth_usd_50 is None:
+                    _, b50, a50 = _compute_orderbook_band_metrics(depth, band_bps=50.0)
+                    depth_bid_usd_50, depth_ask_usd_50 = b50, a50
+                    if b50 is not None and a50 is not None:
+                        depth_usd_50 = float(b50 + a50)
+
+                if spread_bps is None:
+                    spread_bps = _compute_spread_bps_from_depth(depth)
+                if microprice is None:
+                    microprice = _compute_microprice_from_depth(depth)
+
                 sources["orderbook"] = sources.get("orderbook", "rest")
+                sources["spread"] = sources.get("spread", "rest")
+                sources["depth"] = sources.get("depth", "rest")
             else:
                 warnings.append("no_depth")
 
@@ -2173,11 +2625,14 @@ async def compute_full_institutional_analysis(
 
         if isinstance(klines, list) and klines:
             cvd_slope = _compute_cvd_slope_from_klines(klines, window=40)
+            price_ret_1h = _compute_price_return_1h_from_klines(klines)
+            realized_vol_24h = _compute_realized_vol_24h_from_klines(klines)
         else:
             warnings.append("no_klines")
 
         if isinstance(oi_hist, list) and oi_hist:
             oi_hist_slope = _compute_oi_hist_slope(oi_hist)
+            oi_usd = _extract_oi_usd_from_hist(oi_hist)
         else:
             warnings.append("no_oi_hist")
 
@@ -2199,12 +2654,16 @@ async def compute_full_institutional_analysis(
             except Exception:
                 warnings.append("lsr_error")
 
+        build_up_regime = _classify_build_up(bias, price_ret_1h, oi_slope)
+
     # Normalization (rolling z)
     oi_slope_z = _norm_update(binance_symbol, "oi_slope", oi_slope)
     tape_5m_z = _norm_update(binance_symbol, "tape_5m", tape_5m)
     ob_imb_z = _norm_update(binance_symbol, "ob_imb", ob_25)
     basis_pct_z = _norm_update(binance_symbol, "basis_pct", basis_pct)
     liq_total_z = _norm_update(binance_symbol, "liq_total", liq_total_usd_5m)
+    spread_bps_z = _norm_update(binance_symbol, "spread_bps", spread_bps)
+    depth_25_z = _norm_update(binance_symbol, "depth_25", depth_usd_25)
 
     # Regimes
     funding_regime = _classify_funding(funding_rate, z=funding_z)
@@ -2228,7 +2687,7 @@ async def compute_full_institutional_analysis(
         liq_total_usd_5m=liq_total_usd_5m,
     )
 
-    inst_score, components, meta_v2 = _score_institutional_v2_regime(
+    inst_score_v2, components_v2, meta_v2 = _score_institutional_v2_regime(
         bias,
         crowding_regime=crowding_regime,
         tape_5m=tape_5m,
@@ -2246,7 +2705,32 @@ async def compute_full_institutional_analysis(
         liq_total_z=liq_total_z,
     )
 
-    ok_count = _components_ok_count(components)
+    inst_score_v3, components_v3, meta_v3 = _score_institutional_v3_quality(
+        bias,
+        base_score=inst_score_v2,
+        base_components=components_v2,
+        crowding_regime=crowding_regime,
+        spread_bps=spread_bps,
+        depth_usd_25bps=depth_usd_25,
+        build_up_regime=build_up_regime,
+        large_trade_imb_5m=large_trade_imb_5m,
+    )
+
+    # choose main score output
+    inst_score_main = inst_score_v2
+    components_main = components_v2
+    meta_main = {"scoring": "v2_regime", "v2": meta_v2, "v1_raw": meta_raw}
+
+    if INST_SCORE_VERSION == "1":
+        inst_score_main = inst_score_raw
+        components_main = components_raw
+        meta_main = {"scoring": "v1_raw", "v1_raw": meta_raw}
+    elif INST_SCORE_VERSION == "3":
+        inst_score_main = inst_score_v3
+        components_main = components_v3
+        meta_main = {"scoring": "v3_quality", "v3": meta_v3, "v2": meta_v2, "v1_raw": meta_raw}
+
+    ok_count = _components_ok_count(components_main)
 
     score_meta: Dict[str, Any] = {
         "mode": eff_mode,
@@ -2255,13 +2739,14 @@ async def compute_full_institutional_analysis(
         "liq_min_notional_usd": float(_LIQ_MIN_NOTIONAL_USD),
         "ws_snapshot_used": bool(ws_used),
         "orderflow_ws_used": bool(orderflow_ws_used),
-        "scoring": "v2_regime",
-        "v2": meta_v2,
-        "v1_raw": meta_raw,
         "norm_enabled": bool(INST_NORM_ENABLED),
         "norm_min_points": int(INST_NORM_MIN_POINTS),
         "norm_window": int(INST_NORM_WINDOW),
+        "spread_max_bps_v3": float(INST_SPREAD_MAX_BPS),
+        "depth_min_usd_25bps_v3": float(INST_DEPTH_MIN_USD_25BPS),
+        "large_trade_usd_threshold": float(INST_LARGE_TRADE_USD),
     }
+    score_meta.update(meta_main)
 
     available = any(
         [
@@ -2273,6 +2758,8 @@ async def compute_full_institutional_analysis(
             cvd_notional_5m is not None,
             oi_hist_slope is not None,
             (liq_total_usd_5m is not None and liq_total_usd_5m > 0.0),
+            spread_bps is not None,
+            depth_usd_25 is not None,
         ]
     )
 
@@ -2284,12 +2771,15 @@ async def compute_full_institutional_analysis(
         liquidation_intensity = None
 
     payload: Dict[str, Any] = {
-        "institutional_score": int(inst_score),
+        "institutional_score": int(inst_score_main),
         "institutional_score_raw": int(inst_score_raw),
+        "institutional_score_v2": int(inst_score_v2),
+        "institutional_score_v3": int(inst_score_v3),
         "binance_symbol": binance_symbol,
         "available": bool(available),
 
         "oi": oi_value,
+        "oi_usd": oi_usd,
         "oi_slope": oi_slope,
         "oi_slope_z": oi_slope_z,
 
@@ -2301,6 +2791,7 @@ async def compute_full_institutional_analysis(
         "funding_mean": funding_mean,
         "funding_std": funding_std,
         "funding_z": funding_z,
+        "next_funding_time_ms": next_funding_time_ms,
 
         "basis_pct": basis_pct,
         "basis_pct_z": basis_pct_z,
@@ -2308,13 +2799,37 @@ async def compute_full_institutional_analysis(
 
         "tape_delta_1m": tape_1m,
         "tape_delta_5m": tape_5m,
+        "tape_delta_1m_notional": tape_1m_notional,
+        "tape_delta_5m_notional": tape_5m_notional,
         "tape_delta_5m_z": tape_5m_z,
         "tape_regime": _classify_tape(tape_5m),
+
+        "large_trade_imb_5m": large_trade_imb_5m,
+        "large_buy_cnt_5m": large_buy_cnt_5m,
+        "large_sell_cnt_5m": large_sell_cnt_5m,
 
         "orderbook_imb_10bps": ob_10,
         "orderbook_imb_25bps": ob_25,
         "orderbook_imb_25bps_z": ob_imb_z,
         "orderbook_regime": ob_regime,
+
+        "spread_bps": spread_bps,
+        "spread_bps_z": spread_bps_z,
+        "microprice": microprice,
+
+        "depth_bid_usd_10bps": depth_bid_usd_10,
+        "depth_ask_usd_10bps": depth_ask_usd_10,
+        "depth_usd_10bps": depth_usd_10,
+
+        "depth_bid_usd_25bps": depth_bid_usd_25,
+        "depth_ask_usd_25bps": depth_ask_usd_25,
+        "depth_usd_25bps": depth_usd_25,
+        "depth_25bps_z": depth_25_z,
+        "depth_ratio_25bps": depth_ratio_25,
+
+        "depth_bid_usd_50bps": depth_bid_usd_50,
+        "depth_ask_usd_50bps": depth_ask_usd_50,
+        "depth_usd_50bps": depth_usd_50,
 
         "crowding_regime": crowding_regime,
         "flow_regime": flow_regime,
@@ -2329,10 +2844,16 @@ async def compute_full_institutional_analysis(
         "liq_regime": liq_regime,
         "liquidation_intensity": liquidation_intensity,
 
+        "price_return_1h": price_ret_1h,
+        "realized_vol_24h": realized_vol_24h,
+        "build_up_regime": build_up_regime,
+
         "warnings": warnings,
 
-        "score_components": components,
+        "score_components": components_main,
         "score_components_raw": components_raw,
+        "score_components_v2": components_v2,
+        "score_components_v3": components_v3,
         "score_meta": score_meta,
 
         "lsr_global_last": lsr_global_last,
@@ -2351,7 +2872,7 @@ async def compute_full_institutional_analysis(
         "normalization_enabled": bool(INST_NORM_ENABLED),
         "data_sources": sources,
 
-        # Legacy/compat keys
+        # Legacy/compat keys (KEEP!)
         "openInterest": oi_value,
         "fundingRate": funding_rate,
         "basisPct": basis_pct,
