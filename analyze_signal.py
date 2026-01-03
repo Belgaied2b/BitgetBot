@@ -5,7 +5,8 @@
 # - Liquidations PASS2-only by default (anti-ban)
 # - TTL-compatible setup_type suffixing for scanner.py
 # - NEW: SMT divergence (optional) + normalized inst score (0..100)
-# - NEW: optional options_data regime filter (rv/iv)
+# - NEW: options_data regime context (Deribit DVOL snapshot)
+# - NEW: TrendGuard (anti-contre-tendance): HTF bias mismatch + ADX/squeeze + overextension MARKET veto
 # =====================================================================
 
 from __future__ import annotations
@@ -69,25 +70,221 @@ try:
 except Exception:
     compute_smt_divergence = None  # type: ignore
 
+# options_data.py in your project exposes: OptionsCache/OptionsSnapshot/score_options_context
 try:
-    from options_data import realized_volatility, options_vol_filter  # type: ignore
+    from options_data import OptionsSnapshot, score_options_context  # type: ignore
 except Exception:
-    realized_volatility = None  # type: ignore
-    options_vol_filter = None  # type: ignore
+    OptionsSnapshot = None  # type: ignore
+    score_options_context = None  # type: ignore
+
+
+# =====================================================================
+# ✅ TrendGuard (anti-contre-tendance / anti-chop MARKET)
+# =====================================================================
+
+# Hard rules (safe defaults):
+TG_STRICT_HTF_BIAS = str(os.getenv("TG_STRICT_HTF_BIAS", "1")).strip() == "1"  # hard reject if HTF bias != bias
+TG_STRICT_REGIME_MARKET = str(os.getenv("TG_STRICT_REGIME_MARKET", "1")).strip() == "1"  # reject MARKET if weak trend/squeeze/overext
+TG_ADX_PERIOD = int(os.getenv("TG_ADX_PERIOD", "14"))
+TG_ADX_MIN = float(os.getenv("TG_ADX_MIN", "20"))  # <20 => weak trend (chop)
+TG_BB_PERIOD = int(os.getenv("TG_BB_PERIOD", "20"))
+TG_BB_K = float(os.getenv("TG_BB_K", "2"))
+TG_BB_SQUEEZE_BW = float(os.getenv("TG_BB_SQUEEZE_BW", "0.04"))  # bandwidth < 4% => squeeze
+TG_OVEREXT_ATR = float(os.getenv("TG_OVEREXT_ATR", "1.2"))  # market entry too far from EMA20
+
+
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return pd.Series(series).astype(float).ewm(span=int(span), adjust=False).mean()
+
+
+def _adx_wilder(df: pd.DataFrame, period: int = 14) -> float:
+    """
+    Wilder ADX (lightweight) -> last value.
+    """
+    try:
+        if df is None or df.empty or len(df) < period * 3:
+            return 0.0
+        for c in ("high", "low", "close"):
+            if c not in df.columns:
+                return 0.0
+
+        h = pd.to_numeric(df["high"], errors="coerce").astype(float)
+        l = pd.to_numeric(df["low"], errors="coerce").astype(float)
+        c = pd.to_numeric(df["close"], errors="coerce").astype(float)
+
+        up = h.diff()
+        dn = -l.diff()
+
+        plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
+        minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
+
+        prev_close = c.shift(1)
+        tr = pd.concat([(h - l).abs(), (h - prev_close).abs(), (l - prev_close).abs()], axis=1).max(axis=1)
+
+        alpha = 1.0 / float(max(1, int(period)))
+        atr = pd.Series(tr).ewm(alpha=alpha, adjust=False).mean()
+
+        pdi = 100.0 * (pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, np.nan))
+        mdi = 100.0 * (pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, np.nan))
+
+        dx = 100.0 * (abs(pdi - mdi) / (pdi + mdi).replace(0, np.nan))
+        adx_s = pd.Series(dx).ewm(alpha=alpha, adjust=False).mean()
+        v = float(adx_s.iloc[-1])
+        return v if np.isfinite(v) else 0.0
+    except Exception:
+        return 0.0
+
+
+def _bb_bandwidth(df: pd.DataFrame, period: int = 20, k: float = 2.0) -> float:
+    """
+    Bandwidth = (upper-lower)/middle. last value.
+    """
+    try:
+        if df is None or df.empty or len(df) < period + 5:
+            return 0.0
+        if "close" not in df.columns:
+            return 0.0
+        c = pd.to_numeric(df["close"], errors="coerce").astype(float)
+        mid = c.rolling(int(period)).mean()
+        sd = c.rolling(int(period)).std(ddof=0)
+        upper = mid + float(k) * sd
+        lower = mid - float(k) * sd
+        denom = mid.replace(0, np.nan)
+        bw = (upper - lower) / denom
+        v = float(bw.iloc[-1])
+        return v if np.isfinite(v) else 0.0
+    except Exception:
+        return 0.0
+
+
+def _is_squeeze(df: pd.DataFrame) -> bool:
+    bw = _bb_bandwidth(df, period=TG_BB_PERIOD, k=TG_BB_K)
+    return bool(bw > 0 and bw < TG_BB_SQUEEZE_BW)
+
+
+def _is_market_entry(entry_type: str) -> bool:
+    return "MARKET" in str(entry_type or "").upper()
+
+
+def _htf_bias_from_df(df_h4: pd.DataFrame) -> str:
+    """
+    Priority:
+      1) analyze_structure(df_h4).trend if available
+      2) EMA20/EMA50 direction as fallback
+    """
+    try:
+        st = analyze_structure(df_h4)
+        t = str(st.get("trend") or "").upper()
+        if t in ("LONG", "SHORT"):
+            return t
+    except Exception:
+        pass
+
+    try:
+        if df_h4 is None or df_h4.empty or len(df_h4) < 60 or "close" not in df_h4.columns:
+            return "RANGE"
+        c = pd.to_numeric(df_h4["close"], errors="coerce").astype(float)
+        e20 = _ema(c, 20)
+        e50 = _ema(c, 50)
+        if float(e20.iloc[-1]) > float(e50.iloc[-1]):
+            return "LONG"
+        if float(e20.iloc[-1]) < float(e50.iloc[-1]):
+            return "SHORT"
+        return "RANGE"
+    except Exception:
+        return "RANGE"
+
+
+def _trend_guard(
+    *,
+    df_h1: pd.DataFrame,
+    df_h4: pd.DataFrame,
+    bias: str,
+    entry: Optional[float],
+    entry_type: str,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Hard filters to avoid counter-trend + chop/late MARKET entries.
+
+    Returns (ok, reason, meta)
+    """
+    meta: Dict[str, Any] = {}
+    b = str(bias or "").upper()
+    et = str(entry_type or "MARKET")
+
+    # 1) HTF bias mismatch
+    htf_bias = _htf_bias_from_df(df_h4)
+    meta["htf_bias"] = htf_bias
+    meta["bias"] = b
+    if htf_bias in ("LONG", "SHORT") and b in ("LONG", "SHORT") and htf_bias != b:
+        return False, "reject:htf_bias_mismatch", meta
+
+    # 2) Regime: ADX weak trend + squeeze => no MARKET
+    adx_v = _adx_wilder(df_h4, period=TG_ADX_PERIOD)
+    meta["adx_h4"] = float(adx_v)
+    sq = _is_squeeze(df_h1)
+    meta["squeeze_h1"] = bool(sq)
+
+    if _is_market_entry(et) and TG_STRICT_REGIME_MARKET:
+        if adx_v > 0 and adx_v < TG_ADX_MIN:
+            return False, "reject:weak_trend_no_market", meta
+        if sq:
+            return False, "reject:squeeze_no_market", meta
+
+        # 3) Overextension: entry too far from EMA20 (H1)
+        try:
+            if entry is not None and "close" in df_h1.columns:
+                a = _atr(df_h1, 14)
+                meta["atr_h1"] = float(a)
+                if a > 0:
+                    c = pd.to_numeric(df_h1["close"], errors="coerce").astype(float)
+                    ema20 = float(_ema(c, 20).iloc[-1])
+                    meta["ema20_h1"] = float(ema20)
+                    if abs(float(entry) - ema20) > float(TG_OVEREXT_ATR) * a:
+                        return False, "reject:overextended_market", meta
+        except Exception:
+            pass
+
+    return True, "OK", meta
+
+
+# =====================================================================
+# Macro unwrap helpers
+# =====================================================================
+
+def _unwrap_macro(macro: Any) -> Dict[str, Any]:
+    """
+    scanner.py passes macro_ctx like:
+      macro_ctx = {"macro": msnap_dict, "options": osnap_dict}
+
+    This helper keeps backward compatibility with older formats.
+    """
+    if isinstance(macro, dict):
+        return macro
+    return {}
 
 
 def _get_macro_ref_df(macro: Any) -> Optional[pd.DataFrame]:
     """
-    Tries to find a BTC H1 dataframe inside `macro`.
-    Tolerates multiple common key names.
+    Tries to find a BTC H1 dataframe inside macro container.
+    Tolerates:
+      - macro["btc_h1"], macro["btc_df_h1"], etc.
+      - macro["macro"]["btc_h1"], etc.
     """
     try:
-        if not isinstance(macro, dict):
-            return None
+        m = _unwrap_macro(macro)
+        # direct
         for k in ("btc_h1", "btc_df_h1", "btc_h1_df", "BTC_H1", "BTC", "btc"):
-            v = macro.get(k)
+            v = m.get(k)
             if isinstance(v, pd.DataFrame) and (not v.empty):
                 return v
+        # nested
+        mm = m.get("macro")
+        if isinstance(mm, dict):
+            for k in ("btc_h1", "btc_df_h1", "btc_h1_df", "BTC_H1", "BTC", "btc"):
+                v = mm.get(k)
+                if isinstance(v, pd.DataFrame) and (not v.empty):
+                    return v
         return None
     except Exception:
         return None
@@ -98,33 +295,62 @@ def _get_macro_implied_vol(macro: Any, symbol: str) -> Optional[float]:
     Optional implied vol input:
       - macro["implied_vol"] or macro["iv"] can be float
       - or dict mapping symbol->iv
+    Also checks nested macro["macro"].
     """
     try:
-        if not isinstance(macro, dict):
-            return None
-        iv = macro.get("implied_vol", None)
-        if iv is None:
-            iv = macro.get("iv", None)
+        m = _unwrap_macro(macro)
 
-        if iv is None:
-            return None
+        def _probe(d: Dict[str, Any]) -> Optional[float]:
+            iv = d.get("implied_vol", None)
+            if iv is None:
+                iv = d.get("iv", None)
+            if iv is None:
+                return None
 
-        if isinstance(iv, (int, float, np.floating)):
-            v = float(iv)
-            return v if np.isfinite(v) and v > 0 else None
-
-        if isinstance(iv, dict):
-            # try exact symbol first
-            if symbol in iv:
-                v = float(iv[symbol])
+            if isinstance(iv, (int, float, np.floating)):
+                v = float(iv)
                 return v if np.isfinite(v) and v > 0 else None
 
-            # common cleanup attempts (non-blocking)
-            sym2 = str(symbol).replace("-USDT", "").replace("USDTM", "").replace("USDT", "")
-            if sym2 in iv:
-                v = float(iv[sym2])
-                return v if np.isfinite(v) and v > 0 else None
+            if isinstance(iv, dict):
+                if symbol in iv:
+                    v = float(iv[symbol])
+                    return v if np.isfinite(v) and v > 0 else None
+                sym2 = str(symbol).replace("-USDT", "").replace("USDTM", "").replace("USDT", "")
+                if sym2 in iv:
+                    v = float(iv[sym2])
+                    return v if np.isfinite(v) and v > 0 else None
+            return None
 
+        v1 = _probe(m)
+        if v1 is not None:
+            return v1
+        mm = m.get("macro")
+        if isinstance(mm, dict):
+            return _probe(mm)
+        return None
+    except Exception:
+        return None
+
+
+def _get_options_obj(macro: Any) -> Any:
+    """
+    Returns options snapshot-like object from:
+      - macro["options"] (scanner format)
+      - macro["options_snapshot"]
+      - macro["options"] itself (legacy)
+    """
+    try:
+        m = _unwrap_macro(macro)
+        if "options" in m:
+            return m.get("options")
+        if "options_snapshot" in m:
+            return m.get("options_snapshot")
+        mm = m.get("macro")
+        if isinstance(mm, dict):
+            if "options" in mm:
+                return mm.get("options")
+            if "options_snapshot" in mm:
+                return mm.get("options_snapshot")
         return None
     except Exception:
         return None
@@ -864,7 +1090,6 @@ def _inst_score_normalized_0_100(inst: Dict[str, Any], gate: int) -> int:
 
         max_sum = meta.get("max_components_sum")
         if max_sum is None:
-            # fallback: number of components (assumes 0/1 or small int)
             max_sum = len(comps) if isinstance(comps, dict) and len(comps) > 0 else 1
 
         max_sum_i = int(max(1, int(max_sum)))
@@ -986,33 +1211,22 @@ class SignalAnalyzer:
             return _reject("smt_divergence_veto", smt=smt, smt_veto=True, structure=struct, momentum=mom, composite=comp)
 
         # ---------------------------------------------------------------
-        # Optional options/vol filter (realized vol + implied vol if provided)
+        # options_data regime (Deribit DVOL snapshot) — soft context
         # ---------------------------------------------------------------
         options_filter: Optional[Dict[str, Any]] = None
         options_soft_veto = False
 
-        if realized_volatility is not None and options_vol_filter is not None:
-            rv = realized_volatility(df_h1, lookback=96)
-            iv = _get_macro_implied_vol(macro, symbol)
-            options_filter = options_vol_filter(realized_vol=float(rv), implied_vol=iv)
-
-            # If the helper decides "ok=False" (ex: extreme regime + veto enabled), enforce in strict mode
-            if isinstance(options_filter, dict) and (not bool(options_filter.get("ok", True))) and (not DESK_EV_MODE):
-                LOGGER.info("[EVAL_REJECT] %s options_regime_veto options=%s", symbol, options_filter)
-                return _reject(
-                    "options_regime_veto",
-                    options_filter=options_filter,
-                    smt=smt,
-                    smt_veto=bool(smt_veto),
-                    structure=struct,
-                    momentum=mom,
-                    composite=comp,
-                )
-
-            # In desk mode, treat HIGH/EXTREME as soft veto (de-prioritize)
+        if score_options_context is not None:
+            opt_obj = _get_options_obj(macro)
             try:
-                reg = str((options_filter or {}).get("regime") or "").upper()
-                if reg in ("HIGH", "EXTREME"):
+                options_filter = score_options_context(opt_obj, bias=bias)
+            except Exception:
+                options_filter = {"ok": True, "score": 0, "regime": "unknown", "reason": "options_error"}
+
+            # If regime is HIGH_VOL and you're doing MARKET, treat as soft veto in desk mode
+            try:
+                reg = str((options_filter or {}).get("regime") or "").lower()
+                if reg in ("high_vol",):
                     options_soft_veto = True
             except Exception:
                 options_soft_veto = False
@@ -1028,12 +1242,30 @@ class SignalAnalyzer:
         liq_sweep_pre = liquidity_sweep_details(df_h1, bias, lookback=180)
         sweep_ok = bool(isinstance(liq_sweep_pre, dict) and liq_sweep_pre.get("ok"))
 
+        # STRICT HTF bias mismatch (anti-contre-tendance) — early
+        htf_bias_now = _htf_bias_from_df(df_h4)
+        if TG_STRICT_HTF_BIAS and (htf_bias_now in ("LONG", "SHORT")) and (bias in ("LONG", "SHORT")) and (htf_bias_now != bias):
+            if DESK_EV_MODE and (not TG_STRICT_HTF_BIAS):
+                soft_vetoes.append("htf_bias_mismatch")
+            else:
+                LOGGER.info("[EVAL_REJECT] %s htf_bias_mismatch bias=%s htf_bias=%s", symbol, bias, htf_bias_now)
+                return _reject(
+                    "htf_bias_mismatch",
+                    structure=struct,
+                    momentum=mom,
+                    composite=comp,
+                    htf_bias=htf_bias_now,
+                    smt=smt,
+                    smt_veto=bool(smt_veto),
+                    options_filter=options_filter,
+                )
+
         # REQUIRE_STRUCTURE: keep strict only outside desk mode.
         if REQUIRE_STRUCTURE and used_bias_fallback and (not DESK_EV_MODE):
             LOGGER.info("[EVAL_REJECT] %s no_clear_trend_range", symbol)
             return _reject("no_clear_trend_range", structure=struct, momentum=mom, composite=comp, smt=smt, smt_veto=bool(smt_veto))
 
-        # HTF alignment gating
+        # HTF alignment gating (legacy helper)
         if REQUIRE_HTF_ALIGN and bias in ("LONG", "SHORT"):
             if not htf_trend_ok(df_h4, bias):
                 if DESK_EV_MODE:
@@ -1041,12 +1273,12 @@ class SignalAnalyzer:
                     LOGGER.info("[EVAL_PRE] %s HTF_VETO (soft, desk_mode)", symbol)
                 else:
                     LOGGER.info("[EVAL_REJECT] %s htf_veto", symbol)
-                    return _reject("htf_veto", structure=struct, smt=smt, smt_veto=bool(smt_veto))
+                    return _reject("htf_veto", structure=struct, smt=smt, smt_veto=bool(smt_veto), options_filter=options_filter)
 
         # In non-desk mode, require at least one structural trigger (BOS or RAID or SWEEP)
         if (not DESK_EV_MODE) and (not (bos_flag or raid_ok or sweep_ok)):
             LOGGER.info("[EVAL_REJECT] %s no_structure_trigger", symbol)
-            return _reject("no_structure_trigger", structure=struct, sweep=liq_sweep_pre, smt=smt, smt_veto=bool(smt_veto))
+            return _reject("no_structure_trigger", structure=struct, sweep=liq_sweep_pre, smt=smt, smt_veto=bool(smt_veto), options_filter=options_filter)
 
         # Momentum gating (cheap)
         if REQUIRE_MOMENTUM:
@@ -1056,14 +1288,14 @@ class SignalAnalyzer:
                     LOGGER.info("[EVAL_PRE] %s MOM_VETO (soft, desk_mode)", symbol)
                 else:
                     LOGGER.info("[EVAL_REJECT] %s momentum_not_bullish", symbol)
-                    return _reject("momentum_not_bullish", structure=struct, smt=smt, smt_veto=bool(smt_veto))
+                    return _reject("momentum_not_bullish", structure=struct, smt=smt, smt_veto=bool(smt_veto), options_filter=options_filter)
             if bias == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
                 if DESK_EV_MODE:
                     soft_vetoes.append("momentum_not_bearish")
                     LOGGER.info("[EVAL_PRE] %s MOM_VETO (soft, desk_mode)", symbol)
                 else:
                     LOGGER.info("[EVAL_REJECT] %s momentum_not_bearish", symbol)
-                    return _reject("momentum_not_bearish", structure=struct, smt=smt, smt_veto=bool(smt_veto))
+                    return _reject("momentum_not_bearish", structure=struct, smt=smt, smt_veto=bool(smt_veto), options_filter=options_filter)
 
         # ===============================================================
         # PRE-PRIORITY (cheap) → controls PASS2
@@ -1078,16 +1310,16 @@ class SignalAnalyzer:
             ext_sig=ext_sig,
         )
 
-        # NEW: SMT + options regime -> desk soft veto + pre_priority downgrade
+        # SMT + options regime -> desk soft veto + pre_priority downgrade
         if smt_veto and DESK_EV_MODE:
             soft_vetoes.append("smt_veto")
             pre_priority = _downgrade(pre_priority, 1)
             pre_priority_reasons = list(pre_priority_reasons) + ["pre:smt_veto_downgrade"]
 
         if options_soft_veto and DESK_EV_MODE:
-            soft_vetoes.append("options_vol_regime_high")
+            soft_vetoes.append("options_regime_high_vol")
             pre_priority = _downgrade(pre_priority, 1)
-            pre_priority_reasons = list(pre_priority_reasons) + ["pre:options_regime_high_downgrade"]
+            pre_priority_reasons = list(pre_priority_reasons) + ["pre:options_high_vol_downgrade"]
 
         pass2_allowed_by_priority = priority_at_least(pre_priority, PASS2_ONLY_FOR_PRIORITY)
 
@@ -1326,7 +1558,41 @@ class SignalAnalyzer:
             atr14,
         )
 
-        # Extension hygiene
+        # ---------------------------------------------------------------
+        # TrendGuard (anti-contre-tendance / anti-chop MARKET)
+        # ---------------------------------------------------------------
+        tg_ok, tg_why, tg_meta = _trend_guard(
+            df_h1=df_h1,
+            df_h4=df_h4,
+            bias=bias,
+            entry=float(entry) if entry > 0 else None,
+            entry_type=entry_type,
+        )
+        LOGGER.info("[EVAL_PRE] %s TREND_GUARD ok=%s why=%s meta=%s", symbol, tg_ok, tg_why, tg_meta)
+
+        if not tg_ok:
+            # In desk mode you can choose to soft-veto instead of reject
+            if DESK_EV_MODE and (not TG_STRICT_REGIME_MARKET) and (tg_why != "reject:htf_bias_mismatch"):
+                soft_vetoes.append(tg_why.replace("reject:", "tg:"))
+            else:
+                return _reject(
+                    tg_why.replace("reject:", ""),
+                    institutional=inst,
+                    structure=struct,
+                    entry_pick=entry_pick,
+                    trend_guard=tg_meta,
+                    pre_priority=pre_priority,
+                    pre_priority_reasons=pre_priority_reasons,
+                    soft_vetoes=soft_vetoes,
+                    smt=smt,
+                    smt_veto=bool(smt_veto),
+                    options_filter=options_filter,
+                    inst_gate=int(gate),
+                    inst_ok_count=int(ok_count),
+                    inst_score_norm=int(inst_score_norm),
+                )
+
+        # Extension hygiene (existing)
         if ext_sig == "OVEREXTENDED_LONG" and bias == "LONG":
             if entry_type == "MARKET":
                 LOGGER.info("[EVAL_REJECT] %s overextended_long_market", symbol)
@@ -1335,6 +1601,7 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
+                    trend_guard=tg_meta,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                     soft_vetoes=soft_vetoes,
@@ -1352,6 +1619,7 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
+                    trend_guard=tg_meta,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                     soft_vetoes=soft_vetoes,
@@ -1371,6 +1639,7 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
+                    trend_guard=tg_meta,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                     soft_vetoes=soft_vetoes,
@@ -1388,6 +1657,7 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
+                    trend_guard=tg_meta,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                     soft_vetoes=soft_vetoes,
@@ -1408,6 +1678,7 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
+                    trend_guard=tg_meta,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                     soft_vetoes=soft_vetoes,
@@ -1425,6 +1696,7 @@ class SignalAnalyzer:
                     institutional=inst,
                     structure=struct,
                     entry_pick=entry_pick,
+                    trend_guard=tg_meta,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                     soft_vetoes=soft_vetoes,
@@ -1535,6 +1807,7 @@ class SignalAnalyzer:
                 "sl_invalid_after_liq_adj",
                 institutional=inst,
                 structure=struct,
+                trend_guard=tg_meta,
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
                 soft_vetoes=soft_vetoes,
@@ -1572,6 +1845,7 @@ class SignalAnalyzer:
                 institutional=inst,
                 structure=struct,
                 entry_pick=entry_pick,
+                trend_guard=tg_meta,
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
                 soft_vetoes=soft_vetoes,
@@ -1642,6 +1916,7 @@ class SignalAnalyzer:
                 "pre_priority_reasons": pre_priority_reasons,
                 "pass2_done": bool(do_pass2),
                 "soft_vetoes": soft_vetoes,
+                "trend_guard": tg_meta,
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
@@ -1705,6 +1980,7 @@ class SignalAnalyzer:
                 "pre_priority_reasons": pre_priority_reasons,
                 "pass2_done": bool(do_pass2),
                 "soft_vetoes": soft_vetoes,
+                "trend_guard": tg_meta,
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
@@ -1769,6 +2045,7 @@ class SignalAnalyzer:
                 "pre_priority_reasons": pre_priority_reasons,
                 "pass2_done": bool(do_pass2),
                 "soft_vetoes": soft_vetoes,
+                "trend_guard": tg_meta,
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
@@ -1837,6 +2114,7 @@ class SignalAnalyzer:
                     "pre_priority_reasons": pre_priority_reasons,
                     "pass2_done": bool(do_pass2),
                     "soft_vetoes": soft_vetoes,
+                    "trend_guard": tg_meta,
                     "structure": struct,
                     "bos_quality": bos_q,
                     "institutional": inst,
@@ -1876,6 +2154,7 @@ class SignalAnalyzer:
             "pre_priority": pre_priority,
             "pre_priority_reasons": pre_priority_reasons,
             "soft_vetoes": soft_vetoes,
+            "trend_guard": tg_meta,
             "smt": smt,
             "smt_veto": bool(smt_veto),
             "options_filter": options_filter,
