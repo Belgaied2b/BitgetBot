@@ -1,5 +1,9 @@
 # =====================================================================
 # analyze_signal.py — Desk institutional analyzer (TTL-compatible setup)
+# - Integrates new institutional_data.py gate (raw_components_sum) + ok_count
+# - 2-pass institutional policy (LIGHT then NORMAL/FULL)
+# - Liquidations PASS2-only by default (anti-ban)
+# - TTL-compatible setup_type suffixing for scanner.py
 # =====================================================================
 
 from __future__ import annotations
@@ -60,7 +64,7 @@ ALLOW_TECH_FALLBACK_WHEN_INST_DOWN = str(os.getenv("ALLOW_TECH_FALLBACK_WHEN_INS
 # =====================================================================
 def _setup_ttl_compatible(setup_type: str, entry_type: str) -> str:
     """
-    scanner.py uses _entry_ttl_s(entry_type, setup) but looks for OTE/FVG in setup.
+    scanner.py uses _entry_ttl_s(entry_type, setup) but looks for OTE/FVG/RAID in setup.
     We keep the canonical setup type, and append a suffix when needed so TTL works.
 
     Rules:
@@ -95,14 +99,14 @@ def _env_str(name: str, default: str) -> str:
 
 
 # Liquidations enabled (global)
-INST_ENABLE_LIQUIDATIONS = _env_flag("INST_ENABLE_LIQUIDATIONS", "1")  # ✅ default ON
+INST_ENABLE_LIQUIDATIONS = _env_flag("INST_ENABLE_LIQUIDATIONS", "1")  # default ON
 
 # If 1: only call liquidations on PASS2 (recommended)
-INST_LIQ_PASS2_ONLY = _env_flag("INST_LIQ_PASS2_ONLY", "1")  # ✅ default ON (anti-ban)
+INST_LIQ_PASS2_ONLY = _env_flag("INST_LIQ_PASS2_ONLY", "1")  # default ON (anti-ban)
 
 # Pass modes (override institutional_data INST_MODE)
 INST_PASS1_MODE = _env_str("INST_PASS1_MODE", "LIGHT").upper()
-INST_PASS2_MODE = _env_str("INST_PASS2_MODE", "NORMAL").upper()  # NORMAL par défaut (FULL si tu veux)
+INST_PASS2_MODE = _env_str("INST_PASS2_MODE", "NORMAL").upper()  # NORMAL by default (FULL if you want)
 
 # Enable/disable pass2 completely
 INST_PASS2_ENABLED = _env_flag("INST_PASS2_ENABLED", "1")
@@ -156,7 +160,7 @@ def _pre_grade_candidate(
     ext_sig: str,
 ) -> Tuple[str, List[str]]:
     """
-    PRE-grade "cheap" (avant PASS2) pour limiter les appels institutionnels lourds.
+    PRE-grade "cheap" (avant PASS2) pour limiter les calls institutionnels lourds.
     """
     reasons: List[str] = []
     m = (mom or "").upper()
@@ -211,6 +215,7 @@ def _final_grade(
     ext_sig: str,
     unfavorable_market: bool,
     mom: str,
+    soft_vetoes: Optional[List[str]] = None,
 ) -> Tuple[str, List[str]]:
     """
     Grade final A→E + reasons. (A meilleur)
@@ -221,6 +226,7 @@ def _final_grade(
     et = (entry_type or "").upper()
     ext = (ext_sig or "").upper()
     m = (mom or "").upper()
+    svs = soft_vetoes or []
 
     # Base from setup type
     if st == "BOS_STRICT":
@@ -268,6 +274,10 @@ def _final_grade(
     if ext.startswith("OVEREXTENDED"):
         p = _downgrade(p, 1)
         reasons.append("downgrade:overextended")
+
+    if svs:
+        p = _downgrade(p, 1)
+        reasons.append(f"downgrade:soft_vetoes({','.join(svs)})")
 
     if m in ("STRONG_BULLISH", "STRONG_BEARISH"):
         p = _upgrade(p, 1)
@@ -744,7 +754,7 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
 
 
 # =====================================================================
-# Institutional gate helpers
+# Institutional gate helpers (NEW score integration)
 # =====================================================================
 def _inst_ok_count(inst: Dict[str, Any]) -> int:
     comp = inst.get("score_components") or {}
@@ -864,7 +874,10 @@ class SignalAnalyzer:
 
         # ---------------------------------------------------------------
         # PRE-FILTERS (cheap) BEFORE institutional call (anti-ban)
+        # (In DESK_EV_MODE, HTF/MOMENTUM veto are treated as soft vetoes)
         # ---------------------------------------------------------------
+        soft_vetoes: List[str] = []
+
         bos_flag = bool(struct.get("bos", False))
         raid_ok = bool(isinstance(struct.get("raid_displacement"), dict) and struct["raid_displacement"].get("ok"))
         liq_sweep_pre = liquidity_sweep_details(df_h1, bias, lookback=180)
@@ -875,10 +888,15 @@ class SignalAnalyzer:
             LOGGER.info("[EVAL_REJECT] %s no_clear_trend_range", symbol)
             return _reject("no_clear_trend_range", structure=struct, momentum=mom, composite=comp)
 
+        # HTF alignment gating
         if REQUIRE_HTF_ALIGN and bias in ("LONG", "SHORT"):
             if not htf_trend_ok(df_h4, bias):
-                LOGGER.info("[EVAL_REJECT] %s htf_veto", symbol)
-                return _reject("htf_veto", structure=struct)
+                if DESK_EV_MODE:
+                    soft_vetoes.append("htf_veto")
+                    LOGGER.info("[EVAL_PRE] %s HTF_VETO (soft, desk_mode)", symbol)
+                else:
+                    LOGGER.info("[EVAL_REJECT] %s htf_veto", symbol)
+                    return _reject("htf_veto", structure=struct)
 
         # In non-desk mode, require at least one structural trigger (BOS or RAID or SWEEP)
         if (not DESK_EV_MODE) and (not (bos_flag or raid_ok or sweep_ok)):
@@ -888,11 +906,19 @@ class SignalAnalyzer:
         # Momentum gating (cheap)
         if REQUIRE_MOMENTUM:
             if bias == "LONG" and mom not in ("BULLISH", "STRONG_BULLISH"):
-                LOGGER.info("[EVAL_REJECT] %s momentum_not_bullish", symbol)
-                return _reject("momentum_not_bullish", structure=struct)
+                if DESK_EV_MODE:
+                    soft_vetoes.append("momentum_not_bullish")
+                    LOGGER.info("[EVAL_PRE] %s MOM_VETO (soft, desk_mode)", symbol)
+                else:
+                    LOGGER.info("[EVAL_REJECT] %s momentum_not_bullish", symbol)
+                    return _reject("momentum_not_bullish", structure=struct)
             if bias == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
-                LOGGER.info("[EVAL_REJECT] %s momentum_not_bearish", symbol)
-                return _reject("momentum_not_bearish", structure=struct)
+                if DESK_EV_MODE:
+                    soft_vetoes.append("momentum_not_bearish")
+                    LOGGER.info("[EVAL_PRE] %s MOM_VETO (soft, desk_mode)", symbol)
+                else:
+                    LOGGER.info("[EVAL_REJECT] %s momentum_not_bearish", symbol)
+                    return _reject("momentum_not_bearish", structure=struct)
 
         # ===============================================================
         # PRE-PRIORITY (cheap) → controls PASS2
@@ -910,12 +936,13 @@ class SignalAnalyzer:
         pass2_allowed_by_priority = priority_at_least(pre_priority, PASS2_ONLY_FOR_PRIORITY)
 
         LOGGER.info(
-            "[EVAL_PRE] %s PRE_PRIORITY=%s (min_for_pass2=%s) pass2_allowed=%s reasons=%s",
+            "[EVAL_PRE] %s PRE_PRIORITY=%s (min_for_pass2=%s) pass2_allowed=%s reasons=%s soft_vetoes=%s",
             symbol,
             pre_priority,
             PASS2_ONLY_FOR_PRIORITY,
             pass2_allowed_by_priority,
             pre_priority_reasons,
+            soft_vetoes,
         )
 
         # ===============================================================
@@ -952,8 +979,19 @@ class SignalAnalyzer:
         liq_eff_1 = inst.get("liquidation_intensity") is not None
 
         LOGGER.info(
-            "[INST_RAW] %s pass=1 mode=%s liq_req=%s liq_ok=%s inst_score=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s",
-            symbol, mode_eff_1, pass1_liq, liq_eff_1, inst.get("institutional_score"), ok_count, gate, override, available, binance_symbol, bias
+            "[INST_RAW] %s pass=1 mode=%s liq_req=%s liq_ok=%s inst_score=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s comps=%s",
+            symbol,
+            mode_eff_1,
+            pass1_liq,
+            liq_eff_1,
+            inst.get("institutional_score"),
+            ok_count,
+            gate,
+            override,
+            available,
+            binance_symbol,
+            bias,
+            inst.get("available_components") or [],
         )
 
         # If inst not available: strict reject unless fallback enabled
@@ -970,6 +1008,7 @@ class SignalAnalyzer:
                     composite=comp,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
+                    soft_vetoes=soft_vetoes,
                 )
 
         # Pass2: only for “candidates” + liquidations ON here
@@ -982,7 +1021,7 @@ class SignalAnalyzer:
         )
 
         if do_pass2:
-            pass2_liq = bool(INST_ENABLE_LIQUIDATIONS)  # ✅ liquidations ON here
+            pass2_liq = bool(INST_ENABLE_LIQUIDATIONS)  # liquidations ON here
             try:
                 inst2 = await compute_full_institutional_analysis(
                     symbol,
@@ -1013,8 +1052,19 @@ class SignalAnalyzer:
                 liq_eff_2 = inst.get("liquidation_intensity") is not None
 
                 LOGGER.info(
-                    "[INST_RAW] %s pass=2 mode=%s liq_req=%s liq_ok=%s inst_score=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s",
-                    symbol, mode_eff_2, pass2_liq, liq_eff_2, inst.get("institutional_score"), ok_count, gate, override, available, binance_symbol, bias
+                    "[INST_RAW] %s pass=2 mode=%s liq_req=%s liq_ok=%s inst_score=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s comps=%s",
+                    symbol,
+                    mode_eff_2,
+                    pass2_liq,
+                    liq_eff_2,
+                    inst.get("institutional_score"),
+                    ok_count,
+                    gate,
+                    override,
+                    available,
+                    binance_symbol,
+                    bias,
+                    inst.get("available_components") or [],
                 )
         else:
             LOGGER.info(
@@ -1041,6 +1091,7 @@ class SignalAnalyzer:
                 ok_count=int(ok_count),
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
+                soft_vetoes=soft_vetoes,
             )
 
         # ===============================================================
@@ -1072,6 +1123,7 @@ class SignalAnalyzer:
                 bos_quality=bos_q,
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
+                soft_vetoes=soft_vetoes,
             )
 
         premium, discount = compute_premium_discount(df_h1)
@@ -1107,6 +1159,7 @@ class SignalAnalyzer:
                     entry_pick=entry_pick,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
+                    soft_vetoes=soft_vetoes,
                 )
             if not _entry_pullback_ok(entry, entry_mkt, bias, atr14):
                 LOGGER.info("[EVAL_REJECT] %s overextended_long_no_pullback", symbol)
@@ -1117,6 +1170,7 @@ class SignalAnalyzer:
                     entry_pick=entry_pick,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
+                    soft_vetoes=soft_vetoes,
                 )
 
         if ext_sig == "OVEREXTENDED_SHORT" and bias == "SHORT":
@@ -1129,6 +1183,7 @@ class SignalAnalyzer:
                     entry_pick=entry_pick,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
+                    soft_vetoes=soft_vetoes,
                 )
             if not _entry_pullback_ok(entry, entry_mkt, bias, atr14):
                 LOGGER.info("[EVAL_REJECT] %s overextended_short_no_pullback", symbol)
@@ -1139,6 +1194,7 @@ class SignalAnalyzer:
                     entry_pick=entry_pick,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
+                    soft_vetoes=soft_vetoes,
                 )
 
         unfavorable_market = bool(entry_type == "MARKET" and ((bias == "LONG" and premium) or (bias == "SHORT" and discount)))
@@ -1152,6 +1208,7 @@ class SignalAnalyzer:
                     entry_pick=entry_pick,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
+                    soft_vetoes=soft_vetoes,
                 )
             if bias == "SHORT" and discount:
                 LOGGER.info("[EVAL_REJECT] %s short_in_discount_market", symbol)
@@ -1162,6 +1219,7 @@ class SignalAnalyzer:
                     entry_pick=entry_pick,
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
+                    soft_vetoes=soft_vetoes,
                 )
 
         # --------------------------
@@ -1251,7 +1309,7 @@ class SignalAnalyzer:
         except Exception:
             pass
 
-        # ✅ tick-grid rounding AFTER adjustments (exchange hygiene)
+        # tick-grid rounding AFTER adjustments
         sl = _round_sl_for_side(sl, entry, bias, tick)
         sl_adj["sl_post_round"] = float(sl)
 
@@ -1263,9 +1321,10 @@ class SignalAnalyzer:
                 structure=struct,
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
+                soft_vetoes=soft_vetoes,
             )
 
-        # ✅ recalc TP1 after SL adjustments
+        # recalc TP1 after SL adjustments
         try:
             tp1, _rr_used2 = compute_tp1(entry, sl, bias, df=df_h1, tick=tick)
             tp1 = float(tp1)
@@ -1293,6 +1352,7 @@ class SignalAnalyzer:
                 entry_pick=entry_pick,
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
+                soft_vetoes=soft_vetoes,
             )
 
         # ===============================================================
@@ -1327,6 +1387,7 @@ class SignalAnalyzer:
                 ext_sig=str(ext_sig),
                 unfavorable_market=bool(unfavorable_market),
                 mom=str(mom),
+                soft_vetoes=soft_vetoes,
             )
 
             setup_core = "BOS_STRICT"
@@ -1344,20 +1405,21 @@ class SignalAnalyzer:
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": setup_ttl,          # ✅ TTL-compatible for scanner.py
-                "setup_type_core": setup_core,    # ✅ canonical for debug
+                "setup_type": setup_ttl,          # TTL-compatible for scanner.py
+                "setup_type_core": setup_core,    # canonical for debug
                 "setup_variant": bos_variant,
                 "priority": priority,
                 "priority_reasons": priority_reasons,
                 "pre_priority": pre_priority,
                 "pre_priority_reasons": pre_priority_reasons,
                 "pass2_done": bool(do_pass2),
+                "soft_vetoes": soft_vetoes,
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
                 "inst_gate": int(gate),
                 "inst_ok_count": int(ok_count),
-                "inst_score_eff": int(gate),
+                "inst_score_eff": int(gate),  # gate used for acceptance
                 "momentum": mom,
                 "composite": comp,
                 "composite_score": comp_score,
@@ -1384,6 +1446,7 @@ class SignalAnalyzer:
                 ext_sig=str(ext_sig),
                 unfavorable_market=bool(unfavorable_market),
                 mom=str(mom),
+                soft_vetoes=soft_vetoes,
             )
 
             setup_core = "RAID_DISPLACEMENT"
@@ -1401,7 +1464,7 @@ class SignalAnalyzer:
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": setup_ttl,          # ✅ TTL-compatible
+                "setup_type": setup_ttl,          # TTL-compatible
                 "setup_type_core": setup_core,
                 "setup_variant": variant,
                 "priority": priority,
@@ -1409,6 +1472,7 @@ class SignalAnalyzer:
                 "pre_priority": pre_priority,
                 "pre_priority_reasons": pre_priority_reasons,
                 "pass2_done": bool(do_pass2),
+                "soft_vetoes": soft_vetoes,
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
@@ -1442,6 +1506,7 @@ class SignalAnalyzer:
                 ext_sig=str(ext_sig),
                 unfavorable_market=bool(unfavorable_market),
                 mom=str(mom),
+                soft_vetoes=soft_vetoes,
             )
 
             setup_core = "LIQ_SWEEP"
@@ -1459,7 +1524,7 @@ class SignalAnalyzer:
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": setup_ttl,          # ✅ TTL-compatible
+                "setup_type": setup_ttl,          # TTL-compatible
                 "setup_type_core": setup_core,
                 "setup_variant": variant,
                 "priority": priority,
@@ -1467,6 +1532,7 @@ class SignalAnalyzer:
                 "pre_priority": pre_priority,
                 "pre_priority_reasons": pre_priority_reasons,
                 "pass2_done": bool(do_pass2),
+                "soft_vetoes": soft_vetoes,
                 "structure": struct,
                 "bos_quality": bos_q,
                 "institutional": inst,
@@ -1504,6 +1570,7 @@ class SignalAnalyzer:
                     ext_sig=str(ext_sig),
                     unfavorable_market=bool(unfavorable_market),
                     mom=str(mom),
+                    soft_vetoes=soft_vetoes,
                 )
 
                 setup_core = "INST_CONTINUATION"
@@ -1521,7 +1588,7 @@ class SignalAnalyzer:
                     "tp2": None,
                     "rr": float(rr),
                     "qty": 1,
-                    "setup_type": setup_ttl,          # ✅ TTL-compatible
+                    "setup_type": setup_ttl,          # TTL-compatible
                     "setup_type_core": setup_core,
                     "setup_variant": "INST_CONTINUATION",
                     "priority": priority,
@@ -1529,6 +1596,7 @@ class SignalAnalyzer:
                     "pre_priority": pre_priority,
                     "pre_priority_reasons": pre_priority_reasons,
                     "pass2_done": bool(do_pass2),
+                    "soft_vetoes": soft_vetoes,
                     "structure": struct,
                     "bos_quality": bos_q,
                     "institutional": inst,
@@ -1562,4 +1630,5 @@ class SignalAnalyzer:
             "sl_meta": sl_meta_out,
             "pre_priority": pre_priority,
             "pre_priority_reasons": pre_priority_reasons,
+            "soft_vetoes": soft_vetoes,
         }
