@@ -3,6 +3,11 @@
 # BOS / CHOCH / COS / Internal vs External / Liquidity / OB / FVG / HTF
 # + RAID → DISPLACEMENT → FVG entry (desk model)
 # + Volume Profile (POC/HVN/LVN) lightweight
+#
+# NEW:
+#   - External HTF levels: PDH/PDL + PWH/PWL
+#   - Sessions: ASIA/LONDON/NEWYORK highs/lows (best-effort)
+#   - BOS "EXTERNAL" can be flagged using PDH/PDL/PWH/PWL (non-breaking)
 # =====================================================================
 # API stable used by analyze_signal.py:
 #   - analyze_structure(df) -> dict with keys: trend, bos, bos_direction, bos_type, fvg_zones, oi_series...
@@ -16,6 +21,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+import os
 import numpy as np
 import pandas as pd
 
@@ -118,6 +124,334 @@ def _median_range(df: pd.DataFrame, n: int = 60) -> float:
         return max(0.0, v) if np.isfinite(v) else 0.0
     except Exception:
         return 0.0
+
+
+# =====================================================================
+# Datetime / HTF external levels (PDH/PDL, PWH/PWL, sessions)
+# =====================================================================
+
+_TIME_COL_CANDIDATES = ("timestamp", "time", "datetime", "date")
+
+
+def _infer_dt_index(df: pd.DataFrame) -> Tuple[Optional[pd.DatetimeIndex], Dict[str, Any]]:
+    """
+    Best-effort datetime extraction. Returns (DatetimeIndex|None, meta).
+    If no reliable datetime is found, returns None.
+
+    - If df.index is DatetimeIndex => use it.
+    - Else tries columns: timestamp/time/datetime/date.
+      * numeric => infer seconds/ms
+      * string  => pd.to_datetime
+    """
+    meta: Dict[str, Any] = {"available": False, "source": None, "tz": None, "assumption": None, "error": None}
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            meta["error"] = "df_empty"
+            return None, meta
+
+        if isinstance(df.index, pd.DatetimeIndex):
+            dt = df.index
+            meta.update({"available": True, "source": "index", "tz": str(dt.tz) if dt.tz else None})
+            if dt.tz is None:
+                meta["assumption"] = "naive_index_assumed_utc"
+            return dt, meta
+
+        for c in _TIME_COL_CANDIDATES:
+            if c not in df.columns:
+                continue
+
+            s = df[c]
+            if s is None or len(s) == 0:
+                continue
+
+            # numeric timestamps
+            if np.issubdtype(s.dtype, np.number):
+                vals = pd.Series(s).astype("float64")
+                med = float(np.nanmedian(vals.values))
+                if not np.isfinite(med):
+                    continue
+
+                # heuristic: ms vs s
+                # - seconds since epoch ~ 1e9
+                # - ms since epoch ~ 1e12
+                unit = "s"
+                if med >= 1e12:
+                    unit = "ms"
+                elif med >= 1e10:
+                    unit = "ms"
+                elif med >= 1e9:
+                    unit = "s"
+
+                dt = pd.to_datetime(vals, unit=unit, errors="coerce")
+                dt = pd.DatetimeIndex(dt)
+                if dt.isna().all():
+                    continue
+
+                meta.update({"available": True, "source": c, "tz": str(dt.tz) if dt.tz else None})
+                if dt.tz is None:
+                    meta["assumption"] = f"naive_{c}_assumed_utc"
+                return dt, meta
+
+            # string/object timestamps
+            dt = pd.to_datetime(pd.Series(s), errors="coerce")
+            dt = pd.DatetimeIndex(dt)
+            if dt.isna().all():
+                continue
+
+            meta.update({"available": True, "source": c, "tz": str(dt.tz) if dt.tz else None})
+            if dt.tz is None:
+                meta["assumption"] = f"naive_{c}_assumed_utc"
+            return dt, meta
+
+        meta["error"] = "no_datetime_found"
+        return None, meta
+    except Exception as e:
+        meta["error"] = f"dt_infer_error:{e}"
+        return None, meta
+
+
+def _coerce_to_tz(dt: pd.DatetimeIndex, tz: Optional[str]) -> Tuple[pd.DatetimeIndex, Dict[str, Any]]:
+    """
+    Best-effort timezone normalization:
+      - if dt tz-aware -> convert
+      - if dt naive -> keep naive and note assumption
+    """
+    meta: Dict[str, Any] = {"tz_used": None, "note": None}
+    if dt is None or len(dt) == 0:
+        meta["note"] = "dt_empty"
+        return dt, meta
+
+    tz_req = (tz or "").strip() or None
+    if tz_req is None:
+        meta["tz_used"] = str(dt.tz) if dt.tz else None
+        return dt, meta
+
+    try:
+        if dt.tz is None:
+            # keep naive; we can't safely localize without knowing the source timezone
+            meta["tz_used"] = None
+            meta["note"] = f"naive_dt_no_localize_requested_tz={tz_req}"
+            return dt, meta
+        out = dt.tz_convert(tz_req)
+        meta["tz_used"] = tz_req
+        return out, meta
+    except Exception as e:
+        meta["note"] = f"tz_convert_failed:{e}"
+        meta["tz_used"] = str(dt.tz) if dt.tz else None
+        return dt, meta
+
+
+def _daily_levels_from_h1(df: pd.DataFrame, dt: pd.DatetimeIndex) -> Optional[pd.DataFrame]:
+    """
+    Returns DataFrame indexed by date with columns: high, low.
+    """
+    try:
+        if df is None or df.empty or dt is None or len(dt) != len(df):
+            return None
+        if not _has_cols(df, ("high", "low")):
+            return None
+
+        tmp = df[["high", "low"]].copy()
+        tmp["__dt__"] = dt
+        tmp["__date__"] = pd.to_datetime(tmp["__dt__"]).dt.floor("D")
+        g = tmp.groupby("__date__", sort=True)
+        out = pd.DataFrame({"high": g["high"].max(), "low": g["low"].min()})
+        return out
+    except Exception:
+        return None
+
+
+def _weekly_levels_from_h1(df: pd.DataFrame, dt: pd.DatetimeIndex) -> Optional[pd.DataFrame]:
+    """
+    Returns DataFrame indexed by weekly periods with columns: high, low.
+    Uses W-SUN as week ending Sunday (common Monday-start week).
+    """
+    try:
+        if df is None or df.empty or dt is None or len(dt) != len(df):
+            return None
+        if not _has_cols(df, ("high", "low")):
+            return None
+
+        tmp = df[["high", "low"]].copy()
+        tmp["__dt__"] = dt
+        per = pd.to_datetime(tmp["__dt__"]).to_period("W-SUN")
+        tmp["__wk__"] = per
+        g = tmp.groupby("__wk__", sort=True)
+        out = pd.DataFrame({"high": g["high"].max(), "low": g["low"].min()})
+        return out
+    except Exception:
+        return None
+
+
+# Default sessions (UTC-like). If dt is tz-aware and convertible, pass a tz string in env STRUCT_SESS_TZ.
+# If dt is naive => sessions are computed on naive timestamps; we cannot confirm the true timezone.
+SESSION_DEFS = [
+    ("ASIA", 0, 8),       # [00:00, 08:00)
+    ("LONDON", 8, 13),    # [08:00, 13:00)
+    ("NEWYORK", 13, 21),  # [13:00, 21:00)
+]
+
+
+def _session_name_for_hour(hour: int) -> str:
+    for name, h0, h1 in SESSION_DEFS:
+        if int(h0) <= int(hour) < int(h1):
+            return name
+    return "OFF"
+
+
+def _session_bounds(day: pd.Timestamp, name: str) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+    for n, h0, h1 in SESSION_DEFS:
+        if n == name:
+            start = day + pd.Timedelta(hours=int(h0))
+            end = day + pd.Timedelta(hours=int(h1))
+            return start, end
+    return None
+
+
+def _compute_sessions_levels(df: pd.DataFrame, dt: pd.DatetimeIndex) -> Dict[str, Any]:
+    """
+    Computes current-day session highs/lows and previous session highs/lows.
+    Returns best-effort info. If dt cannot be used, returns available=False.
+    """
+    out: Dict[str, Any] = {
+        "available": False,
+        "tz_used": None,
+        "note": None,
+        "current_session": None,
+        "current": {},
+        "previous_session": None,
+        "previous": {},
+    }
+    try:
+        if df is None or df.empty or dt is None or len(dt) != len(df):
+            out["note"] = "dt_unavailable"
+            return out
+        if not _has_cols(df, ("high", "low", "close")):
+            out["note"] = "missing_cols"
+            return out
+
+        tz = str(os.getenv("STRUCT_SESS_TZ", "")).strip() or None
+        dt2, tz_meta = _coerce_to_tz(dt, tz)
+        out["tz_used"] = tz_meta.get("tz_used")
+        if tz_meta.get("note"):
+            out["note"] = tz_meta.get("note")
+
+        last_ts = pd.Timestamp(dt2[-1])
+        day = last_ts.floor("D")
+        hour = int(last_ts.hour)
+        cur_sess = _session_name_for_hour(hour)
+        out["current_session"] = cur_sess
+
+        # Build helper DataFrame with dt
+        tmp = df[["high", "low", "close"]].copy()
+        tmp["__dt__"] = dt2
+
+        def _hl(start: pd.Timestamp, end: pd.Timestamp) -> Optional[Dict[str, float]]:
+            w = tmp[(tmp["__dt__"] >= start) & (tmp["__dt__"] < end)]
+            if w.empty:
+                return None
+            hi = float(w["high"].astype(float).max())
+            lo = float(w["low"].astype(float).min())
+            return {"high": hi, "low": lo}
+
+        # Current day levels per session
+        cur_levels: Dict[str, Any] = {}
+        for name, _, _ in SESSION_DEFS:
+            b = _session_bounds(day, name)
+            if not b:
+                continue
+            s0, s1 = b
+            hl = _hl(s0, s1)
+            if hl is not None:
+                cur_levels[name] = hl
+        out["current"] = cur_levels
+
+        # Previous session
+        prev_sess = None
+        # session ordering
+        sess_names = [n for n, _, _ in SESSION_DEFS]
+        if cur_sess in sess_names:
+            i = sess_names.index(cur_sess)
+            if i > 0:
+                prev_sess = sess_names[i - 1]
+                prev_day = day
+            else:
+                # if ASIA current => previous is NEWYORK of previous day
+                prev_sess = sess_names[-1]
+                prev_day = day - pd.Timedelta(days=1)
+
+            pb = _session_bounds(prev_day, prev_sess)
+            if pb:
+                s0, s1 = pb
+                hlp = _hl(s0, s1)
+                if hlp is not None:
+                    out["previous_session"] = prev_sess
+                    out["previous"] = {prev_sess: hlp}
+
+        out["available"] = True
+        return out
+    except Exception as e:
+        out["note"] = f"session_error:{e}"
+        return out
+
+
+def external_htf_levels(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Computes PDH/PDL and PWH/PWL from H1 candles, best-effort.
+
+    Returns:
+      {
+        available: bool,
+        dt_meta: {...},
+        pdh,pdl,pwh,pwl: float|None,
+        sessions: {...}
+      }
+    """
+    out: Dict[str, Any] = {
+        "available": False,
+        "dt_meta": {},
+        "pdh": None,
+        "pdl": None,
+        "pwh": None,
+        "pwl": None,
+        "sessions": {"available": False},
+    }
+    try:
+        if df is None or df.empty or len(df) < 40 or not _has_cols(df, ("high", "low", "close")):
+            out["dt_meta"] = {"available": False, "error": "not_enough_data"}
+            return out
+
+        dt, meta = _infer_dt_index(df)
+        out["dt_meta"] = meta
+        if dt is None or not bool(meta.get("available")):
+            # Cannot compute reliable day/week boundaries
+            return out
+
+        # sessions (best-effort)
+        out["sessions"] = _compute_sessions_levels(df, dt)
+
+        last_ts = pd.Timestamp(dt[-1])
+        last_day = last_ts.floor("D")
+        prev_day = last_day - pd.Timedelta(days=1)
+
+        dlev = _daily_levels_from_h1(df, dt)
+        if dlev is not None and (prev_day in dlev.index):
+            out["pdh"] = _safe_float(dlev.loc[prev_day, "high"], None)  # type: ignore
+            out["pdl"] = _safe_float(dlev.loc[prev_day, "low"], None)   # type: ignore
+
+        wlev = _weekly_levels_from_h1(df, dt)
+        if wlev is not None:
+            last_week = pd.Timestamp(last_ts).to_period("W-SUN")
+            prev_week = last_week - 1
+            if prev_week in wlev.index:
+                out["pwh"] = _safe_float(wlev.loc[prev_week, "high"], None)  # type: ignore
+                out["pwl"] = _safe_float(wlev.loc[prev_week, "low"], None)   # type: ignore
+
+        out["available"] = True
+        return out
+    except Exception as e:
+        out["dt_meta"] = {"available": False, "error": f"htf_levels_error:{e}"}
+        return out
 
 
 # =====================================================================
@@ -411,11 +745,23 @@ def _classify_bos(
     last_close: float,
     *,
     break_buffer: float = 0.0,
+    htf_levels: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     BOS classification using last swing and a buffer.
+    Non-breaking:
+      - bos_type remains "INTERNAL"/"EXTERNAL" (or None)
+    Added:
+      - EXTERNAL can also be determined by PDH/PDL/PWH/PWL if available.
     """
-    res = {"bos": False, "direction": None, "bos_type": None, "broken_level": None}
+    res = {
+        "bos": False,
+        "direction": None,
+        "bos_type": None,
+        "broken_level": None,
+        "external_ref": None,          # NEW (debug): which HTF level was exceeded
+        "external_ref_level": None,    # NEW
+    }
 
     highs = swings.get("highs") or []
     lows = swings.get("lows") or []
@@ -428,6 +774,23 @@ def _classify_bos(
     ext_hi = float(max([p for _, p in highs[-3:]])) if len(highs) >= 2 else None
     ext_lo = float(min([p for _, p in lows[-3:]])) if len(lows) >= 2 else None
 
+    # NEW: include HTF external references (PDH/PDL/PWH/PWL) into external classification
+    ext_hi_refs: List[Tuple[str, float]] = []
+    ext_lo_refs: List[Tuple[str, float]] = []
+    if isinstance(htf_levels, dict) and bool(htf_levels.get("available")):
+        for k in ("pdh", "pwh"):
+            v = htf_levels.get(k)
+            if v is not None:
+                vv = _safe_float(v, None)  # type: ignore
+                if vv is not None and np.isfinite(vv):
+                    ext_hi_refs.append((k, float(vv)))
+        for k in ("pdl", "pwl"):
+            v = htf_levels.get(k)
+            if v is not None:
+                vv = _safe_float(v, None)  # type: ignore
+                if vv is not None and np.isfinite(vv):
+                    ext_lo_refs.append((k, float(vv)))
+
     bos_up = False
     bos_dn = False
     bos_type_up = None
@@ -435,15 +798,38 @@ def _classify_bos(
     broken_up = None
     broken_dn = None
 
+    ext_ref_up = None
+    ext_ref_dn = None
+    ext_ref_lvl_up = None
+    ext_ref_lvl_dn = None
+
     if last_hi is not None and last_close > (last_hi + break_buffer):
         bos_up = True
         broken_up = last_hi
-        bos_type_up = "EXTERNAL" if (ext_hi is not None and last_close > (ext_hi + break_buffer)) else "INTERNAL"
+        # default external check by swings
+        swing_external = bool(ext_hi is not None and last_close > (ext_hi + break_buffer))
+        # htf external check (if any)
+        htf_external = False
+        for name, lvl in ext_hi_refs:
+            if last_close > (float(lvl) + break_buffer):
+                htf_external = True
+                ext_ref_up = name
+                ext_ref_lvl_up = float(lvl)
+                break
+        bos_type_up = "EXTERNAL" if (swing_external or htf_external) else "INTERNAL"
 
     if last_lo is not None and last_close < (last_lo - break_buffer):
         bos_dn = True
         broken_dn = last_lo
-        bos_type_dn = "EXTERNAL" if (ext_lo is not None and last_close < (ext_lo - break_buffer)) else "INTERNAL"
+        swing_external = bool(ext_lo is not None and last_close < (ext_lo - break_buffer))
+        htf_external = False
+        for name, lvl in ext_lo_refs:
+            if last_close < (float(lvl) - break_buffer):
+                htf_external = True
+                ext_ref_dn = name
+                ext_ref_lvl_dn = float(lvl)
+                break
+        bos_type_dn = "EXTERNAL" if (swing_external or htf_external) else "INTERNAL"
 
     # resolve rare double-break edge
     if bos_up and bos_dn:
@@ -455,16 +841,43 @@ def _classify_bos(
             bos_up = False
 
     if bos_up:
-        res.update({"bos": True, "direction": "UP", "bos_type": bos_type_up, "broken_level": broken_up})
+        res.update(
+            {
+                "bos": True,
+                "direction": "UP",
+                "bos_type": bos_type_up,
+                "broken_level": broken_up,
+                "external_ref": ext_ref_up,
+                "external_ref_level": ext_ref_lvl_up,
+            }
+        )
     elif bos_dn:
-        res.update({"bos": True, "direction": "DOWN", "bos_type": bos_type_dn, "broken_level": broken_dn})
+        res.update(
+            {
+                "bos": True,
+                "direction": "DOWN",
+                "bos_type": bos_type_dn,
+                "broken_level": broken_dn,
+                "external_ref": ext_ref_dn,
+                "external_ref_level": ext_ref_lvl_dn,
+            }
+        )
 
     return res
 
 
-def _detect_bos_choch_cos(df: pd.DataFrame) -> Dict[str, Any]:
+def _detect_bos_choch_cos(df: pd.DataFrame, htf_levels: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if df is None or len(df) < 60 or not _has_cols(df, ("open", "high", "low", "close")):
-        return {"bos": False, "choch": False, "cos": False, "direction": None, "bos_type": None, "broken_level": None}
+        return {
+            "bos": False,
+            "choch": False,
+            "cos": False,
+            "direction": None,
+            "bos_type": None,
+            "broken_level": None,
+            "external_ref": None,
+            "external_ref_level": None,
+        }
 
     close = df["close"].astype(float)
     last_close = float(close.iloc[-1])
@@ -473,7 +886,7 @@ def _detect_bos_choch_cos(df: pd.DataFrame) -> Dict[str, Any]:
     a = _atr(df, 14)
     buf = max(a * 0.12, abs(last_close) * 0.0004)
 
-    bos_info = _classify_bos(swings, last_close, break_buffer=buf)
+    bos_info = _classify_bos(swings, last_close, break_buffer=buf, htf_levels=htf_levels)
     if not bos_info.get("bos"):
         bos_info.update({"choch": False, "cos": False})
         return bos_info
@@ -919,12 +1332,6 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
       1) Sweep (raid) of EQ level (EQL for longs / EQH for shorts)
       2) Displacement candle in trend direction (impulse)
       3) Fresh FVG formed by displacement -> propose entry at FVG mid
-
-    NOTE:
-      This implementation is careful about indices:
-        - We work on a local window `w` (reset_index).
-        - FVG zones built on `w` have local indices.
-        - We also attach index_global for debugging/logging consistency.
     """
     out = {"ok": False, "bias": None, "entry": None, "zone": None, "note": "no_pattern"}
 
@@ -1013,9 +1420,6 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
 
         # 3) detect FVG zones on the same local window
         zones = _detect_fvg(w, lookback=len(w), keep_last=16)
-
-        # IMPORTANT FIX:
-        # zones' "index" is LOCAL (because w is reset_index and idx_offset=0).
         zones = [z for z in zones if int(z.get("index", -1)) >= int(disp_i)]
         if not zones:
             out["note"] = "no_fvg_after_displacement"
@@ -1044,14 +1448,12 @@ def _raid_displacement_fvg(df: pd.DataFrame, trend: str, lookback: int = 180) ->
             out["note"] = "no_fvg_bias_match"
             return out
 
-        # distance sanity
         if best_dist > 2.0 * a:
             out["note"] = f"fvg_too_far dist={best_dist:.6g} atr={a:.6g}"
             return out
 
         entry = float((float(best["low"]) + float(best["high"])) / 2.0)
 
-        # attach global index (debug)
         best = dict(best)
         try:
             best["index_global"] = int(global_offset + int(best.get("index", 0)))
@@ -1097,6 +1499,9 @@ def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
       - oi_series: Series|None (if df has "oi")
       - raid_displacement: dict {ok, entry, note...}
       - volume_profile: dict {poc/hvn/lvn}
+
+    NEW:
+      - htf_levels: {pdh,pdl,pwh,pwl,sessions,dt_meta,available}
     """
     if df is None or len(df) < 40 or not _has_cols(df, ("open", "high", "low", "close")):
         return {
@@ -1116,12 +1521,17 @@ def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
             "oi_series": None,
             "raid_displacement": {"ok": False, "note": "no_data"},
             "volume_profile": {"poc": None, "hvn": None, "lvn": None, "range": None},
+            "htf_levels": {"available": False, "dt_meta": {"available": False}},
         }
 
     trend = _trend_from_ema(df["close"].astype(float))
     swings = find_swings(df, left=3, right=3)
     levels = detect_equal_levels(df, left=3, right=3, max_window=200)
-    bos_block = _detect_bos_choch_cos(df)
+
+    # NEW: external HTF levels (best-effort)
+    htf_levels = external_htf_levels(df)
+
+    bos_block = _detect_bos_choch_cos(df, htf_levels=htf_levels)
     ob = _detect_order_blocks(df, lookback=120)
     fvg_zones = _detect_fvg(df, lookback=140, keep_last=8)
 
@@ -1154,6 +1564,10 @@ def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
         "oi_series": oi_series,
         "raid_displacement": raid,
         "volume_profile": vp,
+        "htf_levels": htf_levels,           # NEW
+        # extra debug (non-breaking)
+        "bos_external_ref": bos_block.get("external_ref"),
+        "bos_external_ref_level": bos_block.get("external_ref_level"),
     }
 
 
@@ -1202,8 +1616,8 @@ def run_structure_tests() -> Dict[str, Any]:
     You can call this locally to ensure the module loads and core funcs run.
     """
     try:
-        # simple dummy OHLCV
-        n = 120
+        n = 160
+        idx = pd.date_range("2025-01-01", periods=n, freq="H")  # gives datetime index -> enables PDH/Weekly/sessions
         x = np.linspace(100, 110, n)
         df = pd.DataFrame(
             {
@@ -1212,7 +1626,8 @@ def run_structure_tests() -> Dict[str, Any]:
                 "low": x + np.random.normal(-0.5, 0.2, n),
                 "close": x + np.random.normal(0, 0.2, n),
                 "volume": np.random.uniform(10, 100, n),
-            }
+            },
+            index=idx,
         )
 
         st = analyze_structure(df)
@@ -1220,6 +1635,7 @@ def run_structure_tests() -> Dict[str, Any]:
         sw = liquidity_sweep_details(df, "LONG")
         bq = bos_quality_details(df, direction="UP")
 
+        htf = st.get("htf_levels") or {}
         return {
             "ok": True,
             "trend": st.get("trend"),
@@ -1228,6 +1644,12 @@ def run_structure_tests() -> Dict[str, Any]:
             "eql": len(lv.get("eq_lows") or []),
             "sweep_ok": bool(sw.get("ok")),
             "bosq_grade": bq.get("grade"),
+            "htf_available": bool(htf.get("available")),
+            "pdh": htf.get("pdh"),
+            "pdl": htf.get("pdl"),
+            "pwh": htf.get("pwh"),
+            "pwl": htf.get("pwl"),
+            "sessions": (htf.get("sessions") or {}).get("current_session"),
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
