@@ -4,9 +4,10 @@
 # - 2-pass institutional policy (LIGHT then NORMAL/FULL)
 # - Liquidations PASS2-only by default (anti-ban)
 # - TTL-compatible setup_type suffixing for scanner.py
-# - NEW: SMT divergence (optional) + normalized inst score (0..100)
+# - Optional: SMT divergence (cross-symbol) + normalized inst score (0..100)
 # - NEW: options_data regime context (Deribit DVOL snapshot)
 # - NEW: TrendGuard (anti-contre-tendance): HTF bias mismatch + ADX/squeeze + overextension MARKET veto
+# - NEW: INST_CONTINUATION kept but ULTRA-STRICT (requires trigger + pass2 + limit entry + strong momentum + no soft veto)
 # =====================================================================
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ from settings import (
     REQUIRE_HTF_ALIGN,
     REQUIRE_BOS_QUALITY,
     RR_MIN_TOLERATED_WITH_INST,
-    # NEW (grading / pass2 policy)
+    # grading / pass2 policy
     PASS2_ONLY_FOR_PRIORITY,
     priority_at_least,
 )
@@ -83,7 +84,7 @@ except Exception:
 # =====================================================================
 
 # Hard rules (safe defaults):
-TG_STRICT_HTF_BIAS = str(os.getenv("TG_STRICT_HTF_BIAS", "1")).strip() == "1"  # hard reject if HTF bias != bias
+TG_STRICT_HTF_BIAS = str(os.getenv("TG_STRICT_HTF_BIAS", "1")).strip() == "1"  # reject if HTF bias != bias
 TG_STRICT_REGIME_MARKET = str(os.getenv("TG_STRICT_REGIME_MARKET", "1")).strip() == "1"  # reject MARKET if weak trend/squeeze/overext
 TG_ADX_PERIOD = int(os.getenv("TG_ADX_PERIOD", "14"))
 TG_ADX_MIN = float(os.getenv("TG_ADX_MIN", "20"))  # <20 => weak trend (chop)
@@ -212,11 +213,11 @@ def _trend_guard(
     b = str(bias or "").upper()
     et = str(entry_type or "MARKET")
 
-    # 1) HTF bias mismatch
+    # 1) HTF bias mismatch (only if TG_STRICT_HTF_BIAS)
     htf_bias = _htf_bias_from_df(df_h4)
     meta["htf_bias"] = htf_bias
     meta["bias"] = b
-    if htf_bias in ("LONG", "SHORT") and b in ("LONG", "SHORT") and htf_bias != b:
+    if TG_STRICT_HTF_BIAS and htf_bias in ("LONG", "SHORT") and b in ("LONG", "SHORT") and htf_bias != b:
         return False, "reject:htf_bias_mismatch", meta
 
     # 2) Regime: ADX weak trend + squeeze => no MARKET
@@ -254,7 +255,7 @@ def _trend_guard(
 
 def _unwrap_macro(macro: Any) -> Dict[str, Any]:
     """
-    scanner.py passes macro_ctx like:
+    scanner.py may pass macro_ctx like:
       macro_ctx = {"macro": msnap_dict, "options": osnap_dict}
 
     This helper keeps backward compatibility with older formats.
@@ -419,6 +420,28 @@ if INST_PASS1_MODE not in ("LIGHT", "NORMAL", "FULL"):
 if INST_PASS2_MODE not in ("LIGHT", "NORMAL", "FULL"):
     INST_PASS2_MODE = "NORMAL"
 
+# =====================================================================
+# ✅ INST_CONTINUATION ULTRA-STRICT policy (env-tunable)
+# =====================================================================
+INST_CONT_REQUIRE_TRIGGER = _env_flag("INST_CONT_REQUIRE_TRIGGER", "1")         # require BOS/RAID/SWEEP
+INST_CONT_REQUIRE_PASS2 = _env_flag("INST_CONT_REQUIRE_PASS2", "1")             # require pass2_done True
+INST_CONT_DISALLOW_MARKET = _env_flag("INST_CONT_DISALLOW_MARKET", "1")         # entry_type must NOT be MARKET
+INST_CONT_REQUIRE_NO_SOFT_VETO = _env_flag("INST_CONT_REQUIRE_NO_SOFT_VETO", "1")  # soft_vetoes must be empty
+INST_CONT_REQUIRE_STRONG_MOM = _env_flag("INST_CONT_REQUIRE_STRONG_MOM", "1")   # STRONG_* only
+INST_CONT_REQUIRE_CLEAR_BIAS = _env_flag("INST_CONT_REQUIRE_CLEAR_BIAS", "1")   # reject if used_bias_fallback
+try:
+    INST_CONT_MIN_COMPOSITE_THR = float(_env_str("INST_CONT_MIN_COMPOSITE_THR", "70"))
+except Exception:
+    INST_CONT_MIN_COMPOSITE_THR = 70.0
+try:
+    INST_CONT_MIN_GATE = int(_env_str("INST_CONT_MIN_GATE", str(int(INST_SCORE_DESK_PRIORITY))))
+except Exception:
+    INST_CONT_MIN_GATE = int(INST_SCORE_DESK_PRIORITY)
+try:
+    INST_CONT_RR_MIN = float(_env_str("INST_CONT_RR_MIN", str(float(max(RR_MIN_STRICT, RR_MIN_DESK_PRIORITY)))))
+except Exception:
+    INST_CONT_RR_MIN = float(max(RR_MIN_STRICT, RR_MIN_DESK_PRIORITY))
+
 
 # =====================================================================
 # Priority helpers (A→E)
@@ -490,7 +513,7 @@ def _pre_grade_candidate(
         p = _downgrade(p, 1)
         reasons.append("pre:bias_fallback")
 
-    # Penalize overextension (still can be valid, but less worth PASS2)
+    # Penalize overextension
     if ext.startswith("OVEREXTENDED"):
         p = _downgrade(p, 1)
         reasons.append("pre:overextended")
@@ -1051,7 +1074,7 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
 
 
 # =====================================================================
-# Institutional gate helpers (NEW score integration)
+# Institutional gate helpers (score integration)
 # =====================================================================
 def _inst_ok_count(inst: Dict[str, Any]) -> int:
     comp = inst.get("score_components") or {}
@@ -1223,7 +1246,7 @@ class SignalAnalyzer:
             except Exception:
                 options_filter = {"ok": True, "score": 0, "regime": "unknown", "reason": "options_error"}
 
-            # If regime is HIGH_VOL and you're doing MARKET, treat as soft veto in desk mode
+            # If regime is HIGH_VOL, treat as soft veto (desk)
             try:
                 reg = str((options_filter or {}).get("regime") or "").lower()
                 if reg in ("high_vol",):
@@ -1233,7 +1256,6 @@ class SignalAnalyzer:
 
         # ---------------------------------------------------------------
         # PRE-FILTERS (cheap) BEFORE institutional call (anti-ban)
-        # (In DESK_EV_MODE, HTF/MOMENTUM veto are treated as soft vetoes)
         # ---------------------------------------------------------------
         soft_vetoes: List[str] = []
 
@@ -1244,10 +1266,8 @@ class SignalAnalyzer:
 
         # STRICT HTF bias mismatch (anti-contre-tendance) — early
         htf_bias_now = _htf_bias_from_df(df_h4)
-        if TG_STRICT_HTF_BIAS and (htf_bias_now in ("LONG", "SHORT")) and (bias in ("LONG", "SHORT")) and (htf_bias_now != bias):
-            if DESK_EV_MODE and (not TG_STRICT_HTF_BIAS):
-                soft_vetoes.append("htf_bias_mismatch")
-            else:
+        if htf_bias_now in ("LONG", "SHORT") and bias in ("LONG", "SHORT") and (htf_bias_now != bias):
+            if TG_STRICT_HTF_BIAS or (not DESK_EV_MODE):
                 LOGGER.info("[EVAL_REJECT] %s htf_bias_mismatch bias=%s htf_bias=%s", symbol, bias, htf_bias_now)
                 return _reject(
                     "htf_bias_mismatch",
@@ -1259,6 +1279,8 @@ class SignalAnalyzer:
                     smt_veto=bool(smt_veto),
                     options_filter=options_filter,
                 )
+            else:
+                soft_vetoes.append("htf_bias_mismatch")
 
         # REQUIRE_STRUCTURE: keep strict only outside desk mode.
         if REQUIRE_STRUCTURE and used_bias_fallback and (not DESK_EV_MODE):
@@ -1571,7 +1593,7 @@ class SignalAnalyzer:
         LOGGER.info("[EVAL_PRE] %s TREND_GUARD ok=%s why=%s meta=%s", symbol, tg_ok, tg_why, tg_meta)
 
         if not tg_ok:
-            # In desk mode you can choose to soft-veto instead of reject
+            # In desk mode you can choose to soft-veto instead of reject (except if strict htf mismatch)
             if DESK_EV_MODE and (not TG_STRICT_REGIME_MARKET) and (tg_why != "reject:htf_bias_mismatch"):
                 soft_vetoes.append(tg_why.replace("reject:", "tg:"))
             else:
@@ -1592,7 +1614,7 @@ class SignalAnalyzer:
                     inst_score_norm=int(inst_score_norm),
                 )
 
-        # Extension hygiene (existing)
+        # Extension hygiene
         if ext_sig == "OVEREXTENDED_LONG" and bias == "LONG":
             if entry_type == "MARKET":
                 LOGGER.info("[EVAL_REJECT] %s overextended_long_market", symbol)
@@ -1907,8 +1929,8 @@ class SignalAnalyzer:
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": setup_ttl,          # TTL-compatible for scanner.py
-                "setup_type_core": setup_core,    # canonical for debug
+                "setup_type": setup_ttl,
+                "setup_type_core": setup_core,
                 "setup_variant": bos_variant,
                 "priority": priority,
                 "priority_reasons": priority_reasons,
@@ -1922,7 +1944,7 @@ class SignalAnalyzer:
                 "institutional": inst,
                 "inst_gate": int(gate),
                 "inst_ok_count": int(ok_count),
-                "inst_score_eff": int(gate),      # gate used for acceptance
+                "inst_score_eff": int(gate),
                 "inst_score_norm": int(inst_score_norm),
                 "momentum": mom,
                 "composite": comp,
@@ -1971,7 +1993,7 @@ class SignalAnalyzer:
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": setup_ttl,          # TTL-compatible
+                "setup_type": setup_ttl,
                 "setup_type_core": setup_core,
                 "setup_variant": variant,
                 "priority": priority,
@@ -2036,7 +2058,7 @@ class SignalAnalyzer:
                 "tp2": None,
                 "rr": float(rr),
                 "qty": 1,
-                "setup_type": setup_ttl,          # TTL-compatible
+                "setup_type": setup_ttl,
                 "setup_type_core": setup_core,
                 "setup_variant": variant,
                 "priority": priority,
@@ -2067,16 +2089,86 @@ class SignalAnalyzer:
                 "options_filter": options_filter,
             }
 
-        # 4) INST_CONTINUATION (desk)
+        # 4) INST_CONTINUATION (desk) — ULTRA STRICT
         if DESK_EV_MODE and bias in ("LONG", "SHORT"):
-            good_inst = int(gate) >= int(INST_SCORE_DESK_PRIORITY)
-            good_rr = float(rr) >= float(RR_MIN_DESK_PRIORITY)
-            good_comp = _composite_bias_ok(bias, comp_score, comp_label, thr=65.0)
+            # Hard core requirements
+            inst_cont_trigger_ok = (can_bos or can_raid or can_sweep)
+            inst_cont_pass2_ok = bool(do_pass2)
+            inst_cont_entry_ok = (not _is_market_entry(entry_type))
+            inst_cont_gate_ok = int(gate) >= int(max(MIN_INST_SCORE, INST_CONT_MIN_GATE))
+            inst_cont_rr_ok = float(rr) >= float(INST_CONT_RR_MIN)
+            inst_cont_comp_ok = _composite_bias_ok(bias, comp_score, comp_label, thr=float(INST_CONT_MIN_COMPOSITE_THR))
+            inst_cont_soft_ok = (len(soft_vetoes) == 0)
+            inst_cont_bias_ok = (not used_bias_fallback)
 
-            if good_inst and good_rr and good_comp:
+            # Strong momentum must align with bias (if enabled)
+            m = str(mom or "").upper()
+            if INST_CONT_REQUIRE_STRONG_MOM:
+                if bias == "LONG":
+                    inst_cont_mom_ok = (m == "STRONG_BULLISH")
+                else:
+                    inst_cont_mom_ok = (m == "STRONG_BEARISH")
+            else:
+                inst_cont_mom_ok = True
+
+            # Apply toggles
+            if not INST_CONT_REQUIRE_TRIGGER:
+                inst_cont_trigger_ok = True
+            if not INST_CONT_REQUIRE_PASS2:
+                inst_cont_pass2_ok = True
+            if not INST_CONT_DISALLOW_MARKET:
+                inst_cont_entry_ok = True
+            if not INST_CONT_REQUIRE_NO_SOFT_VETO:
+                inst_cont_soft_ok = True
+            if not INST_CONT_REQUIRE_CLEAR_BIAS:
+                inst_cont_bias_ok = True
+
+            inst_cont_ok = bool(
+                inst_cont_gate_ok
+                and inst_cont_rr_ok
+                and inst_cont_comp_ok
+                and inst_cont_mom_ok
+                and inst_cont_trigger_ok
+                and inst_cont_pass2_ok
+                and inst_cont_entry_ok
+                and inst_cont_soft_ok
+                and inst_cont_bias_ok
+            )
+
+            LOGGER.info(
+                "[EVAL_PRE] %s INST_CONT_STRICT ok=%s gate_ok=%s rr_ok=%s comp_ok=%s mom_ok=%s trigger_ok=%s pass2_ok=%s entry_ok=%s soft_ok=%s bias_ok=%s "
+                "(gate=%s min_gate=%s rr=%.4f rr_min=%.4f comp=%.2f thr=%.2f mom=%s entry_type=%s triggers(bos=%s raid=%s sweep=%s) pass2=%s soft_vetoes=%s used_bias_fallback=%s)",
+                symbol,
+                inst_cont_ok,
+                inst_cont_gate_ok,
+                inst_cont_rr_ok,
+                inst_cont_comp_ok,
+                inst_cont_mom_ok,
+                inst_cont_trigger_ok,
+                inst_cont_pass2_ok,
+                inst_cont_entry_ok,
+                inst_cont_soft_ok,
+                inst_cont_bias_ok,
+                gate,
+                max(MIN_INST_SCORE, INST_CONT_MIN_GATE),
+                float(rr),
+                float(INST_CONT_RR_MIN),
+                float(comp_score),
+                float(INST_CONT_MIN_COMPOSITE_THR),
+                mom,
+                entry_type,
+                can_bos,
+                can_raid,
+                can_sweep,
+                do_pass2,
+                soft_vetoes,
+                used_bias_fallback,
+            )
+
+            if inst_cont_ok:
                 priority, priority_reasons = _final_grade(
                     setup_type="INST_CONTINUATION",
-                    setup_variant="INST_CONTINUATION",
+                    setup_variant="INST_CONTINUATION_STRICT",
                     rr=float(rr),
                     gate=int(gate),
                     ok_count=int(ok_count),
@@ -2105,9 +2197,9 @@ class SignalAnalyzer:
                     "tp2": None,
                     "rr": float(rr),
                     "qty": 1,
-                    "setup_type": setup_ttl,          # TTL-compatible
+                    "setup_type": setup_ttl,
                     "setup_type_core": setup_core,
-                    "setup_variant": "INST_CONTINUATION",
+                    "setup_variant": "INST_CONTINUATION_STRICT",
                     "priority": priority,
                     "priority_reasons": priority_reasons,
                     "pre_priority": pre_priority,
@@ -2143,7 +2235,7 @@ class SignalAnalyzer:
             "institutional": inst,
             "bos_quality": bos_q,
             "entry_pick": entry_pick,
-            "rr": float(rr),
+            "rr": float(rr) if rr is not None else None,
             "inst_gate": int(gate),
             "inst_ok_count": int(ok_count),
             "inst_score_eff": int(gate),
