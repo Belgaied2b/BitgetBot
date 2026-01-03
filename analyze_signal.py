@@ -357,24 +357,53 @@ def _get_options_obj(macro: Any) -> Any:
         return None
 
 
+def _score_options_context_safe(opt_obj: Any, *, bias: str, setup_type: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Compatibility wrapper: score_options_context signature may be:
+      - score_options_context(opt_obj, bias=...)
+      - score_options_context(opt_obj, bias=..., setup_type=...)
+      - score_options_context(opt_obj, bias, setup_type=...) (positional)
+    """
+    if score_options_context is None:
+        return {"ok": True, "score": 0, "regime": "unavailable", "reason": "no_options_module"}
+    try:
+        # try with setup_type kw
+        if setup_type is not None:
+            return score_options_context(opt_obj, bias=bias, setup_type=setup_type)  # type: ignore
+        return score_options_context(opt_obj, bias=bias)  # type: ignore
+    except TypeError:
+        try:
+            if setup_type is not None:
+                return score_options_context(opt_obj, bias, setup_type=setup_type)  # type: ignore
+            return score_options_context(opt_obj, bias)  # type: ignore
+        except Exception:
+            return {"ok": True, "score": 0, "regime": "unknown", "reason": "options_error"}
+    except Exception:
+        return {"ok": True, "score": 0, "regime": "unknown", "reason": "options_error"}
+
+
 # =====================================================================
 # ✅ scanner.py compatibility helper (TTL policy uses setup string)
 # =====================================================================
 def _setup_ttl_compatible(setup_type: str, entry_type: str) -> str:
     """
-    scanner.py uses _entry_ttl_s(entry_type, setup) but looks for OTE/FVG/RAID in setup.
+    scanner.py uses _entry_ttl_s(entry_type, setup) but looks for OTE/FVG/RAID/SWEEP in setup.
     We keep the canonical setup type, and append a suffix when needed so TTL works.
 
     Rules:
-      - If entry_type contains RAID => suffix _RAID (do NOT add _FVG, or TTL would pick FVG before RAID)
+      - If base already contains RAID or SWEEP -> DO NOT append _FVG (avoid TTL picking FVG before RAID/SWEEP).
+      - If entry_type contains RAID => suffix _RAID (unless already RAID/SWEEP).
       - Else if entry_type contains OTE => suffix _OTE
-      - Else if entry_type contains FVG => suffix _FVG
+      - Else if entry_type contains FVG => suffix _FVG (only if base is not RAID/SWEEP)
     """
     base = str(setup_type or "").strip()
     if not base:
         base = "OTHER"
     s = base.upper()
     et = str(entry_type or "").upper()
+
+    if ("RAID" in s) or ("SWEEP" in s):
+        return base
 
     if "RAID" in et and ("RAID" not in s and "SWEEP" not in s):
         return f"{base}_RAID"
@@ -1222,7 +1251,11 @@ class SignalAnalyzer:
         ref_df = _get_macro_ref_df(macro)
 
         if compute_smt_divergence is not None and ref_df is not None:
-            smt = compute_smt_divergence(df_h1, ref_df, lookback=160)
+            try:
+                smt = compute_smt_divergence(df_h1, ref_df, lookback=160)
+            except Exception:
+                smt = {"available": False}
+
             if bool(smt.get("available")):
                 if bias == "LONG" and bool(smt.get("bearish_smt")):
                     smt_veto = True
@@ -1234,27 +1267,6 @@ class SignalAnalyzer:
             return _reject("smt_divergence_veto", smt=smt, smt_veto=True, structure=struct, momentum=mom, composite=comp)
 
         # ---------------------------------------------------------------
-        # options_data regime (Deribit DVOL snapshot) — soft context
-        # ---------------------------------------------------------------
-        options_filter: Optional[Dict[str, Any]] = None
-        options_soft_veto = False
-
-        if score_options_context is not None:
-            opt_obj = _get_options_obj(macro)
-            try:
-                options_filter = score_options_context(opt_obj, bias=bias)
-            except Exception:
-                options_filter = {"ok": True, "score": 0, "regime": "unknown", "reason": "options_error"}
-
-            # If regime is HIGH_VOL, treat as soft veto (desk)
-            try:
-                reg = str((options_filter or {}).get("regime") or "").lower()
-                if reg in ("high_vol",):
-                    options_soft_veto = True
-            except Exception:
-                options_soft_veto = False
-
-        # ---------------------------------------------------------------
         # PRE-FILTERS (cheap) BEFORE institutional call (anti-ban)
         # ---------------------------------------------------------------
         soft_vetoes: List[str] = []
@@ -1263,6 +1275,35 @@ class SignalAnalyzer:
         raid_ok = bool(isinstance(struct.get("raid_displacement"), dict) and struct["raid_displacement"].get("ok"))
         liq_sweep_pre = liquidity_sweep_details(df_h1, bias, lookback=180)
         sweep_ok = bool(isinstance(liq_sweep_pre, dict) and liq_sweep_pre.get("ok"))
+
+        # ---------------------------------------------------------------
+        # options_data regime (Deribit DVOL snapshot) — soft context
+        # ---------------------------------------------------------------
+        options_filter: Optional[Dict[str, Any]] = None
+        options_soft_veto = False
+
+        if score_options_context is not None:
+            opt_obj = _get_options_obj(macro)
+
+            # only a hint here, final setup_type comes later
+            if bos_flag:
+                setup_guess = "BOS_STRICT"
+            elif raid_ok:
+                setup_guess = "RAID_DISPLACEMENT"
+            elif sweep_ok:
+                setup_guess = "LIQ_SWEEP"
+            else:
+                setup_guess = "OTHER"
+
+            options_filter = _score_options_context_safe(opt_obj, bias=bias, setup_type=setup_guess)
+
+            # If regime is HIGH_VOL, treat as soft veto (desk)
+            try:
+                reg = str((options_filter or {}).get("regime") or "").lower()
+                if reg in ("high_vol",):
+                    options_soft_veto = True
+            except Exception:
+                options_soft_veto = False
 
         # STRICT HTF bias mismatch (anti-contre-tendance) — early
         htf_bias_now = _htf_bias_from_df(df_h4)
@@ -1279,8 +1320,7 @@ class SignalAnalyzer:
                     smt_veto=bool(smt_veto),
                     options_filter=options_filter,
                 )
-            else:
-                soft_vetoes.append("htf_bias_mismatch")
+            soft_vetoes.append("htf_bias_mismatch")
 
         # REQUIRE_STRUCTURE: keep strict only outside desk mode.
         if REQUIRE_STRUCTURE and used_bias_fallback and (not DESK_EV_MODE):
