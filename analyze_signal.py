@@ -4,6 +4,8 @@
 # - 2-pass institutional policy (LIGHT then NORMAL/FULL)
 # - Liquidations PASS2-only by default (anti-ban)
 # - TTL-compatible setup_type suffixing for scanner.py
+# - NEW: SMT divergence (optional) + normalized inst score (0..100)
+# - NEW: optional options_data regime filter (rv/iv)
 # =====================================================================
 
 from __future__ import annotations
@@ -58,6 +60,75 @@ REQUIRED_COLS = ("open", "high", "low", "close", "volume")
 
 # Optional: allow technical fallback if Binance is banned/down (default False)
 ALLOW_TECH_FALLBACK_WHEN_INST_DOWN = str(os.getenv("ALLOW_TECH_FALLBACK_WHEN_INST_DOWN", "0")).strip() == "1"
+
+# =====================================================================
+# ✅ Optional SMT divergence (cross-symbol) + options regime helper
+# =====================================================================
+try:
+    from smt_utils import compute_smt_divergence  # type: ignore
+except Exception:
+    compute_smt_divergence = None  # type: ignore
+
+try:
+    from options_data import realized_volatility, options_vol_filter  # type: ignore
+except Exception:
+    realized_volatility = None  # type: ignore
+    options_vol_filter = None  # type: ignore
+
+
+def _get_macro_ref_df(macro: Any) -> Optional[pd.DataFrame]:
+    """
+    Tries to find a BTC H1 dataframe inside `macro`.
+    Tolerates multiple common key names.
+    """
+    try:
+        if not isinstance(macro, dict):
+            return None
+        for k in ("btc_h1", "btc_df_h1", "btc_h1_df", "BTC_H1", "BTC", "btc"):
+            v = macro.get(k)
+            if isinstance(v, pd.DataFrame) and (not v.empty):
+                return v
+        return None
+    except Exception:
+        return None
+
+
+def _get_macro_implied_vol(macro: Any, symbol: str) -> Optional[float]:
+    """
+    Optional implied vol input:
+      - macro["implied_vol"] or macro["iv"] can be float
+      - or dict mapping symbol->iv
+    """
+    try:
+        if not isinstance(macro, dict):
+            return None
+        iv = macro.get("implied_vol", None)
+        if iv is None:
+            iv = macro.get("iv", None)
+
+        if iv is None:
+            return None
+
+        if isinstance(iv, (int, float, np.floating)):
+            v = float(iv)
+            return v if np.isfinite(v) and v > 0 else None
+
+        if isinstance(iv, dict):
+            # try exact symbol first
+            if symbol in iv:
+                v = float(iv[symbol])
+                return v if np.isfinite(v) and v > 0 else None
+
+            # common cleanup attempts (non-blocking)
+            sym2 = str(symbol).replace("-USDT", "").replace("USDTM", "").replace("USDT", "")
+            if sym2 in iv:
+                v = float(iv[sym2])
+                return v if np.isfinite(v) and v > 0 else None
+
+        return None
+    except Exception:
+        return None
+
 
 # =====================================================================
 # ✅ scanner.py compatibility helper (TTL policy uses setup string)
@@ -781,6 +852,29 @@ def _inst_gate_value(inst: Dict[str, Any]) -> Tuple[int, int]:
         return 0, _inst_ok_count(inst)
 
 
+def _inst_score_normalized_0_100(inst: Dict[str, Any], gate: int) -> int:
+    """
+    Normalizes gate into [0..100].
+    Uses score_meta.max_components_sum if provided by institutional_data.py.
+    Falls back to len(score_components) (min 1).
+    """
+    try:
+        meta = inst.get("score_meta") or {}
+        comps = inst.get("score_components") or {}
+
+        max_sum = meta.get("max_components_sum")
+        if max_sum is None:
+            # fallback: number of components (assumes 0/1 or small int)
+            max_sum = len(comps) if isinstance(comps, dict) and len(comps) > 0 else 1
+
+        max_sum_i = int(max(1, int(max_sum)))
+        g = int(gate)
+        s = int(round(100.0 * float(g) / float(max_sum_i)))
+        return int(max(0, min(100, s)))
+    except Exception:
+        return 0
+
+
 def _desk_inst_gate_override(inst: Dict[str, Any], bias: str, gate: int) -> Tuple[int, Optional[str]]:
     """
     If flow is clearly strong and crowding is not risky, allow bumping gate to MIN_INST_SCORE.
@@ -873,6 +967,57 @@ class SignalAnalyzer:
         LOGGER.info("[EVAL_PRE] %s VOL_REGIME=%s EXTENSION=%s", symbol, vol_reg, ext_sig)
 
         # ---------------------------------------------------------------
+        # SMT divergence (optional) — cheap cross-symbol filter
+        # ---------------------------------------------------------------
+        smt: Dict[str, Any] = {"available": False}
+        smt_veto = False
+        ref_df = _get_macro_ref_df(macro)
+
+        if compute_smt_divergence is not None and ref_df is not None:
+            smt = compute_smt_divergence(df_h1, ref_df, lookback=160)
+            if bool(smt.get("available")):
+                if bias == "LONG" and bool(smt.get("bearish_smt")):
+                    smt_veto = True
+                if bias == "SHORT" and bool(smt.get("bullish_smt")):
+                    smt_veto = True
+
+        if smt_veto and (not DESK_EV_MODE):
+            LOGGER.info("[EVAL_REJECT] %s smt_divergence_veto bias=%s smt=%s", symbol, bias, smt)
+            return _reject("smt_divergence_veto", smt=smt, smt_veto=True, structure=struct, momentum=mom, composite=comp)
+
+        # ---------------------------------------------------------------
+        # Optional options/vol filter (realized vol + implied vol if provided)
+        # ---------------------------------------------------------------
+        options_filter: Optional[Dict[str, Any]] = None
+        options_soft_veto = False
+
+        if realized_volatility is not None and options_vol_filter is not None:
+            rv = realized_volatility(df_h1, lookback=96)
+            iv = _get_macro_implied_vol(macro, symbol)
+            options_filter = options_vol_filter(realized_vol=float(rv), implied_vol=iv)
+
+            # If the helper decides "ok=False" (ex: extreme regime + veto enabled), enforce in strict mode
+            if isinstance(options_filter, dict) and (not bool(options_filter.get("ok", True))) and (not DESK_EV_MODE):
+                LOGGER.info("[EVAL_REJECT] %s options_regime_veto options=%s", symbol, options_filter)
+                return _reject(
+                    "options_regime_veto",
+                    options_filter=options_filter,
+                    smt=smt,
+                    smt_veto=bool(smt_veto),
+                    structure=struct,
+                    momentum=mom,
+                    composite=comp,
+                )
+
+            # In desk mode, treat HIGH/EXTREME as soft veto (de-prioritize)
+            try:
+                reg = str((options_filter or {}).get("regime") or "").upper()
+                if reg in ("HIGH", "EXTREME"):
+                    options_soft_veto = True
+            except Exception:
+                options_soft_veto = False
+
+        # ---------------------------------------------------------------
         # PRE-FILTERS (cheap) BEFORE institutional call (anti-ban)
         # (In DESK_EV_MODE, HTF/MOMENTUM veto are treated as soft vetoes)
         # ---------------------------------------------------------------
@@ -886,7 +1031,7 @@ class SignalAnalyzer:
         # REQUIRE_STRUCTURE: keep strict only outside desk mode.
         if REQUIRE_STRUCTURE and used_bias_fallback and (not DESK_EV_MODE):
             LOGGER.info("[EVAL_REJECT] %s no_clear_trend_range", symbol)
-            return _reject("no_clear_trend_range", structure=struct, momentum=mom, composite=comp)
+            return _reject("no_clear_trend_range", structure=struct, momentum=mom, composite=comp, smt=smt, smt_veto=bool(smt_veto))
 
         # HTF alignment gating
         if REQUIRE_HTF_ALIGN and bias in ("LONG", "SHORT"):
@@ -896,12 +1041,12 @@ class SignalAnalyzer:
                     LOGGER.info("[EVAL_PRE] %s HTF_VETO (soft, desk_mode)", symbol)
                 else:
                     LOGGER.info("[EVAL_REJECT] %s htf_veto", symbol)
-                    return _reject("htf_veto", structure=struct)
+                    return _reject("htf_veto", structure=struct, smt=smt, smt_veto=bool(smt_veto))
 
         # In non-desk mode, require at least one structural trigger (BOS or RAID or SWEEP)
         if (not DESK_EV_MODE) and (not (bos_flag or raid_ok or sweep_ok)):
             LOGGER.info("[EVAL_REJECT] %s no_structure_trigger", symbol)
-            return _reject("no_structure_trigger", structure=struct, sweep=liq_sweep_pre)
+            return _reject("no_structure_trigger", structure=struct, sweep=liq_sweep_pre, smt=smt, smt_veto=bool(smt_veto))
 
         # Momentum gating (cheap)
         if REQUIRE_MOMENTUM:
@@ -911,14 +1056,14 @@ class SignalAnalyzer:
                     LOGGER.info("[EVAL_PRE] %s MOM_VETO (soft, desk_mode)", symbol)
                 else:
                     LOGGER.info("[EVAL_REJECT] %s momentum_not_bullish", symbol)
-                    return _reject("momentum_not_bullish", structure=struct)
+                    return _reject("momentum_not_bullish", structure=struct, smt=smt, smt_veto=bool(smt_veto))
             if bias == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
                 if DESK_EV_MODE:
                     soft_vetoes.append("momentum_not_bearish")
                     LOGGER.info("[EVAL_PRE] %s MOM_VETO (soft, desk_mode)", symbol)
                 else:
                     LOGGER.info("[EVAL_REJECT] %s momentum_not_bearish", symbol)
-                    return _reject("momentum_not_bearish", structure=struct)
+                    return _reject("momentum_not_bearish", structure=struct, smt=smt, smt_veto=bool(smt_veto))
 
         # ===============================================================
         # PRE-PRIORITY (cheap) → controls PASS2
@@ -933,16 +1078,29 @@ class SignalAnalyzer:
             ext_sig=ext_sig,
         )
 
+        # NEW: SMT + options regime -> desk soft veto + pre_priority downgrade
+        if smt_veto and DESK_EV_MODE:
+            soft_vetoes.append("smt_veto")
+            pre_priority = _downgrade(pre_priority, 1)
+            pre_priority_reasons = list(pre_priority_reasons) + ["pre:smt_veto_downgrade"]
+
+        if options_soft_veto and DESK_EV_MODE:
+            soft_vetoes.append("options_vol_regime_high")
+            pre_priority = _downgrade(pre_priority, 1)
+            pre_priority_reasons = list(pre_priority_reasons) + ["pre:options_regime_high_downgrade"]
+
         pass2_allowed_by_priority = priority_at_least(pre_priority, PASS2_ONLY_FOR_PRIORITY)
 
         LOGGER.info(
-            "[EVAL_PRE] %s PRE_PRIORITY=%s (min_for_pass2=%s) pass2_allowed=%s reasons=%s soft_vetoes=%s",
+            "[EVAL_PRE] %s PRE_PRIORITY=%s (min_for_pass2=%s) pass2_allowed=%s reasons=%s soft_vetoes=%s smt_veto=%s options_filter=%s",
             symbol,
             pre_priority,
             PASS2_ONLY_FOR_PRIORITY,
             pass2_allowed_by_priority,
             pre_priority_reasons,
             soft_vetoes,
+            smt_veto,
+            options_filter,
         )
 
         # ===============================================================
@@ -974,12 +1132,13 @@ class SignalAnalyzer:
 
         gate, ok_count = _inst_gate_value(inst)
         gate, override = _desk_inst_gate_override(inst, bias, int(gate))
+        inst_score_norm = _inst_score_normalized_0_100(inst, int(gate))
 
         mode_eff_1 = (inst.get("score_meta") or {}).get("mode") or INST_PASS1_MODE
         liq_eff_1 = inst.get("liquidation_intensity") is not None
 
         LOGGER.info(
-            "[INST_RAW] %s pass=1 mode=%s liq_req=%s liq_ok=%s inst_score=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s comps=%s",
+            "[INST_RAW] %s pass=1 mode=%s liq_req=%s liq_ok=%s inst_score=%s ok_count=%s gate=%s inst_score_norm=%s override=%s available=%s binance_symbol=%s bias=%s comps=%s",
             symbol,
             mode_eff_1,
             pass1_liq,
@@ -987,6 +1146,7 @@ class SignalAnalyzer:
             inst.get("institutional_score"),
             ok_count,
             gate,
+            inst_score_norm,
             override,
             available,
             binance_symbol,
@@ -1009,6 +1169,12 @@ class SignalAnalyzer:
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                     soft_vetoes=soft_vetoes,
+                    smt=smt,
+                    smt_veto=bool(smt_veto),
+                    options_filter=options_filter,
+                    inst_gate=int(gate),
+                    inst_ok_count=int(ok_count),
+                    inst_score_norm=int(inst_score_norm),
                 )
 
         # Pass2: only for “candidates” + liquidations ON here
@@ -1047,12 +1213,13 @@ class SignalAnalyzer:
 
                 gate, ok_count = _inst_gate_value(inst)
                 gate, override = _desk_inst_gate_override(inst, bias, int(gate))
+                inst_score_norm = _inst_score_normalized_0_100(inst, int(gate))
 
                 mode_eff_2 = (inst.get("score_meta") or {}).get("mode") or INST_PASS2_MODE
                 liq_eff_2 = inst.get("liquidation_intensity") is not None
 
                 LOGGER.info(
-                    "[INST_RAW] %s pass=2 mode=%s liq_req=%s liq_ok=%s inst_score=%s ok_count=%s gate=%s override=%s available=%s binance_symbol=%s bias=%s comps=%s",
+                    "[INST_RAW] %s pass=2 mode=%s liq_req=%s liq_ok=%s inst_score=%s ok_count=%s gate=%s inst_score_norm=%s override=%s available=%s binance_symbol=%s bias=%s comps=%s",
                     symbol,
                     mode_eff_2,
                     pass2_liq,
@@ -1060,6 +1227,7 @@ class SignalAnalyzer:
                     inst.get("institutional_score"),
                     ok_count,
                     gate,
+                    inst_score_norm,
                     override,
                     available,
                     binance_symbol,
@@ -1089,9 +1257,13 @@ class SignalAnalyzer:
                 structure=struct,
                 inst_gate=int(gate),
                 ok_count=int(ok_count),
+                inst_score_norm=int(inst_score_norm),
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
                 soft_vetoes=soft_vetoes,
+                smt=smt,
+                smt_veto=bool(smt_veto),
+                options_filter=options_filter,
             )
 
         # ===============================================================
@@ -1124,6 +1296,12 @@ class SignalAnalyzer:
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
                 soft_vetoes=soft_vetoes,
+                smt=smt,
+                smt_veto=bool(smt_veto),
+                options_filter=options_filter,
+                inst_gate=int(gate),
+                inst_ok_count=int(ok_count),
+                inst_score_norm=int(inst_score_norm),
             )
 
         premium, discount = compute_premium_discount(df_h1)
@@ -1160,6 +1338,12 @@ class SignalAnalyzer:
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                     soft_vetoes=soft_vetoes,
+                    smt=smt,
+                    smt_veto=bool(smt_veto),
+                    options_filter=options_filter,
+                    inst_gate=int(gate),
+                    inst_ok_count=int(ok_count),
+                    inst_score_norm=int(inst_score_norm),
                 )
             if not _entry_pullback_ok(entry, entry_mkt, bias, atr14):
                 LOGGER.info("[EVAL_REJECT] %s overextended_long_no_pullback", symbol)
@@ -1171,6 +1355,12 @@ class SignalAnalyzer:
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                     soft_vetoes=soft_vetoes,
+                    smt=smt,
+                    smt_veto=bool(smt_veto),
+                    options_filter=options_filter,
+                    inst_gate=int(gate),
+                    inst_ok_count=int(ok_count),
+                    inst_score_norm=int(inst_score_norm),
                 )
 
         if ext_sig == "OVEREXTENDED_SHORT" and bias == "SHORT":
@@ -1184,6 +1374,12 @@ class SignalAnalyzer:
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                     soft_vetoes=soft_vetoes,
+                    smt=smt,
+                    smt_veto=bool(smt_veto),
+                    options_filter=options_filter,
+                    inst_gate=int(gate),
+                    inst_ok_count=int(ok_count),
+                    inst_score_norm=int(inst_score_norm),
                 )
             if not _entry_pullback_ok(entry, entry_mkt, bias, atr14):
                 LOGGER.info("[EVAL_REJECT] %s overextended_short_no_pullback", symbol)
@@ -1195,6 +1391,12 @@ class SignalAnalyzer:
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                     soft_vetoes=soft_vetoes,
+                    smt=smt,
+                    smt_veto=bool(smt_veto),
+                    options_filter=options_filter,
+                    inst_gate=int(gate),
+                    inst_ok_count=int(ok_count),
+                    inst_score_norm=int(inst_score_norm),
                 )
 
         unfavorable_market = bool(entry_type == "MARKET" and ((bias == "LONG" and premium) or (bias == "SHORT" and discount)))
@@ -1209,6 +1411,12 @@ class SignalAnalyzer:
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                     soft_vetoes=soft_vetoes,
+                    smt=smt,
+                    smt_veto=bool(smt_veto),
+                    options_filter=options_filter,
+                    inst_gate=int(gate),
+                    inst_ok_count=int(ok_count),
+                    inst_score_norm=int(inst_score_norm),
                 )
             if bias == "SHORT" and discount:
                 LOGGER.info("[EVAL_REJECT] %s short_in_discount_market", symbol)
@@ -1220,6 +1428,12 @@ class SignalAnalyzer:
                     pre_priority=pre_priority,
                     pre_priority_reasons=pre_priority_reasons,
                     soft_vetoes=soft_vetoes,
+                    smt=smt,
+                    smt_veto=bool(smt_veto),
+                    options_filter=options_filter,
+                    inst_gate=int(gate),
+                    inst_ok_count=int(ok_count),
+                    inst_score_norm=int(inst_score_norm),
                 )
 
         # --------------------------
@@ -1303,9 +1517,11 @@ class SignalAnalyzer:
                 if lvl > 0 and lvl > entry and sl < (lvl + buf):
                     new_sl = max(sl, lvl + buf)
                     if np.isfinite(new_sl) and float(new_sl) != float(sl):
+                        start_sl = float(sl)
                         sl = float(new_sl)
-                        sl_adj["did_eq"] = True
-                        sl_adj["eq_level"] = float(lvl)
+                        if float(sl) != start_sl:
+                            sl_adj["did_eq"] = True
+                            sl_adj["eq_level"] = float(lvl)
         except Exception:
             pass
 
@@ -1322,6 +1538,12 @@ class SignalAnalyzer:
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
                 soft_vetoes=soft_vetoes,
+                smt=smt,
+                smt_veto=bool(smt_veto),
+                options_filter=options_filter,
+                inst_gate=int(gate),
+                inst_ok_count=int(ok_count),
+                inst_score_norm=int(inst_score_norm),
             )
 
         # recalc TP1 after SL adjustments
@@ -1353,6 +1575,12 @@ class SignalAnalyzer:
                 pre_priority=pre_priority,
                 pre_priority_reasons=pre_priority_reasons,
                 soft_vetoes=soft_vetoes,
+                smt=smt,
+                smt_veto=bool(smt_veto),
+                options_filter=options_filter,
+                inst_gate=int(gate),
+                inst_ok_count=int(ok_count),
+                inst_score_norm=int(inst_score_norm),
             )
 
         # ===============================================================
@@ -1419,7 +1647,8 @@ class SignalAnalyzer:
                 "institutional": inst,
                 "inst_gate": int(gate),
                 "inst_ok_count": int(ok_count),
-                "inst_score_eff": int(gate),  # gate used for acceptance
+                "inst_score_eff": int(gate),      # gate used for acceptance
+                "inst_score_norm": int(inst_score_norm),
                 "momentum": mom,
                 "composite": comp,
                 "composite_score": comp_score,
@@ -1428,6 +1657,9 @@ class SignalAnalyzer:
                 "discount": discount,
                 "entry_pick": entry_pick,
                 "sl_meta": sl_meta_out,
+                "smt": smt,
+                "smt_veto": bool(smt_veto),
+                "options_filter": options_filter,
             }
 
         # 2) RAID_DISPLACEMENT (desk)
@@ -1479,6 +1711,7 @@ class SignalAnalyzer:
                 "inst_gate": int(gate),
                 "inst_ok_count": int(ok_count),
                 "inst_score_eff": int(gate),
+                "inst_score_norm": int(inst_score_norm),
                 "momentum": mom,
                 "composite": comp,
                 "composite_score": comp_score,
@@ -1488,6 +1721,9 @@ class SignalAnalyzer:
                 "entry_pick": entry_pick,
                 "liquidity_sweep": liq_sweep,
                 "sl_meta": sl_meta_out,
+                "smt": smt,
+                "smt_veto": bool(smt_veto),
+                "options_filter": options_filter,
             }
 
         # 3) LIQ_SWEEP (desk)
@@ -1539,6 +1775,7 @@ class SignalAnalyzer:
                 "inst_gate": int(gate),
                 "inst_ok_count": int(ok_count),
                 "inst_score_eff": int(gate),
+                "inst_score_norm": int(inst_score_norm),
                 "momentum": mom,
                 "composite": comp,
                 "composite_score": comp_score,
@@ -1548,6 +1785,9 @@ class SignalAnalyzer:
                 "entry_pick": entry_pick,
                 "liquidity_sweep": liq_sweep,
                 "sl_meta": sl_meta_out,
+                "smt": smt,
+                "smt_veto": bool(smt_veto),
+                "options_filter": options_filter,
             }
 
         # 4) INST_CONTINUATION (desk)
@@ -1603,6 +1843,7 @@ class SignalAnalyzer:
                     "inst_gate": int(gate),
                     "inst_ok_count": int(ok_count),
                     "inst_score_eff": int(gate),
+                    "inst_score_norm": int(inst_score_norm),
                     "momentum": mom,
                     "composite": comp,
                     "composite_score": comp_score,
@@ -1611,6 +1852,9 @@ class SignalAnalyzer:
                     "discount": discount,
                     "entry_pick": entry_pick,
                     "sl_meta": sl_meta_out,
+                    "smt": smt,
+                    "smt_veto": bool(smt_veto),
+                    "options_filter": options_filter,
                 }
 
         LOGGER.info("[EVAL_REJECT] %s no_setup_validated (DESK_EV_MODE=%s)", symbol, DESK_EV_MODE)
@@ -1625,10 +1869,14 @@ class SignalAnalyzer:
             "inst_gate": int(gate),
             "inst_ok_count": int(ok_count),
             "inst_score_eff": int(gate),
+            "inst_score_norm": int(inst_score_norm),
             "composite_score": comp_score,
             "composite_label": comp_label,
             "sl_meta": sl_meta_out,
             "pre_priority": pre_priority,
             "pre_priority_reasons": pre_priority_reasons,
             "soft_vetoes": soft_vetoes,
+            "smt": smt,
+            "smt_veto": bool(smt_veto),
+            "options_filter": options_filter,
         }
