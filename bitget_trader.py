@@ -16,6 +16,15 @@
 #   so the watcher can arm protection when ANY position is open.
 # - helpers: filled_qty(), order_size(), remaining_qty()
 # - flash_close_position(): close-positions v2 helper
+#
+# Watcher additions:
+# - get_all_positions(): /api/v2/mix/position/all-position
+# - get_single_position(): /api/v2/mix/position/single-position
+# - get_pending_orders(): /api/v2/mix/order/orders-pending
+# - get_pending_plan_orders(): /api/v2/mix/order/orders-plan-pending
+# - get_order_fills(): /api/v2/mix/order/fills
+# - get_ticker(): /api/v2/mix/market/ticker
+# - helpers to extract lists safely from v2 payload shapes
 # =====================================================================
 
 from __future__ import annotations
@@ -1076,3 +1085,134 @@ class BitgetTrader:
         if hold_side:
             payload["holdSide"] = str(hold_side).lower()
         return await self._request_any_status("POST", "/api/v2/mix/order/close-positions", data=payload, auth=True, timeout=timeout)
+
+    # ----------------------------
+    # Watcher / state snapshots (NEW)
+    # ----------------------------
+
+    @staticmethod
+    def _extract_list(js: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Some endpoints return data=list, others return data={list:[...]}.
+        We normalize to list[dict].
+        """
+        if not isinstance(js, dict):
+            return []
+        data = js.get("data")
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            for k in ("list", "data", "rows"):
+                v = data.get(k)
+                if isinstance(v, list):
+                    return [x for x in v if isinstance(x, dict)]
+        return []
+
+    async def get_all_positions(self, *, timeout: int = 10) -> Dict[str, Any]:
+        """
+        GET /api/v2/mix/position/all-position
+        """
+        params = {"productType": self.product_type, "marginCoin": self.margin_coin}
+        return await self._request_any_status("GET", "/api/v2/mix/position/all-position", params=params, auth=True, timeout=timeout)
+
+    async def get_single_position(self, symbol: str, *, timeout: int = 10) -> Dict[str, Any]:
+        """
+        GET /api/v2/mix/position/single-position
+        """
+        sym = self._symbol(symbol)
+        params = {"productType": self.product_type, "marginCoin": self.margin_coin, "symbol": sym}
+        return await self._request_any_status("GET", "/api/v2/mix/position/single-position", params=params, auth=True, timeout=timeout)
+
+    async def get_pending_orders(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        limit: int = 100,
+        id_less_than: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        timeout: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        GET /api/v2/mix/order/orders-pending
+        """
+        params: Dict[str, Any] = {"productType": self.product_type}
+        if symbol:
+            params["symbol"] = self._symbol(symbol)
+        if limit:
+            params["limit"] = int(limit)
+        if id_less_than:
+            params["idLessThan"] = str(id_less_than)
+        if start_time:
+            params["startTime"] = int(start_time)
+        if end_time:
+            params["endTime"] = int(end_time)
+        return await self._request_any_status("GET", "/api/v2/mix/order/orders-pending", params=params, auth=True, timeout=timeout)
+
+    async def get_pending_plan_orders(
+        self,
+        *,
+        plan_type: str = "normal_plan",
+        symbol: Optional[str] = None,
+        limit: int = 100,
+        id_less_than: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        timeout: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        GET /api/v2/mix/order/orders-plan-pending
+        """
+        params: Dict[str, Any] = {"productType": self.product_type, "planType": str(plan_type)}
+        if symbol:
+            params["symbol"] = self._symbol(symbol)
+        if limit:
+            params["limit"] = int(limit)
+        if id_less_than:
+            params["idLessThan"] = str(id_less_than)
+        if start_time:
+            params["startTime"] = int(start_time)
+        if end_time:
+            params["endTime"] = int(end_time)
+        return await self._request_any_status("GET", "/api/v2/mix/order/orders-plan-pending", params=params, auth=True, timeout=timeout)
+
+    async def get_order_fills(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        order_id: Optional[str] = None,
+        limit: int = 100,
+        id_less_than: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        timeout: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        GET /api/v2/mix/order/fills
+        """
+        params: Dict[str, Any] = {"productType": self.product_type}
+        if symbol:
+            params["symbol"] = self._symbol(symbol)
+        if order_id:
+            params["orderId"] = str(order_id)
+        if limit:
+            params["limit"] = int(limit)
+        if id_less_than:
+            params["idLessThan"] = str(id_less_than)
+        if start_time:
+            params["startTime"] = int(start_time)
+        if end_time:
+            params["endTime"] = int(end_time)
+        return await self._request_any_status("GET", "/api/v2/mix/order/fills", params=params, auth=True, timeout=timeout)
+
+    async def get_ticker(
+        self,
+        symbol: str,
+        *,
+        timeout: int = 8,
+    ) -> Dict[str, Any]:
+        """
+        GET /api/v2/mix/market/ticker (public)
+        """
+        params = {"productType": self.product_type, "symbol": self._symbol(symbol)}
+        return await self._request_any_status("GET", "/api/v2/mix/market/ticker", params=params, auth=False, timeout=timeout)
