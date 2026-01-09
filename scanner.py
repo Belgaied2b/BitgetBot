@@ -186,7 +186,6 @@ TICK_LOCK = asyncio.Lock()
 MACRO_CACHE = MacroCache() if MacroCache else None
 OPTIONS_CACHE = OptionsCache() if OptionsCache else None
 
-
 INST_HUB = InstitutionalWSHub() if InstitutionalWSHub else None
 _INST_SYMBOLS_LAST: List[str] = []
 
@@ -236,7 +235,6 @@ TRAIL_MIN_STEP_ATR = float(os.getenv("TRAIL_MIN_STEP_ATR", "0.20"))
 # Pro monitor throttle
 PRO_MONITOR_INTERVAL_S = float(os.getenv("PRO_MONITOR_INTERVAL_S", "90"))
 
-
 # =====================================================================
 # Options helpers (non-breaking even if options_data isn't available)
 # =====================================================================
@@ -284,7 +282,6 @@ def _sanitize_risk_factor(rf: Any) -> float:
         return x
     except Exception:
         return 1.0
-
 
 # =====================================================================
 # Pending persistence
@@ -405,7 +402,6 @@ async def _pending_load() -> None:
     except Exception as e:
         logger.warning("pending_load failed: %s", e)
 
-
 # =====================================================================
 # Parsers / small helpers
 # =====================================================================
@@ -450,7 +446,6 @@ def desk_log(level: int, tag: str, symbol: str, tid: str = "-", **kv: Any) -> No
 
 def _oid(prefix: str, tid: str, attempt: int) -> str:
     return f"{prefix}-{tid}-{attempt}-{int(time.time()*1000)}"
-
 
 # =====================================================================
 # Telegram hardened
@@ -556,7 +551,6 @@ def _mk_exec_msg(tag: str, symbol: str, tid: str, **kv: Any) -> str:
         else:
             lines.append(f"{_tg_escape(k)}: `{_tg_escape(v)}`")
     return base + "\n".join(lines)
-
 
 # =====================================================================
 # Helpers
@@ -745,10 +739,6 @@ def _is_market_entry(entry_type: str) -> bool:
     return "MARKET" in str(entry_type or "").upper()
 
 
-def _is_ote_pullback(entry_type: str) -> bool:
-    return "OTE_PULLBACK" in str(entry_type or "").upper()
-
-
 def _entry_ttl_s(entry_type: str, setup: str) -> int:
     et = str(entry_type or "").upper()
     sp = str(setup or "").upper()
@@ -806,7 +796,6 @@ def _runaway_mult(entry_type: str, deep: bool) -> float:
         return float(RUNAWAY_ATR_MULT_MARKET)
     # pullbacks:
     return float(RUNAWAY_ATR_MULT_DEEP if deep else RUNAWAY_ATR_MULT_NEAR)
-
 
 # =====================================================================
 # Premium watcher helpers
@@ -1039,7 +1028,6 @@ async def _maybe_switch_sl_for_liquidity(trader: BitgetTrader, tid: str, st: Dic
     if win <= 0:
         return
 
-    lvl = None
     if direction == "LONG":
         # adverse is below: EQL just under price
         cands = [float(x.get("price")) for x in eql if isinstance(x, dict) and x.get("price") is not None]
@@ -1241,7 +1229,7 @@ async def _pro_monitor(trader: BitgetTrader, tid: str, st: Dict[str, Any]) -> No
     sym = str(st.get("symbol") or "").upper()
     direction = str(st.get("direction") or "").upper()
 
-    in_kz, kz = _in_killzone()
+    in_kz, _kz = _in_killzone()
 
     # refresh last price (cheap)
     px = float(st.get("last_price") or 0.0)
@@ -1303,7 +1291,8 @@ async def _pro_monitor(trader: BitgetTrader, tid: str, st: Dict[str, Any]) -> No
     # ---- Institutional snapshot (CVD) ----
     if INST_HUB and DIST_ENABLE:
         try:
-            snap = await INST_HUB.get_snapshot(sym) if asyncio.iscoroutinefunction(getattr(INST_HUB, "get_snapshot", None)) else INST_HUB.get_snapshot(sym)  # type: ignore
+            get_snap = getattr(INST_HUB, "get_snapshot", None)
+            snap = await get_snap(sym) if asyncio.iscoroutinefunction(get_snap) else get_snap(sym)  # type: ignore
         except Exception:
             snap = None
         if isinstance(snap, dict):
@@ -1346,7 +1335,6 @@ async def _pro_monitor(trader: BitgetTrader, tid: str, st: Dict[str, Any]) -> No
             if pnl_move >= 0.15 * atr and OPTIONS_VETO_ACTION == "TIGHTEN":
                 # tighten to BE (or keep if already BE)
                 if not bool(st.get("be_done", False)) and st.get("sl_plan_id"):
-                    # do a BE switch on full size (before TP1) to reduce tail risk
                     tick_used = float(st.get("tick_used") or 0.0) or _estimate_tick_from_price(entry)
                     be_q = _q_sl(entry, tick_used, direction)
                     await _switch_sl_plan(trader, tid, st, _close_side_from_direction(direction), be_q, float(st.get("qty_total") or 0.0), tick_used, tag="SL_OPT_VETO")
@@ -1527,7 +1515,6 @@ async def _cancel_pending_entry(
 
     await send_telegram(_mk_exec_msg("ENTRY_CANCEL", sym, tid, reason=reason, **kv))
 
-
 # =====================================================================
 # Position / PnL helpers (risk close + bootstrap)
 # =====================================================================
@@ -1677,7 +1664,6 @@ async def _bootstrap_risk_open_positions(trader: BitgetTrader) -> None:
     if added:
         logger.info("[BOOT] risk bootstrap: registered %d open positions from exchange", added)
 
-
 # =====================================================================
 # Fetch
 # =====================================================================
@@ -1692,7 +1678,6 @@ async def _fetch_dfs(client, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         return await asyncio.wait_for(retry_async(_do, retries=2, base_delay=0.4), timeout=FETCH_TIMEOUT_S)
     except Exception:
         return pd.DataFrame(), pd.DataFrame()
-
 
 # =====================================================================
 # Per-scan stats
@@ -1729,7 +1714,6 @@ class ScanStats:
                 return False
             self.reject_debug_left -= 1
             return True
-
 
 # =====================================================================
 # Analyze worker (phase A)
@@ -1875,7 +1859,6 @@ async def analyze_symbol(
             "risk_factor": float(opt_rf),
         }
 
-
 # =====================================================================
 # Ranking (phase B)
 # =====================================================================
@@ -1898,7 +1881,6 @@ def rank_candidates(cands: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             float(c.get("comp_score") or 0.0),
         )
     return sorted(cands, key=key, reverse=True)
-
 
 # =====================================================================
 # Execution (phase C)
@@ -2175,7 +2157,6 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     await _pending_save(force=True)
     desk_log(logging.INFO, "PENDING_NEW", sym, tid, setup=setup, rr=rr, opt_regime=str(opt_ctx.get("regime")), opt_rf=float(rf))
 
-
 # =====================================================================
 # WATCHER
 # =====================================================================
@@ -2205,7 +2186,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                 direction = str(st.get("direction") or "")
                 close_side = _close_side_from_direction(direction)
-                pos_mode = str(st.get("pos_mode") or "one_way")
 
                 entry = float(st.get("entry") or 0.0)
                 sl = float(st.get("sl") or 0.0)
@@ -2246,8 +2226,8 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         pass
 
                 if bool(st.get("be_done", False)):
-                    pos_total = await _get_position_total(trader, sym, direction)(trader, sym, direction)
-                    if pos_total >= 0 and pos_total <= 0:
+                    pos_total = await _get_position_total(trader, sym, direction)
+                    if pos_total == 0:
                         await _risk_close_trade(trader, sym, direction, reason="position_closed_after_be")
                         async with PENDING_LOCK:
                             PENDING.pop(tid, None)
@@ -2316,7 +2296,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         # ✅ Deep pullback detection uses ref_price_at_signal (preferred), then pd_mid, then entry.
                         ref_px = float(st.get("ref_price_at_signal") or 0.0) or float(st.get("pd_mid") or 0.0) or float(entry)
                         deep = _deep_pullback(entry=float(entry), ref_price=float(ref_px), atr=float(atr))
-                        # Persist (debug)
                         if st.get("deep_pullback") != deep:
                             st["deep_pullback"] = bool(deep)
                             dirty = True
@@ -2360,9 +2339,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                                 is_market = _is_market_entry(entry_type)
                                 touched = bool(st.get("pullback_touched", False))
 
-                                # ✅ Key fix:
-                                # - If this is a deep pullback (typical OTE_PULLBACK far from signal price),
-                                #   we DO NOT runaway-cancel. TTL handles it.
+                                # ✅ Key fix: disable runaway cancel for deep pullbacks (TTL handles it)
                                 runaway_allowed = True
                                 if (not is_market) and deep:
                                     runaway_allowed = False
@@ -2629,7 +2606,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                 # Phase 2: BE after TP1 filled
                 if bool(st.get("armed", False)) and (not bool(st.get("be_done", False))):
                     pos_total = await _get_position_total(trader, sym, direction)
-                    if pos_total >= 0 and pos_total <= 0:
+                    if pos_total == 0:
                         await _risk_close_trade(trader, sym, direction, reason="position_closed_before_tp1")
                         async with PENDING_LOCK:
                             PENDING.pop(tid, None)
@@ -2737,7 +2714,6 @@ def _ensure_watcher(trader: BitgetTrader) -> None:
     if WATCHER_TASK is None or WATCHER_TASK.done():
         WATCHER_TASK = asyncio.create_task(_watcher_loop(trader))
 
-
 # =====================================================================
 # Scan loop
 # =====================================================================
@@ -2809,7 +2785,6 @@ async def scan_once(client, trader: BitgetTrader) -> None:
     # -----------------------------
     # ALERT POLICY (anti spam)
     # -----------------------------
-    alert_list: List[Dict[str, Any]] = []
     if ALERT_MODE == "ALL_VALID":
         alert_list = ranked
     elif ALERT_MODE == "TOP_RANK":
