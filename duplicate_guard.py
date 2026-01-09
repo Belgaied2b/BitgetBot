@@ -4,6 +4,7 @@
 # ✅ O(1) avg cleanup using expiry queue (no full dict scan every call)
 # ✅ Thread-safe (Lock) for asyncio/to_thread safety
 # ✅ Optional persistence (load/save) to survive restarts (Railway)
+# ✅ FIX: load() now restores an ordered expiry queue (prevents stale items)
 #
 # API kept:
 # - is_duplicate(fingerprint) -> bool
@@ -16,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import threading
 from collections import deque
@@ -42,7 +44,7 @@ def _fmt_num(x: Optional[float], precision: int) -> str:
     try:
         v = float(x)
         # avoid "-0.0"
-        if abs(v) < 10 ** (-(precision + 2)):
+        if abs(v) < 10 ** (-(int(precision) + 2)):
             v = 0.0
         # stable representation
         s = f"{v:.{int(precision)}f}"
@@ -103,7 +105,7 @@ class DuplicateGuard:
     def __post_init__(self) -> None:
         # fp -> expiry_ts
         self._cache: Dict[str, float] = {}
-        # queue of (expiry_ts, fp) for efficient cleanup
+        # queue of (expiry_ts, fp) for efficient cleanup (must be ordered by expiry)
         self._q: Deque[Tuple[float, str]] = deque()
         self._lock = threading.Lock()
 
@@ -114,6 +116,7 @@ class DuplicateGuard:
         now = _now() if now is None else float(now)
 
         # Pop expired from queue; only delete if expiry matches current cache expiry
+        # (handles re-marking of the same fp where old queue entries should not evict)
         while self._q:
             exp, fp = self._q[0]
             if exp > now:
@@ -138,9 +141,7 @@ class DuplicateGuard:
     # Public
     # -----------------------------------------------------------------
     def is_duplicate(self, fp: str) -> bool:
-        """
-        True si fingerprint déjà vu dans la fenêtre TTL.
-        """
+        """True si fingerprint déjà vu dans la fenêtre TTL."""
         if not fp:
             return False
         now = _now()
@@ -150,9 +151,7 @@ class DuplicateGuard:
             return (exp is not None) and (exp > now)
 
     def mark(self, fp: str) -> None:
-        """
-        Enregistre fingerprint "vu maintenant".
-        """
+        """Enregistre fingerprint "vu maintenant"."""
         if not fp:
             return
         now = _now()
@@ -197,27 +196,27 @@ class DuplicateGuard:
     # Optional persistence (restart-safe)
     # -----------------------------------------------------------------
     def save(self, path: str) -> None:
-        """
-        Sauvegarde les fingerprints non expirés.
-        """
+        """Sauvegarde les fingerprints non expirés."""
         if not path:
             return
         now = _now()
         with self._lock:
             self._cleanup(now)
-            data = {"ttl_seconds": self.ttl_seconds, "items": self._cache}
+            data = {"ttl_seconds": int(self.ttl_seconds), "items": self._cache}
         tmp = f"{path}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        import os
         os.replace(tmp, path)
 
     def load(self, path: str) -> int:
         """
         Recharge les fingerprints non expirés.
         Retourne le nombre d'items chargés.
+
+        NOTE:
+        - On reconstruit une queue triée par expiry pour que _cleanup() reste correct.
         """
-        if not path:
+        if not path or (not os.path.exists(path)):
             return 0
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -230,18 +229,23 @@ class DuplicateGuard:
         if not isinstance(items, dict):
             return 0
 
-        kept = 0
+        kept_items: Dict[str, float] = {}
+        for fp, exp in items.items():
+            try:
+                expf = float(exp)
+            except Exception:
+                continue
+            if expf > now:
+                kept_items[str(fp)] = expf
+
+        # Build ordered queue (critical for O(1) cleanup correctness)
+        ordered = sorted(((exp, fp) for fp, exp in kept_items.items()), key=lambda x: x[0])
+
         with self._lock:
             self._cache.clear()
             self._q.clear()
-            for fp, exp in items.items():
-                try:
-                    expf = float(exp)
-                except Exception:
-                    continue
-                if expf > now:
-                    self._cache[str(fp)] = expf
-                    self._q.append((expf, str(fp)))
-                    kept += 1
+            self._cache.update(kept_items)
+            self._q.extend(ordered)
             self._cleanup(now)
-        return kept
+
+        return len(kept_items)
