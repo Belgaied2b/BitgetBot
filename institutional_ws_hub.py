@@ -13,12 +13,6 @@
 #
 # Dependency:
 #   pip install websockets
-#
-# PATCH (premium watcher readiness):
-#   - Adds CVD-style fields: cvd_1m / cvd_5m / cvd_15m (delta notional sums)
-#   - Extends tape retention to 15m so divergence/distribution logic can work
-#   - Keeps backward compatibility: tape_delta_1m/5m remain ratio (delta/abs)
-#   - Adds env cap: INST_WS_HUB_MAX_SYMBOLS (symbol-level cap before stream cap)
 # =====================================================================
 
 from __future__ import annotations
@@ -26,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -40,7 +33,7 @@ BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
 _DEFAULT_MARK_SPEED = "1s"   # markPrice update speed (1s/3s depending on Binance)
 _MAX_STREAMS_PER_CONN = 1024
 
-# rolling windows
+# rolling windows (seconds)
 _TAPE_WIN_1M = 60.0
 _TAPE_WIN_5M = 300.0
 _TAPE_WIN_15M = 900.0
@@ -77,8 +70,8 @@ def _stream_symbol(stream: str) -> str:
 @dataclass
 class _TapeRec:
     ts: float
-    delta_notional: float
-    notional: float
+    delta_notional: float   # signed notional (buy - sell)
+    notional: float         # absolute notional
 
 
 @dataclass
@@ -102,8 +95,8 @@ class _SymbolState:
     ask_qty: float = 0.0
 
     # rolling microstructure
-    tape: Deque[_TapeRec] = field(default_factory=lambda: deque(maxlen=5000))
-    liquidations: Deque[_LiqRec] = field(default_factory=lambda: deque(maxlen=2000))
+    tape: Deque[_TapeRec] = field(default_factory=lambda: deque(maxlen=12000))
+    liquidations: Deque[_LiqRec] = field(default_factory=lambda: deque(maxlen=4000))
 
     last_update_ts: float = 0.0
 
@@ -132,13 +125,6 @@ class InstitutionalWSHub:
         self._stop_evt = asyncio.Event()
 
         self._id_counter = 1
-
-        # Symbol-level cap (before stream cap). Matches your Railway env: INST_WS_HUB_MAX_SYMBOLS
-        try:
-            ms = int(str(os.getenv("INST_WS_HUB_MAX_SYMBOLS", "220")).strip() or "220")
-        except Exception:
-            ms = 220
-        self._max_symbols = max(10, min(1000, ms))
 
     @property
     def is_running(self) -> bool:
@@ -185,13 +171,7 @@ class InstitutionalWSHub:
         self._ws_task = None
 
     async def set_symbols(self, symbols: List[str]) -> None:
-        # normalize + unique + cap (symbol-level)
-        desired_list = sorted({_norm_symbol(s) for s in (symbols or []) if _norm_symbol(s)})
-        if len(desired_list) > self._max_symbols:
-            LOGGER.warning("[WS_HUB] truncating symbols %d -> %d (INST_WS_HUB_MAX_SYMBOLS)", len(desired_list), self._max_symbols)
-            desired_list = desired_list[: self._max_symbols]
-        desired = set(desired_list)
-
+        desired = {_norm_symbol(s) for s in (symbols or []) if _norm_symbol(s)}
         async with self._lock:
             self._desired_symbols = desired
             for sym in desired:
@@ -199,7 +179,7 @@ class InstitutionalWSHub:
         return
 
     # -----------------------------
-    # read API
+    # read API (SYNC)
     # -----------------------------
     def get_snapshot(self, symbol: str) -> Dict[str, Any]:
         sym = _norm_symbol(symbol)
@@ -207,59 +187,67 @@ class InstitutionalWSHub:
         if not st:
             return {"available": False, "symbol": sym, "reason": "no_state"}
 
-        (
-            tape_ratio_1m,
-            tape_ratio_5m,
-            tape_abs_1m,
-            tape_abs_5m,
-            tape_delta_notional_1m,
-            tape_delta_notional_5m,
-            tape_delta_notional_15m,
-            tape_abs_15m,
-        ) = self._compute_tape_extended(st)
-
-        liq_total_5m, liq_buy_5m, liq_sell_5m, liq_delta_ratio_5m, liq_count_5m = self._compute_liq_5m_breakdown(st)
+        # tape / cvd
+        t = self._compute_tape(st)
+        # liquidations
+        liq = self._compute_liq_5m_breakdown(st)
+        # orderbook
         ob_imb = self._compute_book_imbalance(st)
+        micro = self._compute_microprice(st)
+        spread_bps = self._compute_spread_bps(st)
 
         return {
             "available": True,
             "symbol": sym,
             "ts": st.last_update_ts,
+
+            # prices
             "mark_price": st.mark_price,
             "index_price": st.index_price,
             "funding_rate": st.funding_rate,
             "next_funding_time": st.next_funding_time,
             "best_bid": st.best_bid,
             "best_ask": st.best_ask,
+
+            # helpful extras
+            "microprice": micro,
+            "spread_bps": spread_bps,
+
+            # top-of-book qty
             "bid_qty": st.bid_qty,
             "ask_qty": st.ask_qty,
             "orderbook_imbalance": ob_imb,
 
-            # Backward-compatible: ratios (delta/abs)
-            "tape_delta_1m": tape_ratio_1m,
-            "tape_delta_5m": tape_ratio_5m,
-            "tape_abs_1m": tape_abs_1m,
-            "tape_abs_5m": tape_abs_5m,
+            # tape ratios (buy-sell / total)
+            "tape_delta_1m": t["ratio_1m"],
+            "tape_delta_5m": t["ratio_5m"],
+            "tape_delta_15m": t["ratio_15m"],
 
-            # NEW: absolute delta-notional (CVD-style)
-            "tape_delta_notional_1m": tape_delta_notional_1m,
-            "tape_delta_notional_5m": tape_delta_notional_5m,
-            "tape_delta_notional_15m": tape_delta_notional_15m,
-            "tape_abs_15m": tape_abs_15m,
+            # tape signed notionals (what institutional_data expects)
+            "tape_delta_1m_notional": t["delta_1m"],
+            "tape_delta_5m_notional": t["delta_5m"],
+            "tape_delta_15m_notional": t["delta_15m"],
 
-            # ✅ Aliases typically used by premium watcher logic
-            "cvd_1m": tape_delta_notional_1m,
-            "cvd_5m": tape_delta_notional_5m,
-            "cvd_15m": tape_delta_notional_15m,
+            # tape total notionals (useful for gating)
+            "tape_abs_1m": t["abs_1m"],
+            "tape_abs_5m": t["abs_5m"],
+            "tape_abs_15m": t["abs_15m"],
 
             # Backward-compatible field
-            "liq_notional_5m": liq_total_5m,
+            "liq_notional_5m": liq["total"],
 
             # NEW: liquidation breakdown
-            "liq_buy_usd_5m": liq_buy_5m,
-            "liq_sell_usd_5m": liq_sell_5m,
-            "liq_delta_ratio_5m": liq_delta_ratio_5m,
-            "liq_count_5m": liq_count_5m,
+            "liq_buy_usd_5m": liq["buy_abs"],
+            "liq_sell_usd_5m": liq["sell_abs"],
+            "liq_delta_ratio_5m": liq["delta_ratio"],
+            "liq_count_5m": liq["count"],
+
+            # aliases for watcher usage
+            "cvd_notional_5m": t["delta_5m"],
+            "cvd_notional_15m": t["delta_15m"],
+            "cvd_5m": t["delta_5m"],
+            "cvd_15m": t["delta_15m"],
+            "price": (st.best_bid + st.best_ask) / 2.0 if (st.best_bid > 0 and st.best_ask > 0) else (st.mark_price or 0.0),
         }
 
     # -----------------------------
@@ -272,28 +260,14 @@ class InstitutionalWSHub:
         except Exception:
             return
 
-    def _compute_tape_extended(
-        self, st: _SymbolState
-    ) -> Tuple[float, float, float, float, float, float, float, float]:
-        """
-        Returns:
-          - tape_ratio_1m: (delta_notional_1m / abs_notional_1m)
-          - tape_ratio_5m: (delta_notional_5m / abs_notional_5m)
-          - abs_notional_1m, abs_notional_5m
-          - delta_notional_1m, delta_notional_5m, delta_notional_15m
-          - abs_notional_15m
-        """
+    def _compute_tape(self, st: _SymbolState) -> Dict[str, float]:
         now = _now()
+        # keep some margin so prune doesn't lag due to timings
+        self._prune_left(st.tape, now - (_TAPE_WIN_15M + 5.0))
 
-        # keep enough history for 15m computations
-        self._prune_left(st.tape, now - (_TAPE_WIN_15M + 2.0))
-
-        d1 = 0.0
-        n1 = 0.0
-        d5 = 0.0
-        n5 = 0.0
-        d15 = 0.0
-        n15 = 0.0
+        d1 = n1 = 0.0
+        d5 = n5 = 0.0
+        d15 = n15 = 0.0
 
         for rec in st.tape:
             if rec.ts >= now - _TAPE_WIN_15M:
@@ -306,23 +280,25 @@ class InstitutionalWSHub:
                 d1 += rec.delta_notional
                 n1 += rec.notional
 
-        tape_ratio_1m = (d1 / n1) if n1 > 1e-9 else 0.0
-        tape_ratio_5m = (d5 / n5) if n5 > 1e-9 else 0.0
+        r1 = (d1 / n1) if n1 > 1e-9 else 0.0
+        r5 = (d5 / n5) if n5 > 1e-9 else 0.0
+        r15 = (d15 / n15) if n15 > 1e-9 else 0.0
 
-        return (
-            float(tape_ratio_1m),
-            float(tape_ratio_5m),
-            float(n1),
-            float(n5),
-            float(d1),
-            float(d5),
-            float(d15),
-            float(n15),
-        )
+        return {
+            "delta_1m": float(d1),
+            "delta_5m": float(d5),
+            "delta_15m": float(d15),
+            "abs_1m": float(n1),
+            "abs_5m": float(n5),
+            "abs_15m": float(n15),
+            "ratio_1m": float(r1),
+            "ratio_5m": float(r5),
+            "ratio_15m": float(r15),
+        }
 
-    def _compute_liq_5m_breakdown(self, st: _SymbolState) -> Tuple[float, float, float, float, int]:
+    def _compute_liq_5m_breakdown(self, st: _SymbolState) -> Dict[str, Any]:
         now = _now()
-        self._prune_left(st.liquidations, now - (_LIQ_WIN_5M + 2.0))
+        self._prune_left(st.liquidations, now - (_LIQ_WIN_5M + 5.0))
 
         buy_abs = 0.0
         sell_abs = 0.0
@@ -343,13 +319,49 @@ class InstitutionalWSHub:
 
         total = float(buy_abs + sell_abs)
         delta_ratio = float((buy_abs - sell_abs) / total) if total > 1e-12 else 0.0
-        return float(total), float(buy_abs), float(sell_abs), float(delta_ratio), int(cnt)
+
+        return {
+            "total": float(total),
+            "buy_abs": float(buy_abs),
+            "sell_abs": float(sell_abs),
+            "delta_ratio": float(delta_ratio),
+            "count": int(cnt),
+        }
 
     def _compute_book_imbalance(self, st: _SymbolState) -> float:
         denom = (abs(st.bid_qty) + abs(st.ask_qty))
         if denom <= 1e-12:
             return 0.0
         return float((st.bid_qty - st.ask_qty) / denom)
+
+    def _compute_microprice(self, st: _SymbolState) -> float:
+        try:
+            b = float(st.best_bid or 0.0)
+            a = float(st.best_ask or 0.0)
+            B = float(st.bid_qty or 0.0)
+            A = float(st.ask_qty or 0.0)
+            if b <= 0 or a <= 0:
+                return 0.0
+            den = (A + B)
+            if den <= 1e-12:
+                return (a + b) / 2.0
+            # classic microprice
+            return float((b * A + a * B) / den)
+        except Exception:
+            return 0.0
+
+    def _compute_spread_bps(self, st: _SymbolState) -> float:
+        try:
+            b = float(st.best_bid or 0.0)
+            a = float(st.best_ask or 0.0)
+            if b <= 0 or a <= 0:
+                return 0.0
+            mid = (a + b) / 2.0
+            if mid <= 0:
+                return 0.0
+            return float((a - b) / mid * 10000.0)
+        except Exception:
+            return 0.0
 
     # -----------------------------
     # WS loop + handlers
@@ -370,7 +382,7 @@ class InstitutionalWSHub:
 
         desired_streams = self._streams_for_symbols(desired)
 
-        # safety: cap (stream-level)
+        # safety: cap
         if len(desired_streams) > _MAX_STREAMS_PER_CONN:
             desired_list = sorted(list(desired))
             keep: Set[str] = set()
@@ -380,11 +392,6 @@ class InstitutionalWSHub:
                     break
                 keep |= streams
             desired_streams = keep
-            LOGGER.warning(
-                "[WS_HUB] stream-cap active: subscribed streams=%d (max=%d)",
-                len(desired_streams),
-                _MAX_STREAMS_PER_CONN,
-            )
 
         to_add = sorted(list(desired_streams - self._subscribed_streams))
         to_remove = sorted(list(self._subscribed_streams - desired_streams))
@@ -427,14 +434,13 @@ class InstitutionalWSHub:
         qty = _safe_float(data.get("q"), 0.0)
         notional = abs(price * qty)
 
-        # Binance aggTrade:
-        #   m=True  => buyer is market maker => sell aggressor => negative delta
-        #   m=False => buy aggressor => positive delta
+        # Binance aggTrade: m=True means "buyer is the market maker" => net sell pressure
         m = bool(data.get("m", False))
         delta = (-notional) if m else (+notional)
 
-        st.tape.append(_TapeRec(ts=_now(), delta_notional=delta, notional=notional))
-        st.last_update_ts = _now()
+        if notional > 0:
+            st.tape.append(_TapeRec(ts=_now(), delta_notional=delta, notional=notional))
+            st.last_update_ts = _now()
 
     async def _handle_event_forceorder(self, sym: str, data: Dict[str, Any]) -> None:
         st = await self._ensure_state(sym)
@@ -506,13 +512,13 @@ class InstitutionalWSHub:
                     ping_interval=20,
                     ping_timeout=20,
                     close_timeout=5,
-                    max_queue=1024,
+                    max_queue=2048,
                 ) as ws:
                     LOGGER.info("[WS_HUB] connected %s", BINANCE_FUTURES_WS)
                     backoff = 1.0
                     self._subscribed_streams = set()
 
-                    # Enable combined payloads so messages come as {"stream": "...", "data": {...}}
+                    # Enable combined payloads: {"stream":"...","data":{...}}
                     await self._send(ws, {"method": "SET_PROPERTY", "params": ["combined", True], "id": self._next_id()})
 
                     # initial subscribe
