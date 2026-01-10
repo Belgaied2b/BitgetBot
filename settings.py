@@ -146,9 +146,27 @@ MAX_ORDERS_PER_SCAN = _get_int("MAX_ORDERS_PER_SCAN", 10, min_v=0, max_v=50)
 # Universe
 TOP_N_SYMBOLS = _get_int("TOP_N_SYMBOLS", 150, min_v=5, max_v=400)
 
+# Execution logs (TCA / audit)
+EXEC_LOG_ENABLE = _get_bool("EXEC_LOG_ENABLE", False)
+EXEC_LOG_PATH = _get_str("EXEC_LOG_PATH", "exec_log.jsonl")
+
 # Global unit risk (used by some modules)
 RISK_USDT = _get_float("RISK_USDT", 20.0, min_v=1.0, max_v=500.0)
 RR_TARGET = _get_float("RR_TARGET", 1.6, min_v=0.8, max_v=5.0)
+
+# Desk risk limits (used by RiskManager)
+MAX_DAILY_LOSS = _get_float("MAX_DAILY_LOSS", 60.0, min_v=0.0, max_v=100000.0)
+MAX_TRADES_PER_DAY = _get_int("MAX_TRADES_PER_DAY", 500, min_v=0, max_v=10000)
+MAX_OPEN_POSITIONS = _get_int("MAX_OPEN_POSITIONS", 20, min_v=0, max_v=200)
+MAX_LONG_POSITIONS = _get_int("MAX_LONG_POSITIONS", 15, min_v=0, max_v=200)
+MAX_SHORT_POSITIONS = _get_int("MAX_SHORT_POSITIONS", 15, min_v=0, max_v=200)
+MAX_CONSECUTIVE_LOSSES = _get_int("MAX_CONSECUTIVE_LOSSES", 5, min_v=0, max_v=200)
+TILT_COOLDOWN_SECONDS = _get_int("TILT_COOLDOWN_SECONDS", 3600, min_v=0, max_v=86400)
+DRAWDOWN_RISK_FACTOR = _get_float("DRAWDOWN_RISK_FACTOR", 0.5, min_v=0.1, max_v=1.0)
+
+# Per-symbol risk caps (0 disables)
+SYMBOL_MAX_DAILY_LOSS = _get_float("SYMBOL_MAX_DAILY_LOSS", 0.0, min_v=0.0, max_v=100000.0)
+SYMBOL_MAX_TRADES_PER_DAY = _get_int("SYMBOL_MAX_TRADES_PER_DAY", 0, min_v=0, max_v=10000)
 
 
 # =====================================================================
