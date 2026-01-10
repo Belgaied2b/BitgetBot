@@ -75,6 +75,8 @@ from settings import (
 from bitget_client import get_client
 from bitget_trader import BitgetTrader
 from analyze_signal import SignalAnalyzer
+from indicators import desk_momentum_gate  # premium recheck
+
 
 from structure_utils import analyze_structure, htf_trend_ok
 
@@ -242,6 +244,21 @@ TRAIL_MIN_STEP_ATR = float(os.getenv("TRAIL_MIN_STEP_ATR", "0.20"))
 
 # Pro monitor throttle
 PRO_MONITOR_INTERVAL_S = float(os.getenv("PRO_MONITOR_INTERVAL_S", "90"))
+
+# =====================================================================
+# NEW: Premium signal recheck (autonomous validation while pending/live)
+# =====================================================================
+WATCH_RECHECK_ENABLE = str(os.getenv("WATCH_RECHECK_ENABLE", "1")).strip() == "1"
+# cadence: how often to re-validate structure/trend/momentum for each trade
+WATCH_RECHECK_INTERVAL_S = float(os.getenv("WATCH_RECHECK_INTERVAL_S", "120"))
+# how many consecutive fails before action
+WATCH_RECHECK_MAX_FAILS = int(os.getenv("WATCH_RECHECK_MAX_FAILS", "1"))
+# actions
+WATCH_RECHECK_PENDING_ACTION = str(os.getenv("WATCH_RECHECK_PENDING_ACTION", "CANCEL")).strip().upper()  # CANCEL
+WATCH_RECHECK_LIVE_ACTION = str(os.getenv("WATCH_RECHECK_LIVE_ACTION", "CLOSE")).strip().upper()      # CLOSE | TIGHTEN
+# do not apply immediately after fill (seconds)
+WATCH_RECHECK_LIVE_GRACE_S = int(os.getenv("WATCH_RECHECK_LIVE_GRACE_S", "90"))
+
 
 # =====================================================================
 # NEW: Institutional watcher veto policy (requires InstitutionalWSHub snapshot)
@@ -1065,45 +1082,92 @@ async def _invalidation_check(
     entry_price: float,
     entry_type: str,
 ) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Heavy watcher check for pending entries (before fill).
+
+    Goal: cancel a pending entry if the trade is no longer "good":
+      - HTF misalignment (counter-trend)
+      - structure flip / CHoCH (trend inversion)
+      - momentum flip (no longer bullish/bearish)
+      - (market-only) entry too premium/discount vs PD mid
+    """
     sym = str(symbol).upper()
+    dir_u = (direction or "").upper()
+    if dir_u not in ("LONG", "SHORT"):
+        dir_u = "LONG"
 
     async def _do():
-        df_h1 = await client.get_klines_df(sym, TF_H1, 140)
-        df_h4 = await client.get_klines_df(sym, TF_H4, 140)
+        df_h1 = await client.get_klines_df(sym, TF_H1, 160)
+        df_h4 = await client.get_klines_df(sym, TF_H4, 160)
         return df_h1, df_h4
 
     try:
         df_h1, df_h4 = await asyncio.wait_for(retry_async(_do, retries=1, base_delay=0.25), timeout=FETCH_TIMEOUT_S)
-    except Exception:
-        return True, "", {}
+    except Exception as e:
+        # If we cannot fetch fresh data, we do NOT invalidate (can't confirm).
+        return True, "", {"error": str(e)}
 
-    if df_h1 is None or df_h4 is None or getattr(df_h1, "empty", True) or getattr(df_h4, "empty", True):
-        return True, "", {}
+    if df_h1 is None or getattr(df_h1, "empty", True) or len(df_h1) < 80:
+        return True, "", {"note": "no_df_h1"}
+    if df_h4 is None or getattr(df_h4, "empty", True) or len(df_h4) < 60:
+        # Still can run H1 checks, but don't HTF veto.
+        df_h4 = None
 
+    # --- Structure (H1) ---
     try:
-        if not htf_trend_ok(df_h4, direction):
-            return False, "invalidate:htf_veto", {}
-    except Exception:
-        pass
+        struct = analyze_structure(df_h1)
+    except Exception as e:
+        struct = {"error": str(e)}
 
+    st_trend = str(struct.get("trend") or "").upper()
+    choch = bool(struct.get("choch", False))
+
+    # Trend flip (avoid holding/entering against the new structure trend)
+    if st_trend in ("LONG", "SHORT") and st_trend != dir_u:
+        return False, "invalidate:structure_trend_flip", {"struct_trend": st_trend, "choch": int(choch)}
+
+    # CHoCH (explicit inversion signal)
+    if choch and st_trend in ("LONG", "SHORT") and st_trend != dir_u:
+        return False, "invalidate:choch", {"struct_trend": st_trend, "choch": 1}
+
+    # --- HTF alignment (H4) ---
+    if df_h4 is not None:
+        try:
+            if not bool(htf_trend_ok(df_h4, dir_u)):
+                return False, "invalidate:htf_veto", {"htf": "veto"}
+        except Exception:
+            pass
+
+    # --- Momentum gate (H1) ---
     try:
-        st1 = analyze_structure(df_h1)
-        tr = str(st1.get("trend") or "").upper()
-        if tr in ("LONG", "SHORT") and tr != str(direction).upper():
-            return False, "invalidate:trend_flip_h1", {"trend_h1": tr}
-        if bool(st1.get("choch")) and tr in ("LONG", "SHORT") and tr != str(direction).upper():
-            return False, "invalidate:choch_flip", {"trend_h1": tr}
-    except Exception:
-        pass
+        mom = desk_momentum_gate(df_h1, dir_u)
+    except Exception as e:
+        mom = {"ok": True, "error": str(e)}
 
+    if not bool(mom.get("ok", True)):
+        r = str(mom.get("reason") or "")
+        # For pending entries, choppy / overextended is a reason to cancel (entry got late / conditions degraded).
+        if r in {
+            "momentum_not_bullish",
+            "momentum_not_bearish",
+            "ema_bias_veto",
+            "ema_range",
+            "choppy_market",
+            "overextended_long",
+            "overextended_short",
+        }:
+            return False, f"invalidate:{r}", {"momentum": mom}
+
+    # --- Market entry premium/discount sanity (legacy but kept) ---
     mid = _pd_mid(df_h1, 80)
     if _is_market_entry(entry_type) and mid > 0 and math.isfinite(mid):
-        if str(direction).upper() == "LONG" and float(entry_price) > float(mid):
+        if dir_u == "LONG" and float(entry_price) > float(mid):
             return False, "invalidate:entry_premium", {"mid": mid}
-        if str(direction).upper() == "SHORT" and float(entry_price) < float(mid):
+        if dir_u == "SHORT" and float(entry_price) < float(mid):
             return False, "invalidate:entry_discount", {"mid": mid}
 
-    return True, "", {"mid": mid}
+    return True, "", {"mid": mid, "struct_trend": st_trend, "choch": int(choch)}
+
 
 # =====================================================================
 # Cancel pending entry helper
@@ -2033,6 +2097,135 @@ async def _time_stop_check(trader: BitgetTrader, tid: str, st: Dict[str, Any], d
         return True, {"mfe": mfe, "need": need, "age_s": int(age), "bars": int(TIME_STOP_BARS)}
     return False, {"mfe": mfe, "need": need, "age_s": int(age), "bars": int(TIME_STOP_BARS)}
 
+
+
+# =====================================================================
+# NEW: Premium recheck for live positions (trend/structure/momentum)
+# =====================================================================
+
+async def _recheck_live_and_act(trader: BitgetTrader, tid: str, st: Dict[str, Any], df_h1: pd.DataFrame) -> None:
+    """
+    Re-validates the trade while it's live.
+
+    If structure / HTF / momentum flips against the trade:
+      - either CLOSE the position
+      - or TIGHTEN SL to BE (depending on WATCH_RECHECK_LIVE_ACTION)
+    """
+    if not WATCH_RECHECK_ENABLE:
+        return
+
+    now = time.time()
+    last = float(st.get("last_recheck_ts") or 0.0)
+    if (now - last) < float(WATCH_RECHECK_INTERVAL_S):
+        return
+
+    filled_ts = float(st.get("filled_ts") or 0.0)
+    if filled_ts > 0 and (now - filled_ts) < float(WATCH_RECHECK_LIVE_GRACE_S):
+        # avoid immediate close right after entry fill
+        st["last_recheck_ts"] = now
+        st["recheck_fail_hits"] = 0
+        return
+
+    st["last_recheck_ts"] = now
+
+    sym = str(st.get("symbol") or "").upper()
+    direction = str(st.get("direction") or "").upper()
+    if direction not in ("LONG", "SHORT"):
+        direction = "LONG"
+
+    # --- Structure (H1) ---
+    st_trend = "UNKNOWN"
+    choch = False
+    try:
+        struct = analyze_structure(df_h1)
+        st_trend = str(struct.get("trend") or "").upper()
+        choch = bool(struct.get("choch", False))
+    except Exception as e:
+        struct = {"error": str(e)}
+
+    # --- HTF (H4) ---
+    htf_ok = True
+    try:
+        df_h4 = await asyncio.wait_for(trader.client.get_klines_df(sym, TF_H4, 160), timeout=FETCH_TIMEOUT_S)
+        if df_h4 is not None and (not getattr(df_h4, "empty", True)) and len(df_h4) >= 60:
+            htf_ok = bool(htf_trend_ok(df_h4, direction))
+    except Exception:
+        pass
+
+    # --- Momentum (H1) ---
+    try:
+        mom = desk_momentum_gate(df_h1, direction)
+    except Exception as e:
+        mom = {"ok": True, "error": str(e)}
+
+    reasons: List[str] = []
+    if (not htf_ok):
+        reasons.append("htf_veto")
+
+    if st_trend in ("LONG", "SHORT") and st_trend != direction:
+        reasons.append("structure_trend_flip")
+
+    if bool(choch) and st_trend in ("LONG", "SHORT") and st_trend != direction:
+        reasons.append("choch")
+
+    if not bool(mom.get("ok", True)):
+        mr = str(mom.get("reason") or "")
+        if mr in {"momentum_not_bullish", "momentum_not_bearish", "ema_bias_veto"}:
+            reasons.append(mr)
+
+    if not reasons:
+        st["recheck_fail_hits"] = 0
+        st["last_recheck_reason"] = ""
+        st["last_recheck_dbg"] = {"struct_trend": st_trend, "choch": int(choch), "htf_ok": int(htf_ok)}
+        return
+
+    hits = int(st.get("recheck_fail_hits") or 0) + 1
+    st["recheck_fail_hits"] = hits
+    why = ",".join(reasons)
+    st["last_recheck_reason"] = why
+    st["last_recheck_dbg"] = {
+        "reasons": reasons,
+        "struct_trend": st_trend,
+        "choch": int(choch),
+        "htf_ok": int(htf_ok),
+        "momentum": mom,
+    }
+
+    # notify on first fail
+    if hits == 1:
+        try:
+            await send_telegram(_mk_exec_msg("RECHECK_WARN", sym, tid, reasons=why))
+        except Exception:
+            pass
+
+    if hits < int(WATCH_RECHECK_MAX_FAILS):
+        return
+
+    # Action
+    act = str(WATCH_RECHECK_LIVE_ACTION or "CLOSE").upper()
+    if act == "TIGHTEN":
+        try:
+            # move SL to BE if possible
+            entry = float(st.get("entry") or 0.0)
+            tick_used = float(st.get("tick_used") or 0.0) or _estimate_tick_from_price(entry)
+            if entry > 0 and st.get("sl_plan_id"):
+                be_q = _q_sl(entry, tick_used, direction)
+                await _switch_sl_plan(
+                    trader, tid, st,
+                    close_side=_close_side_from_direction(direction),
+                    new_sl=float(be_q),
+                    qty_total=float(st.get("qty_total") or 0.0),
+                    tick_used=float(tick_used),
+                    tag="SL_RECHECK_TIGHTEN",
+                )
+                await send_telegram(_mk_exec_msg("RECHECK_TIGHTEN", sym, tid, reasons=why, sl=float(be_q)))
+                return
+        except Exception:
+            # if tighten fails, fallback to close
+            pass
+
+    await _close_and_cleanup(trader, tid, st, reason=f"recheck:{why}")
+
 # =====================================================================
 # Pro monitor (institutional + options + distribution + liquidity + time stop + trailing)
 # =====================================================================
@@ -2102,6 +2295,12 @@ async def _pro_monitor(trader: BitgetTrader, tid: str, st: Dict[str, Any]) -> No
     if atr <= 0:
         atr = _calc_atr14(df_h1, 14)
         st["atr"] = float(atr)
+
+    # ✅ NEW: autonomous premium recheck (trend/structure/momentum)
+    try:
+        await _recheck_live_and_act(trader, tid, st, df_h1)
+    except Exception:
+        pass
 
     # ---- Institutional snapshot (CVD + veto) ----
     inst_veto = False
