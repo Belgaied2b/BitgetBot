@@ -13,6 +13,13 @@
 #
 # Dependency:
 #   pip install websockets
+#
+# ✅ UPDATED for your autonomous institutional watcher:
+#   - start(..., **kwargs) accepts product_type safely (scanner compatibility)
+#   - snapshot exposes watcher-friendly aliases:
+#       price / last / markPrice / mark_price
+#       ts / timestamp / ts_ms
+#   - adds age_s (freshness) + ws_ok (freshness gate)
 # =====================================================================
 
 from __future__ import annotations
@@ -38,6 +45,9 @@ _TAPE_WIN_1M = 60.0
 _TAPE_WIN_5M = 300.0
 _TAPE_WIN_15M = 900.0
 _LIQ_WIN_5M = 300.0
+
+# snapshot freshness: watcher can trust WS price if age <= this
+_WS_FRESH_MAX_AGE_S = float(4.0)
 
 
 def _now() -> float:
@@ -106,7 +116,7 @@ class InstitutionalWSHub:
     One WS connection, live SUBSCRIBE/UNSUBSCRIBE, per-symbol cache.
 
     Public API:
-      - await hub.start(symbols)
+      - await hub.start(symbols, **kwargs)
       - await hub.stop()
       - await hub.set_symbols(symbols)
       - hub.get_snapshot(symbol) -> dict
@@ -151,7 +161,11 @@ class InstitutionalWSHub:
     # -----------------------------
     # control
     # -----------------------------
-    async def start(self, symbols: Optional[List[str]] = None) -> None:
+    async def start(self, symbols: Optional[List[str]] = None, **kwargs: Any) -> None:
+        """
+        kwargs accepted for compatibility (ex: product_type=... in scanner),
+        ignored safely.
+        """
         if symbols:
             await self.set_symbols(symbols)
 
@@ -196,13 +210,28 @@ class InstitutionalWSHub:
         micro = self._compute_microprice(st)
         spread_bps = self._compute_spread_bps(st)
 
+        # watcher-friendly price (mid if possible, else mark)
+        px_mid = (st.best_bid + st.best_ask) / 2.0 if (st.best_bid > 0 and st.best_ask > 0) else 0.0
+        price = float(px_mid or st.mark_price or 0.0)
+
+        ts = float(st.last_update_ts or 0.0)
+        age_s = float(_now() - ts) if ts > 0 else 1e9
+        ws_ok = bool(age_s <= _WS_FRESH_MAX_AGE_S)
+
         return {
             "available": True,
             "symbol": sym,
-            "ts": st.last_update_ts,
+
+            # timestamps / freshness
+            "ts": ts,                      # seconds epoch
+            "timestamp": ts,               # alias
+            "ts_ms": int(ts * 1000) if ts > 0 else 0,
+            "age_s": age_s,
+            "ws_ok": ws_ok,
 
             # prices
             "mark_price": st.mark_price,
+            "markPrice": st.mark_price,    # alias for watcher patch
             "index_price": st.index_price,
             "funding_rate": st.funding_rate,
             "next_funding_time": st.next_funding_time,
@@ -247,7 +276,10 @@ class InstitutionalWSHub:
             "cvd_notional_15m": t["delta_15m"],
             "cvd_5m": t["delta_5m"],
             "cvd_15m": t["delta_15m"],
-            "price": (st.best_bid + st.best_ask) / 2.0 if (st.best_bid > 0 and st.best_ask > 0) else (st.mark_price or 0.0),
+
+            # watcher patch expects these sometimes
+            "price": price,
+            "last": price,                 # alias
         }
 
     # -----------------------------
@@ -427,6 +459,10 @@ class InstitutionalWSHub:
         st.bid_qty = _safe_float(data.get("B"), st.bid_qty)
         st.ask_qty = _safe_float(data.get("A"), st.ask_qty)
         st.last_update_ts = _now()
+
+        # optional: if mark is missing, approximate from mid
+        if st.mark_price <= 0 and st.best_bid > 0 and st.best_ask > 0:
+            st.mark_price = (st.best_bid + st.best_ask) / 2.0
 
     async def _handle_event_aggtrade(self, sym: str, data: Dict[str, Any]) -> None:
         st = await self._ensure_state(sym)
