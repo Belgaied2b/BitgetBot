@@ -36,6 +36,16 @@ from settings import (
     RR_MIN_TOLERATED_WITH_INST,
     MIN_INST_SCORE,
     DESK_EV_MODE,
+    MAX_DAILY_LOSS,
+    MAX_TRADES_PER_DAY,
+    MAX_OPEN_POSITIONS,
+    MAX_LONG_POSITIONS,
+    MAX_SHORT_POSITIONS,
+    MAX_CONSECUTIVE_LOSSES,
+    TILT_COOLDOWN_SECONDS,
+    DRAWDOWN_RISK_FACTOR,
+    SYMBOL_MAX_DAILY_LOSS,
+    SYMBOL_MAX_TRADES_PER_DAY,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -51,24 +61,24 @@ class RiskConfig:
     risk_per_trade: float = float(RISK_USDT)
 
     # daily loss hard stop
-    max_daily_loss: float = 60.0
+    max_daily_loss: float = float(MAX_DAILY_LOSS)
 
     # daily trades cap
-    max_trades_per_day: int = 500
+    max_trades_per_day: int = int(MAX_TRADES_PER_DAY)
 
     # max concurrently open positions
-    max_open_positions: int = 20
+    max_open_positions: int = int(MAX_OPEN_POSITIONS)
 
     # directional caps
-    max_long_positions: int = 15
-    max_short_positions: int = 15
+    max_long_positions: int = int(MAX_LONG_POSITIONS)
+    max_short_positions: int = int(MAX_SHORT_POSITIONS)
 
     # tilt: consecutive losses => cooldown
-    max_consecutive_losses: int = 5
-    tilt_cooldown_seconds: int = 60 * 60
+    max_consecutive_losses: int = int(MAX_CONSECUTIVE_LOSSES)
+    tilt_cooldown_seconds: int = int(TILT_COOLDOWN_SECONDS)
 
     # drawdown risk reducer
-    drawdown_risk_factor: float = 0.5
+    drawdown_risk_factor: float = float(DRAWDOWN_RISK_FACTOR)
 
     # exposure caps (gross + per symbol) relative to equity
     account_equity_usdt: float = float(ACCOUNT_EQUITY_USDT)
@@ -89,6 +99,10 @@ class RiskConfig:
     vol_risk_min_factor: float = 0.35
     vol_risk_max_factor: float = 1.25
 
+    # per-symbol daily caps (0 disables)
+    symbol_max_daily_loss: float = float(SYMBOL_MAX_DAILY_LOSS)
+    symbol_max_trades_per_day: int = int(SYMBOL_MAX_TRADES_PER_DAY)
+
     # daily reset mode (keeps current default behavior: localtime)
     day_reset_use_utc: bool = False
 
@@ -103,6 +117,8 @@ class DailyState:
     trades_opened: int = 0
     pnl: float = 0.0
     losses_count: int = 0
+    symbol_pnl: Dict[str, float] = field(default_factory=dict)
+    symbol_trades: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -199,6 +215,11 @@ class RiskManager:
             self._tilt_activated_at = 0.0
             # do not auto-close open positions; clear reservations to avoid stuck state
             self._reservations.clear()
+        else:
+            if self._daily.symbol_pnl is None:
+                self._daily.symbol_pnl = {}
+            if self._daily.symbol_trades is None:
+                self._daily.symbol_trades = {}
         # also keep the reservation map clean in runtime
         self._purge_expired_reservations_nolock()
 
@@ -513,6 +534,7 @@ class RiskManager:
         self.direction_counts[side] = self.direction_counts.get(side, 0) + 1
         if self._daily:
             self._daily.trades_opened += 1
+            self._daily.symbol_trades[sym] = int(self._daily.symbol_trades.get(sym, 0)) + 1
 
     def register_closed(self, symbol: str, side: str, pnl: float) -> None:
         self._ensure_daily_state()
@@ -522,6 +544,7 @@ class RiskManager:
 
         if self._daily:
             self._daily.pnl += float(pnl)
+            self._daily.symbol_pnl[sym] = float(self._daily.symbol_pnl.get(sym, 0.0)) + float(pnl)
 
             if pnl < 0:
                 self._daily.losses_count += 1
@@ -582,6 +605,7 @@ class RiskManager:
         commitment: Optional[float],
         volatility_atr_pct: Optional[float],
     ) -> Tuple[bool, str]:
+        self._ensure_daily_state()
         sym = (symbol or "UNKNOWN").upper()
         s = self._norm_side(side)
 
@@ -592,6 +616,17 @@ class RiskManager:
 
         if notional <= 0:
             return False, "notional_invalid"
+
+        # Per-symbol daily caps (optional)
+        if self._daily:
+            if self.config.symbol_max_daily_loss > 0:
+                sym_pnl = float(self._daily.symbol_pnl.get(sym, 0.0))
+                if sym_pnl <= -float(self.config.symbol_max_daily_loss):
+                    return False, "symbol_daily_loss_cap"
+            if self.config.symbol_max_trades_per_day > 0:
+                sym_trades = int(self._daily.symbol_trades.get(sym, 0))
+                if sym_trades >= int(self.config.symbol_max_trades_per_day):
+                    return False, "symbol_trades_cap"
 
         allowed, reason = self.can_open(sym, s)
         if not allowed:
@@ -825,6 +860,8 @@ class RiskManager:
             "daily_pnl": float(self._daily.pnl if self._daily else 0.0),
             "daily_trades": int(self._daily.trades_opened if self._daily else 0),
             "daily_losses": int(self._daily.losses_count if self._daily else 0),
+            "symbol_pnl": dict(self._daily.symbol_pnl if self._daily else {}),
+            "symbol_trades": dict(self._daily.symbol_trades if self._daily else {}),
             "tilt_active": bool(self._is_tilt_active()),
             "open_positions": {
                 sym: {
@@ -859,6 +896,8 @@ class RiskManager:
                 "max_open_positions": int(self.config.max_open_positions),
                 "max_gross_exposure": float(self.config.max_gross_exposure),
                 "max_symbol_exposure": float(self.config.max_symbol_exposure),
+                "symbol_max_daily_loss": float(self.config.symbol_max_daily_loss),
+                "symbol_max_trades_per_day": int(self.config.symbol_max_trades_per_day),
                 "reservation_ttl_seconds": int(self.config.reservation_ttl_seconds),
                 "max_position_age_seconds": int(self.config.max_position_age_seconds),
                 "use_volatility_targeting": bool(self.config.use_volatility_targeting),

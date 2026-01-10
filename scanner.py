@@ -243,6 +243,12 @@ TRAIL_MIN_STEP_ATR = float(os.getenv("TRAIL_MIN_STEP_ATR", "0.20"))
 # Pro monitor throttle
 PRO_MONITOR_INTERVAL_S = float(os.getenv("PRO_MONITOR_INTERVAL_S", "90"))
 
+# Live structure/HTF invalidation (position already open)
+LIVE_STRUCT_ENABLE = str(os.getenv("LIVE_STRUCT_ENABLE", "1")).strip() == "1"
+LIVE_STRUCT_ACTION = str(os.getenv("LIVE_STRUCT_ACTION", "CLOSE")).strip().upper()  # CLOSE | TIGHTEN
+LIVE_STRUCT_MIN_AGE_S = int(os.getenv("LIVE_STRUCT_MIN_AGE_S", "180"))  # grace after fill
+LIVE_STRUCT_INTERVAL_S = float(os.getenv("LIVE_STRUCT_INTERVAL_S", "120"))
+
 # =====================================================================
 # NEW: Institutional watcher veto policy (requires InstitutionalWSHub snapshot)
 # =====================================================================
@@ -379,6 +385,7 @@ def _pending_serializable(state: Dict[str, Any]) -> Dict[str, Any]:
 
         # institutional watcher state/debug
         "inst_veto_hits","last_inst_ts","inst_dbg",
+        "struct_veto_hits","last_struct_ts",
     ]
     out: Dict[str, Any] = {}
     for k in keep:
@@ -1106,6 +1113,41 @@ async def _invalidation_check(
     return True, "", {"mid": mid}
 
 # =====================================================================
+# Live structure invalidation (for open positions)
+# =====================================================================
+
+def _structure_flip_live(
+    df_h1: pd.DataFrame,
+    df_h4: pd.DataFrame,
+    direction: str,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Returns (ok, reason, debug) for live structure invalidation.
+    Uses HTF trend and H1 structure flip/CHoCH.
+    """
+    dbg: Dict[str, Any] = {}
+    dir_u = str(direction).upper()
+
+    try:
+        if not htf_trend_ok(df_h4, dir_u):
+            return False, "live:htf_veto", {}
+    except Exception:
+        pass
+
+    try:
+        st1 = analyze_structure(df_h1)
+        tr = str(st1.get("trend") or "").upper()
+        dbg["trend_h1"] = tr
+        if tr in ("LONG", "SHORT") and tr != dir_u:
+            return False, "live:trend_flip_h1", dbg
+        if bool(st1.get("choch")) and tr in ("LONG", "SHORT") and tr != dir_u:
+            return False, "live:choch_flip", dbg
+    except Exception:
+        pass
+
+    return True, "", dbg
+
+# =====================================================================
 # Cancel pending entry helper
 # =====================================================================
 
@@ -1782,6 +1824,8 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
             "inst_veto_hits": 0,
             "last_inst_ts": 0.0,
             "inst_dbg": {},
+            "struct_veto_hits": 0,
+            "last_struct_ts": 0.0,
         }
 
     await _pending_save(force=True)
@@ -2103,6 +2147,26 @@ async def _pro_monitor(trader: BitgetTrader, tid: str, st: Dict[str, Any]) -> No
         atr = _calc_atr14(df_h1, 14)
         st["atr"] = float(atr)
 
+    # ---- Live structure/HTF invalidation ----
+    struct_veto = False
+    struct_dbg: Dict[str, Any] = {}
+    if LIVE_STRUCT_ENABLE:
+        filled_ts = float(st.get("filled_ts") or 0.0)
+        if filled_ts > 0 and (now - filled_ts) >= float(LIVE_STRUCT_MIN_AGE_S):
+            last_struct = float(st.get("last_struct_ts") or 0.0)
+            if (now - last_struct) >= float(LIVE_STRUCT_INTERVAL_S):
+                st["last_struct_ts"] = now
+                try:
+                    df_h4 = await asyncio.wait_for(trader.client.get_klines_df(sym, TF_H4, 160), timeout=FETCH_TIMEOUT_S)
+                except Exception:
+                    df_h4 = pd.DataFrame()
+
+                if df_h4 is not None and not getattr(df_h4, "empty", True):
+                    ok, reason, dbg = _structure_flip_live(df_h1, df_h4, direction)
+                    if not ok:
+                        struct_veto = True
+                        struct_dbg = {"reason": reason, **(dbg or {})}
+
     # ---- Institutional snapshot (CVD + veto) ----
     inst_veto = False
     inst_dbg: Dict[str, Any] = {}
@@ -2139,7 +2203,7 @@ async def _pro_monitor(trader: BitgetTrader, tid: str, st: Dict[str, Any]) -> No
     dist_confirmed = dist_hits >= int(DIST_CONFIRM_HITS)
 
     # If any veto (inst/opt) build a unified action plan
-    any_veto = bool(inst_veto or veto_opt or dist_confirmed)
+    any_veto = bool(inst_veto or veto_opt or dist_confirmed or struct_veto)
 
     # Liquidity-aware SL switch (patience: only act in killzones unless it’s dangerous)
     if in_kz or any_veto:
@@ -2190,6 +2254,23 @@ async def _pro_monitor(trader: BitgetTrader, tid: str, st: Dict[str, Any]) -> No
             else:
                 await _close_and_cleanup(trader, tid, st, reason="options_veto", regime=opt_regime, spike=int(opt_spike))
                 return
+
+    # ---- Live structure veto action ----
+    if struct_veto:
+        st["struct_veto_hits"] = int(st.get("struct_veto_hits") or 0) + 1
+        entry = float(st.get("entry") or 0.0)
+        if entry > 0 and atr > 0 and px > 0 and LIVE_STRUCT_ACTION == "TIGHTEN":
+            pnl_move = (px - entry) if direction == "LONG" else (entry - px)
+            if pnl_move >= 0.15 * atr and st.get("sl_plan_id"):
+                tick_used = float(st.get("tick_used") or 0.0) or _estimate_tick_from_price(entry)
+                be_q = _q_sl(entry, tick_used, direction)
+                await _switch_sl_plan(trader, tid, st, _close_side_from_direction(direction), be_q, float(st.get("qty_total") or 0.0), tick_used, tag="SL_STRUCT_VETO")
+            else:
+                await _close_and_cleanup(trader, tid, st, reason="struct_veto", **(struct_dbg or {}))
+                return
+        else:
+            await _close_and_cleanup(trader, tid, st, reason="struct_veto", **(struct_dbg or {}))
+            return
 
     # ---- Distribution confirmed action ----
     if dist_confirmed:
