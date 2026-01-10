@@ -1076,11 +1076,12 @@ async def _get_last_price(trader: BitgetTrader, symbol: str) -> float:
 # =====================================================================
 
 async def _invalidation_check(
-    client,
+    trader: BitgetTrader,
     symbol: str,
     direction: str,
     entry_price: float,
     entry_type: str,
+    st: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """
     Heavy watcher check for pending entries (before fill).
@@ -1097,8 +1098,8 @@ async def _invalidation_check(
         dir_u = "LONG"
 
     async def _do():
-        df_h1 = await client.get_klines_df(sym, TF_H1, 160)
-        df_h4 = await client.get_klines_df(sym, TF_H4, 160)
+        df_h1 = await trader.client.get_klines_df(sym, TF_H1, 160)
+        df_h4 = await trader.client.get_klines_df(sym, TF_H4, 160)
         return df_h1, df_h4
 
     try:
@@ -1158,7 +1159,68 @@ async def _invalidation_check(
         }:
             return False, f"invalidate:{r}", {"momentum": mom}
 
+
+    # --- Options veto (use stored ctx; non-blocking) ---
+    try:
+        if OPTIONS_VETO_ENABLE:
+            reg = str((st or {}).get("opt_regime") or "").lower().strip()
+            spike = bool((st or {}).get("opt_spike", False))
+            if reg and (reg in OPTIONS_VETO_REGIMES) and (OPTIONS_VETO_SPIKE and spike):
+                return False, "invalidate:options_veto", {"opt_regime": reg, "opt_spike": spike}
+    except Exception:
+        pass
+
+    # --- Institutional WS veto (microstructure / funding / tape / liq) ---
+    try:
+        if INST_VETO_ENABLE and INST_HUB is not None:
+            snap = INST_HUB.get_snapshot(symbol)
+            if snap and bool(snap.get("available")) and bool(snap.get("ws_ok", True)):
+                dbg = {
+                    "snap_age_s": snap.get("age_s"),
+                    "spread_bps": snap.get("spread_bps"),
+                    "orderbook_imbalance": snap.get("orderbook_imbalance"),
+                }
+
+                sp = float(snap.get("spread_bps") or 0.0)
+                if sp > float(INST_SPREAD_MAX_BPS):
+                    return False, "invalidate:inst_spread", {"inst": dbg}
+
+                fr = float(snap.get("funding_rate") or 0.0)
+                if INST_FUNDING_FLIP_ENABLE and abs(fr) >= float(INST_FUNDING_FLIP_ABS):
+                    # "crowded" in the direction of the trade: tighten/cancel entries
+                    if (dir_u == "LONG" and fr > 0) or (dir_u == "SHORT" and fr < 0):
+                        dbg["funding_rate"] = fr
+                        return False, "invalidate:inst_funding_crowded", {"inst": dbg}
+
+                imb = float(snap.get("orderbook_imbalance") or 0.0)
+                if abs(imb) >= float(INST_OB_IMB_MIN):
+                    # convention: positive => bid-side stronger; negative => ask-side stronger
+                    if (dir_u == "LONG" and imb < 0) or (dir_u == "SHORT" and imb > 0):
+                        dbg["orderbook_imbalance"] = imb
+                        return False, "invalidate:inst_book_imbalance", {"inst": dbg}
+
+                t1 = float(snap.get("tape_delta_1m") or 0.0)
+                t5 = float(snap.get("tape_delta_5m") or 0.0)
+                thr1 = float(INST_TAPE_VETO_RATIO_1M)
+                thr5 = float(INST_TAPE_VETO_RATIO_5M)
+
+                if (dir_u == "LONG" and t1 <= -thr1) or (dir_u == "SHORT" and t1 >= thr1):
+                    dbg["tape_delta_1m"] = t1
+                    return False, "invalidate:inst_tape_1m", {"inst": dbg}
+                if (dir_u == "LONG" and t5 <= -thr5) or (dir_u == "SHORT" and t5 >= thr5):
+                    dbg["tape_delta_5m"] = t5
+                    return False, "invalidate:inst_tape_5m", {"inst": dbg}
+
+                # liquidation spike: non-directional guardrail (avoid wrong side interpretation)
+                liq5 = float(snap.get("liq_notional_5m") or 0.0)
+                if liq5 >= float(INST_LIQ_SPIKE_USDT):
+                    dbg["liq_notional_5m"] = liq5
+                    return False, "invalidate:inst_liq_spike", {"inst": dbg}
+    except Exception:
+        pass
+
     # --- Market entry premium/discount sanity (legacy but kept) ---
+
     mid = _pd_mid(df_h1, 80)
     if _is_market_entry(entry_type) and mid > 0 and math.isfinite(mid):
         if dir_u == "LONG" and float(entry_price) > float(mid):
@@ -1361,8 +1423,8 @@ async def _bootstrap_risk_open_positions(trader: BitgetTrader) -> None:
 
 async def _fetch_dfs(client, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     async def _do():
-        df_h1 = await client.get_klines_df(symbol, TF_H1, CANDLE_LIMIT)
-        df_h4 = await client.get_klines_df(symbol, TF_H4, CANDLE_LIMIT)
+        df_h1 = await trader.client.get_klines_df(symbol, TF_H1, CANDLE_LIMIT)
+        df_h4 = await trader.client.get_klines_df(symbol, TF_H4, CANDLE_LIMIT)
         return df_h1, df_h4
 
     try:
@@ -2146,7 +2208,7 @@ async def _recheck_live_and_act(trader: BitgetTrader, tid: str, st: Dict[str, An
     # --- HTF (H4) ---
     htf_ok = True
     try:
-        df_h4 = await asyncio.wait_for(trader.client.get_klines_df(sym, TF_H4, 160), timeout=FETCH_TIMEOUT_S)
+        df_h4 = await asyncio.wait_for(trader.trader.client.get_klines_df(sym, TF_H4, 160), timeout=FETCH_TIMEOUT_S)
         if df_h4 is not None and (not getattr(df_h4, "empty", True)) and len(df_h4) >= 60:
             htf_ok = bool(htf_trend_ok(df_h4, direction))
     except Exception:
@@ -2652,18 +2714,38 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         heavy_grace = int(_heavy_grace_s(entry_type))
                         if age >= float(heavy_grace):
                             last_heavy_ts = float(st.get("last_heavy_ts") or 0.0)
-                            if (now - last_heavy_ts) >= float(HEAVY_CHECK_INTERVAL_S):
+                            interval_s = float(WATCH_RECHECK_INTERVAL_S) if WATCH_RECHECK_ENABLE else float(HEAVY_CHECK_INTERVAL_S)
+                            if (now - last_heavy_ts) >= interval_s:
                                 st["last_heavy_ts"] = now
                                 dirty = True
 
                                 ok, why, extra = await _invalidation_check(
-                                    trader.client,
+                                    trader,
                                     sym,
                                     direction,
                                     entry_price=entry,
                                     entry_type=entry_type,
+                                    st=st,
                                 )
                                 if not ok:
+                                    # premium recheck: require consecutive fails before cancelling
+                                    hits = int(st.get("pending_recheck_fail_hits") or 0) + 1
+                                    st["pending_recheck_fail_hits"] = hits
+                                    st["last_pending_recheck_reason"] = str(why or "invalidate")
+                                    if isinstance(extra, dict):
+                                        st["pending_recheck_dbg"] = extra
+                                    dirty = True
+
+                                    if hits < int(WATCH_RECHECK_MAX_FAILS):
+                                        desk_log(logging.INFO, "PENDING_RECHECK_FAIL", sym, tid, hits=hits, why=why)
+                                        continue
+
+                                    action = str(WATCH_RECHECK_PENDING_ACTION).upper().strip()
+                                    if action == "FREEZE":
+                                        st["freeze_until"] = time.time() + 300.0
+                                        desk_log(logging.WARNING, "PENDING_FREEZE", sym, tid, why=why, freeze_s=300)
+                                        continue
+
                                     await _cancel_pending_entry(
                                         trader, tid, st,
                                         reason=why or "invalidate",
@@ -2673,6 +2755,10 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                                     )
                                     dirty = True
                                     continue
+                                if ok:
+                                    st["pending_recheck_fail_hits"] = 0
+                                    st.pop("last_pending_recheck_reason", None)
+
                                 if extra and isinstance(extra, dict) and extra.get("mid"):
                                     st["pd_mid"] = float(extra["mid"])
                                     dirty = True
