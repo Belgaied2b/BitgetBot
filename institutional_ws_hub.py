@@ -1,25 +1,17 @@
 # =====================================================================
 # institutional_ws_hub.py — Binance USD-M Futures WebSocket hub + cache
 # =====================================================================
-# Goal:
-#   - Avoid REST spam (418 / -1003) during multi-symbol scans.
-#   - Provide a real-time cache that analyze/institutional_data can read
-#     without making per-symbol REST calls.
+# FIX (desk-lead):
+# - Avoid WS close 1008 "Payload too long" by chunking SUBSCRIBE payloads
+# - Respect WS control message rate (safe delay between ctrl messages)
+# - Keep watcher-friendly snapshot fields + freshness gate
 #
-# WS docs (USD-M Futures):
-#   - Base: wss://fstream.binance.com/ws (live subscribe)
-#   - Combined payloads can be enabled via SET_PROPERTY ["combined", true]
-#   - Max 1024 streams per connection (combined/subscribe limits)
-#
-# Dependency:
-#   pip install websockets
-#
-# ✅ UPDATED for your autonomous institutional watcher:
-#   - start(..., **kwargs) accepts product_type safely (scanner compatibility)
-#   - snapshot exposes watcher-friendly aliases:
-#       price / last / markPrice / mark_price
-#       ts / timestamp / ts_ms
-#   - adds age_s (freshness) + ws_ok (freshness gate)
+# Public API:
+# - await HUB.start(symbols, **kwargs)
+# - await HUB.stop()
+# - await HUB.set_symbols(symbols)
+# - HUB.get_snapshot(symbol) -> dict
+# - HUB.is_running
 # =====================================================================
 
 from __future__ import annotations
@@ -27,18 +19,35 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set
 
 LOGGER = logging.getLogger(__name__)
 
 BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
 
-# ---- internal knobs ----
-_DEFAULT_MARK_SPEED = "1s"   # markPrice update speed (1s/3s depending on Binance)
-_MAX_STREAMS_PER_CONN = 1024
+# -----------------------------
+# Tunables (env)
+# -----------------------------
+_DEFAULT_MARK_SPEED = str(os.getenv("INST_WS_MARK_SPEED", "1s")).strip()  # 1s / 3s
+_MAX_STREAMS_PER_CONN = int(os.getenv("INST_WS_MAX_STREAMS_PER_CONN", "1024"))
+
+# Payload-too-long mitigation:
+# Number of streams per SUBSCRIBE message (keep JSON small)
+_SUBSCRIBE_BATCH_SIZE = int(os.getenv("INST_WS_SUBSCRIBE_BATCH_SIZE", "90"))
+
+# Delay between WS control messages (SUBSCRIBE/UNSUBSCRIBE/SET_PROPERTY)
+# Safe default ~4 msg/s
+_CTRL_MSG_DELAY_S = float(os.getenv("INST_WS_CTRL_MSG_DELAY_S", "0.25"))
+
+# Combined stream payloads (stream+data)
+_ENABLE_COMBINED = str(os.getenv("INST_WS_ENABLE_COMBINED", "1")).strip() == "1"
+
+# Freshness gate: watcher trusts WS if age <= this
+_WS_FRESH_MAX_AGE_S = float(os.getenv("INST_WS_FRESH_MAX_AGE_S", "4.0"))
 
 # rolling windows (seconds)
 _TAPE_WIN_1M = 60.0
@@ -46,8 +55,9 @@ _TAPE_WIN_5M = 300.0
 _TAPE_WIN_15M = 900.0
 _LIQ_WIN_5M = 300.0
 
-# snapshot freshness: watcher can trust WS price if age <= this
-_WS_FRESH_MAX_AGE_S = float(4.0)
+# reconnect backoff
+_RECONNECT_MIN_S = float(os.getenv("INST_WS_RECONNECT_MIN_S", "1.0"))
+_RECONNECT_MAX_S = float(os.getenv("INST_WS_RECONNECT_MAX_S", "20.0"))
 
 
 def _now() -> float:
@@ -80,15 +90,15 @@ def _stream_symbol(stream: str) -> str:
 @dataclass
 class _TapeRec:
     ts: float
-    delta_notional: float   # signed notional (buy - sell)
-    notional: float         # absolute notional
+    delta_notional: float  # signed notional (buy - sell)
+    notional: float  # abs notional
 
 
 @dataclass
 class _LiqRec:
     ts: float
     notional: float
-    side: str  # BUY/SELL as received in Binance forceOrder payload ("S")
+    side: str  # BUY/SELL
 
 
 @dataclass
@@ -114,27 +124,23 @@ class _SymbolState:
 class InstitutionalWSHub:
     """
     One WS connection, live SUBSCRIBE/UNSUBSCRIBE, per-symbol cache.
-
-    Public API:
-      - await hub.start(symbols, **kwargs)
-      - await hub.stop()
-      - await hub.set_symbols(symbols)
-      - hub.get_snapshot(symbol) -> dict
-      - hub.is_running
+    Designed to be read by scanner/watcher without REST spam.
     """
 
     def __init__(self, *, mark_speed: str = _DEFAULT_MARK_SPEED) -> None:
         self._mark_speed = (mark_speed or _DEFAULT_MARK_SPEED).strip()
+
         self._desired_symbols: Set[str] = set()
         self._subscribed_streams: Set[str] = set()
-
         self._state: Dict[str, _SymbolState] = {}
-        self._lock = asyncio.Lock()
 
-        self._ws_task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
         self._stop_evt = asyncio.Event()
+        self._ws_task: Optional[asyncio.Task] = None
+        self._ws = None  # websockets connection
 
         self._id_counter = 1
+        self._subscribe_batch_size = max(10, min(int(_SUBSCRIBE_BATCH_SIZE), 300))
 
     @property
     def is_running(self) -> bool:
@@ -163,8 +169,7 @@ class InstitutionalWSHub:
     # -----------------------------
     async def start(self, symbols: Optional[List[str]] = None, **kwargs: Any) -> None:
         """
-        kwargs accepted for compatibility (ex: product_type=... in scanner),
-        ignored safely.
+        kwargs accepted for compatibility (ex: product_type=... in scanner), ignored safely.
         """
         if symbols:
             await self.set_symbols(symbols)
@@ -174,6 +179,7 @@ class InstitutionalWSHub:
 
         self._stop_evt.clear()
         self._ws_task = asyncio.create_task(self._run_loop(), name="institutional_ws_hub")
+        LOGGER.info("[WS_HUB] started")
 
     async def stop(self) -> None:
         self._stop_evt.set()
@@ -183,6 +189,7 @@ class InstitutionalWSHub:
             except Exception:
                 pass
         self._ws_task = None
+        LOGGER.info("[WS_HUB] stopped")
 
     async def set_symbols(self, symbols: List[str]) -> None:
         desired = {_norm_symbol(s) for s in (symbols or []) if _norm_symbol(s)}
@@ -190,7 +197,9 @@ class InstitutionalWSHub:
             self._desired_symbols = desired
             for sym in desired:
                 self._state.setdefault(sym, _SymbolState())
-        return
+        # apply live if already connected
+        if self._ws is not None:
+            await self._sync_subscriptions(self._ws)
 
     # -----------------------------
     # read API (SYNC)
@@ -201,16 +210,12 @@ class InstitutionalWSHub:
         if not st:
             return {"available": False, "symbol": sym, "reason": "no_state"}
 
-        # tape / cvd
         t = self._compute_tape(st)
-        # liquidations
         liq = self._compute_liq_5m_breakdown(st)
-        # orderbook
         ob_imb = self._compute_book_imbalance(st)
         micro = self._compute_microprice(st)
         spread_bps = self._compute_spread_bps(st)
 
-        # watcher-friendly price (mid if possible, else mark)
         px_mid = (st.best_bid + st.best_ask) / 2.0 if (st.best_bid > 0 and st.best_ask > 0) else 0.0
         price = float(px_mid or st.mark_price or 0.0)
 
@@ -223,18 +228,19 @@ class InstitutionalWSHub:
             "symbol": sym,
 
             # timestamps / freshness
-            "ts": ts,                      # seconds epoch
-            "timestamp": ts,               # alias
+            "ts": ts,
+            "timestamp": ts,
             "ts_ms": int(ts * 1000) if ts > 0 else 0,
             "age_s": age_s,
             "ws_ok": ws_ok,
 
             # prices
             "mark_price": st.mark_price,
-            "markPrice": st.mark_price,    # alias for watcher patch
+            "markPrice": st.mark_price,  # alias
             "index_price": st.index_price,
             "funding_rate": st.funding_rate,
             "next_funding_time": st.next_funding_time,
+
             "best_bid": st.best_bid,
             "best_ask": st.best_ask,
 
@@ -252,34 +258,31 @@ class InstitutionalWSHub:
             "tape_delta_5m": t["ratio_5m"],
             "tape_delta_15m": t["ratio_15m"],
 
-            # tape signed notionals (what institutional_data expects)
+            # tape signed notionals
             "tape_delta_1m_notional": t["delta_1m"],
             "tape_delta_5m_notional": t["delta_5m"],
             "tape_delta_15m_notional": t["delta_15m"],
 
-            # tape total notionals (useful for gating)
+            # tape abs notionals
             "tape_abs_1m": t["abs_1m"],
             "tape_abs_5m": t["abs_5m"],
             "tape_abs_15m": t["abs_15m"],
 
-            # Backward-compatible field
+            # liquidations
             "liq_notional_5m": liq["total"],
-
-            # NEW: liquidation breakdown
             "liq_buy_usd_5m": liq["buy_abs"],
             "liq_sell_usd_5m": liq["sell_abs"],
             "liq_delta_ratio_5m": liq["delta_ratio"],
             "liq_count_5m": liq["count"],
 
-            # aliases for watcher usage
+            # aliases watcher
             "cvd_notional_5m": t["delta_5m"],
             "cvd_notional_15m": t["delta_15m"],
             "cvd_5m": t["delta_5m"],
             "cvd_15m": t["delta_15m"],
 
-            # watcher patch expects these sometimes
             "price": price,
-            "last": price,                 # alias
+            "last": price,
         }
 
     # -----------------------------
@@ -294,7 +297,6 @@ class InstitutionalWSHub:
 
     def _compute_tape(self, st: _SymbolState) -> Dict[str, float]:
         now = _now()
-        # keep some margin so prune doesn't lag due to timings
         self._prune_left(st.tape, now - (_TAPE_WIN_15M + 5.0))
 
         d1 = n1 = 0.0
@@ -377,7 +379,6 @@ class InstitutionalWSHub:
             den = (A + B)
             if den <= 1e-12:
                 return (a + b) / 2.0
-            # classic microprice
             return float((b * A + a * B) / den)
         except Exception:
             return 0.0
@@ -396,27 +397,44 @@ class InstitutionalWSHub:
             return 0.0
 
     # -----------------------------
-    # WS loop + handlers
+    # WS helpers
     # -----------------------------
-    async def _send(self, ws, payload: Dict[str, Any]) -> None:
-        try:
-            await ws.send(json.dumps(payload))
-        except Exception:
-            pass
-
     def _next_id(self) -> int:
         self._id_counter += 1
         return self._id_counter
 
+    async def _send_json(self, ws, payload: Dict[str, Any]) -> None:
+        # compact JSON reduces payload size
+        await ws.send(json.dumps(payload, separators=(",", ":")))
+
+    async def _send_ctrl_chunked(self, ws, method: str, streams: List[str]) -> None:
+        """
+        SUBSCRIBE/UNSUBSCRIBE in batches to avoid 1008 payload-too-long.
+        Also enforces a small delay between control messages.
+        """
+        if not streams:
+            return
+
+        bs = self._subscribe_batch_size
+        for i in range(0, len(streams), bs):
+            batch = streams[i : i + bs]
+            await self._send_json(ws, {"method": method, "params": batch, "id": self._next_id()})
+            await asyncio.sleep(_CTRL_MSG_DELAY_S)
+
     async def _sync_subscriptions(self, ws) -> None:
+        """
+        Compute diff between desired and subscribed streams,
+        then apply using CHUNKED control messages.
+        """
         async with self._lock:
-            desired = set(self._desired_symbols)
+            desired_symbols = set(self._desired_symbols)
 
-        desired_streams = self._streams_for_symbols(desired)
+        desired_streams = self._streams_for_symbols(desired_symbols)
 
-        # safety: cap
+        # safety cap: never exceed stream cap per conn
         if len(desired_streams) > _MAX_STREAMS_PER_CONN:
-            desired_list = sorted(list(desired))
+            # keep deterministic by symbol order
+            desired_list = sorted(desired_symbols)
             keep: Set[str] = set()
             for sym in desired_list:
                 streams = set(self._streams_for_symbol(sym))
@@ -424,17 +442,18 @@ class InstitutionalWSHub:
                     break
                 keep |= streams
             desired_streams = keep
+            LOGGER.warning("[WS_HUB] desired streams capped to %d", len(desired_streams))
 
         to_add = sorted(list(desired_streams - self._subscribed_streams))
         to_remove = sorted(list(self._subscribed_streams - desired_streams))
 
         if to_remove:
-            await self._send(ws, {"method": "UNSUBSCRIBE", "params": to_remove, "id": self._next_id()})
+            await self._send_ctrl_chunked(ws, "UNSUBSCRIBE", to_remove)
             for s in to_remove:
                 self._subscribed_streams.discard(s)
 
         if to_add:
-            await self._send(ws, {"method": "SUBSCRIBE", "params": to_add, "id": self._next_id()})
+            await self._send_ctrl_chunked(ws, "SUBSCRIBE", to_add)
             for s in to_add:
                 self._subscribed_streams.add(s)
 
@@ -443,13 +462,19 @@ class InstitutionalWSHub:
         async with self._lock:
             return self._state.setdefault(sym, _SymbolState())
 
+    # -----------------------------
+    # WS event handlers
+    # -----------------------------
     async def _handle_event_mark(self, sym: str, data: Dict[str, Any]) -> None:
         st = await self._ensure_state(sym)
         st.mark_price = _safe_float(data.get("p"), st.mark_price)
         st.index_price = _safe_float(data.get("i"), st.index_price)
         st.funding_rate = _safe_float(data.get("r"), st.funding_rate)
         nft = data.get("T")
-        st.next_funding_time = int(nft) if nft is not None else st.next_funding_time
+        try:
+            st.next_funding_time = int(nft) if nft is not None else st.next_funding_time
+        except Exception:
+            pass
         st.last_update_ts = _now()
 
     async def _handle_event_book(self, sym: str, data: Dict[str, Any]) -> None:
@@ -460,7 +485,7 @@ class InstitutionalWSHub:
         st.ask_qty = _safe_float(data.get("A"), st.ask_qty)
         st.last_update_ts = _now()
 
-        # optional: if mark is missing, approximate from mid
+        # fallback: approximate mark from mid if missing
         if st.mark_price <= 0 and st.best_bid > 0 and st.best_ask > 0:
             st.mark_price = (st.best_bid + st.best_ask) / 2.0
 
@@ -470,13 +495,13 @@ class InstitutionalWSHub:
         qty = _safe_float(data.get("q"), 0.0)
         notional = abs(price * qty)
 
-        # Binance aggTrade: m=True means "buyer is the market maker" => net sell pressure
+        # Binance aggTrade: m=True => buyer is market maker => SELL pressure
         m = bool(data.get("m", False))
         delta = (-notional) if m else (+notional)
 
         if notional > 0:
             st.tape.append(_TapeRec(ts=_now(), delta_notional=delta, notional=notional))
-            st.last_update_ts = _now()
+        st.last_update_ts = _now()
 
     async def _handle_event_forceorder(self, sym: str, data: Dict[str, Any]) -> None:
         st = await self._ensure_state(sym)
@@ -489,7 +514,7 @@ class InstitutionalWSHub:
         notional = abs(price * qty)
         if notional > 0:
             st.liquidations.append(_LiqRec(ts=_now(), notional=notional, side=side))
-            st.last_update_ts = _now()
+        st.last_update_ts = _now()
 
     async def _handle_combined(self, stream: str, data: Dict[str, Any]) -> None:
         # combined format: {"stream":"btcusdt@aggTrade","data":{...}}
@@ -514,7 +539,6 @@ class InstitutionalWSHub:
             return
 
     async def _handle_raw(self, payload: Dict[str, Any]) -> None:
-        # raw format: {"e":"aggTrade","s":"BTCUSDT", ...}
         et = str(payload.get("e") or "").lower()
         sym = _norm_symbol(str(payload.get("s") or payload.get("symbol") or ""))
         if not et or not sym:
@@ -533,13 +557,17 @@ class InstitutionalWSHub:
             await self._handle_event_forceorder(sym, payload)
             return
 
+    # -----------------------------
+    # WS loop
+    # -----------------------------
     async def _run_loop(self) -> None:
-        backoff = 1.0
         try:
             import websockets  # type: ignore
         except Exception as e:
             LOGGER.error("institutional_ws_hub requires `websockets` package: %s", e)
             return
+
+        backoff = _RECONNECT_MIN_S
 
         while not self._stop_evt.is_set():
             try:
@@ -550,19 +578,28 @@ class InstitutionalWSHub:
                     close_timeout=5,
                     max_queue=2048,
                 ) as ws:
+                    self._ws = ws
                     LOGGER.info("[WS_HUB] connected %s", BINANCE_FUTURES_WS)
-                    backoff = 1.0
+
+                    # reset local subscription state per new connection
                     self._subscribed_streams = set()
+                    backoff = _RECONNECT_MIN_S
 
-                    # Enable combined payloads: {"stream":"...","data":{...}}
-                    await self._send(ws, {"method": "SET_PROPERTY", "params": ["combined", True], "id": self._next_id()})
+                    # enable combined payloads if desired
+                    if _ENABLE_COMBINED:
+                        await self._send_json(
+                            ws,
+                            {"method": "SET_PROPERTY", "params": ["combined", True], "id": self._next_id()},
+                        )
+                        await asyncio.sleep(_CTRL_MSG_DELAY_S)
 
-                    # initial subscribe
+                    # initial subscribe (chunked)
                     await self._sync_subscriptions(ws)
 
                     last_sync = _now()
 
                     while not self._stop_evt.is_set():
+                        # periodic sync (handles live symbol list updates)
                         if _now() - last_sync >= 2.0:
                             await self._sync_subscriptions(ws)
                             last_sync = _now()
@@ -599,13 +636,27 @@ class InstitutionalWSHub:
                             continue
 
             except Exception as e:
-                LOGGER.warning("[WS_HUB] disconnected: %s", e)
+                self._ws = None
+                s = str(e)
+                LOGGER.warning("[WS_HUB] disconnected: %s", s)
 
-            await asyncio.sleep(min(20.0, backoff))
-            backoff = min(20.0, backoff * 1.8)
+                # If we still hit payload-too-long, reduce batch size automatically
+                if "1008" in s and "Payload too long" in s:
+                    old = self._subscribe_batch_size
+                    self._subscribe_batch_size = max(10, int(self._subscribe_batch_size * 0.6))
+                    if self._subscribe_batch_size != old:
+                        LOGGER.warning(
+                            "[WS_HUB] auto-reducing subscribe batch size: %d -> %d",
+                            old,
+                            self._subscribe_batch_size,
+                        )
 
+                await asyncio.sleep(backoff)
+                backoff = min(_RECONNECT_MAX_S, max(_RECONNECT_MIN_S, backoff * 1.6))
+
+        self._ws = None
         LOGGER.info("[WS_HUB] stopped")
 
 
-# Singleton (simple import + use)
+# Singleton
 HUB = InstitutionalWSHub()
