@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List, Union
 
 from retry_utils import retry_async
-from settings import PRODUCT_TYPE, MARGIN_COIN
+from settings import PRODUCT_TYPE, MARGIN_COIN, EXEC_LOG_ENABLE, EXEC_LOG_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -360,6 +360,8 @@ class BitgetTrader:
         self.margin_coin = (margin_coin or MARGIN_COIN)
 
         self._meta = ContractMetaCache(client)
+        self._exec_log_enable = bool(EXEC_LOG_ENABLE)
+        self._exec_log_path = str(EXEC_LOG_PATH or "exec_log.jsonl")
 
     # ----------------------------
     # Compat / helpers
@@ -589,6 +591,53 @@ class BitgetTrader:
         d = max(0, min(12, int(qty_place)))
         return _fmt_decimal(float(qty), d)
 
+    async def _log_exec_event(
+        self,
+        event: str,
+        *,
+        payload: Dict[str, Any],
+        resp: Dict[str, Any],
+        symbol: Optional[str] = None,
+    ) -> None:
+        if not self._exec_log_enable or not self._exec_log_path:
+            return
+
+        record = {
+            "ts_ms": _now_ms(),
+            "event": str(event),
+            "symbol": str(symbol or payload.get("symbol") or "").upper(),
+            "ok": bool(resp.get("ok")),
+            "code": str(resp.get("code", "")),
+            "msg": str(resp.get("msg", "")),
+            "latency_ms": int(resp.get("_latency_ms") or 0),
+            "path": str(resp.get("_path") or ""),
+            "payload": {
+                "side": payload.get("side"),
+                "orderType": payload.get("orderType"),
+                "size": payload.get("size"),
+                "price": payload.get("price"),
+                "tradeSide": payload.get("tradeSide"),
+                "reduceOnly": payload.get("reduceOnly"),
+                "clientOid": payload.get("clientOid"),
+                "triggerPrice": payload.get("triggerPrice"),
+                "triggerType": payload.get("triggerType"),
+                "planType": payload.get("planType"),
+                "executePrice": payload.get("executePrice"),
+                "force": payload.get("force"),
+                "timeInForceValue": payload.get("timeInForceValue"),
+            },
+            "data": resp.get("data"),
+        }
+
+        def _write() -> None:
+            try:
+                with open(self._exec_log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception:
+                return
+
+        await asyncio.to_thread(_write)
+
     # ----------------------------
     # Orders
     # ----------------------------
@@ -642,8 +691,10 @@ class BitgetTrader:
             "clientOid": oid,
             "tradeSide": (trade_side or "open").lower(),
         }
+        payload_used = dict(payload)
         if reduce_only:
             payload["reduceOnly"] = "YES"
+            payload_used["reduceOnly"] = "YES"
 
         if payload["tradeSide"] == "open":
             if preset_stop_loss is not None:
@@ -679,6 +730,7 @@ class BitgetTrader:
                     payload2["size"] = self._format_qty_str(q_qty2, qp2)
                     logger.warning("[ORDER_%s] band clamp retry mn=%s mx=%s before=%s after=%s", debug_tag, mn, mx, q_price, q_price2)
                     resp = await _send(payload2)
+                    payload_used = dict(payload2)
                     resp["_band"] = {"min": mn, "max": mx, "before": q_price, "after": q_price2}
 
         # 40020 => force decimals from tick retry
@@ -690,6 +742,7 @@ class BitgetTrader:
             payload2["price"] = price_str2
             logger.warning("[ORDER_%s] 40020 retry force_decimals=%s price_str=%s->%s", debug_tag, d, price_str, price_str2)
             resp = await _send(payload2)
+            payload_used = dict(payload2)
 
         # 40762 => downsize retry (ENTRY only, when size=None and not reduce-only)
         code = str(resp.get("code", ""))
@@ -708,6 +761,7 @@ class BitgetTrader:
                 downs.append({"try": k + 1, "qty": q_qty2})
                 logger.warning("[ORDER_%s] 40762 downsize retry try=%s qty=%s", debug_tag, k + 1, q_qty2)
                 resp = await _send(payload2)
+                payload_used = dict(payload2)
                 if _is_ok(resp):
                     resp["_downsized"] = downs
                     resp["qty"] = float(q_qty2)
@@ -754,6 +808,12 @@ class BitgetTrader:
                 "clientOid": oid,
             }
 
+        await self._log_exec_event(
+            "place_limit",
+            payload=payload_used,
+            resp=resp,
+            symbol=sym,
+        )
         return resp
 
     async def place_reduce_limit_tp(
@@ -825,6 +885,7 @@ class BitgetTrader:
             "clientOid": oid,
             "executePrice": "0",
         }
+        payload_used = dict(payload)
 
         logger.info(
             "[ORDER_%s] sym=%s close_side=%s trigger_type=%s trigger_raw=%s trig_q=%s trig_str=%s qty=%s tick_used=%s",
@@ -854,6 +915,7 @@ class BitgetTrader:
                     payload2["size"] = self._format_qty_str(q_qty2, qp2)
                     logger.warning("[ORDER_%s] band clamp retry mn=%s mx=%s before=%s after=%s", debug_tag, mn, mx, q_trig, q_trig2)
                     resp = await _send(payload2)
+                    payload_used = dict(payload2)
                     resp["_band"] = {"min": mn, "max": mx, "before": q_trig, "after": q_trig2}
 
         # price precision retry
@@ -865,6 +927,7 @@ class BitgetTrader:
             payload2["triggerPrice"] = trig_str2
             logger.warning("[ORDER_%s] 40020 retry force_decimals=%s trig_str=%s->%s", debug_tag, d, trig_str, trig_str2)
             resp = await _send(payload2)
+            payload_used = dict(payload2)
 
         if not _is_ok(resp):
             code = str(resp.get("code", ""))
@@ -894,6 +957,13 @@ class BitgetTrader:
         else:
             resp["qty"] = float(q_qty)
             resp["_debug"] = {"debug_tag": debug_tag, "trigger_str": trig_str, "tick_used": float(tick_used), "clientOid": oid}
+
+        await self._log_exec_event(
+            "place_stop_market_sl",
+            payload=payload_used,
+            resp=resp,
+            symbol=sym,
+        )
         return resp
 
     # ----------------------------
