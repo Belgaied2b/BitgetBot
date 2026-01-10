@@ -1,10 +1,12 @@
 # =====================================================================
 # institutional_ws_hub.py — Binance USD-M Futures WebSocket hub + cache
 # =====================================================================
-# FIX (desk-lead):
-# - Avoid WS close 1008 "Payload too long" by chunking SUBSCRIBE payloads
-# - Respect WS control message rate (safe delay between ctrl messages)
-# - Keep watcher-friendly snapshot fields + freshness gate
+# FIXES (Desk Lead):
+# 1) Avoid close 1008 "Payload too long": chunk SUBSCRIBE payloads
+# 2) Respect control msg pacing: delay between SUBSCRIBE/UNSUBSCRIBE
+# 3) Enforce MAX SYMBOLS (INST_WS_HUB_MAX_SYMBOLS) to avoid >1024 streams
+# 4) Prevent warning spam: warn only when cap state changes
+# 5) Sync subscriptions only when symbols changed (dirty flag) + periodic refresh
 #
 # Public API:
 # - await HUB.start(symbols, **kwargs)
@@ -23,33 +25,38 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Set
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 LOGGER = logging.getLogger(__name__)
 
 BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
 
 # -----------------------------
-# Tunables (env)
+# Env tunables
 # -----------------------------
 _DEFAULT_MARK_SPEED = str(os.getenv("INST_WS_MARK_SPEED", "1s")).strip()  # 1s / 3s
-_MAX_STREAMS_PER_CONN = int(os.getenv("INST_WS_MAX_STREAMS_PER_CONN", "1024"))
-
-# Payload-too-long mitigation:
-# Number of streams per SUBSCRIBE message (keep JSON small)
-_SUBSCRIBE_BATCH_SIZE = int(os.getenv("INST_WS_SUBSCRIBE_BATCH_SIZE", "90"))
-
-# Delay between WS control messages (SUBSCRIBE/UNSUBSCRIBE/SET_PROPERTY)
-# Safe default ~4 msg/s
-_CTRL_MSG_DELAY_S = float(os.getenv("INST_WS_CTRL_MSG_DELAY_S", "0.25"))
-
-# Combined stream payloads (stream+data)
 _ENABLE_COMBINED = str(os.getenv("INST_WS_ENABLE_COMBINED", "1")).strip() == "1"
 
-# Freshness gate: watcher trusts WS if age <= this
+# Binance commonly supports up to ~1024 streams per connection (general limit).
+_MAX_STREAMS_PER_CONN = int(os.getenv("INST_WS_MAX_STREAMS_PER_CONN", "1024"))
+
+# IMPORTANT: cap symbols to avoid >1024 streams.
+# Each symbol uses 4 streams by default => 1024/4 = 256 symbols max in theory.
+_MAX_SYMBOLS = int(os.getenv("INST_WS_HUB_MAX_SYMBOLS", os.getenv("INST_WS_HUB_MAX_SYMBOLS", "220")) or "220")
+
+# Payload-too-long mitigation (keep SUBSCRIBE JSON small)
+_SUBSCRIBE_BATCH_SIZE = int(os.getenv("INST_WS_SUBSCRIBE_BATCH_SIZE", "90"))
+
+# Control msg pacing (safe default <5 msg/s)
+_CTRL_MSG_DELAY_S = float(os.getenv("INST_WS_CTRL_MSG_DELAY_S", "0.25"))
+
+# Freshness gate for watcher
 _WS_FRESH_MAX_AGE_S = float(os.getenv("INST_WS_FRESH_MAX_AGE_S", "4.0"))
 
-# rolling windows (seconds)
+# Periodic resync safety (seconds) even if no change (handles silent WS drift)
+_FORCE_REFRESH_S = float(os.getenv("INST_WS_FORCE_REFRESH_S", "60.0"))
+
+# rolling windows
 _TAPE_WIN_1M = 60.0
 _TAPE_WIN_5M = 300.0
 _TAPE_WIN_15M = 900.0
@@ -79,7 +86,6 @@ def _norm_symbol(sym: str) -> str:
 
 
 def _stream_symbol(stream: str) -> str:
-    # examples: btcusdt@aggTrade, ethusdt@markPrice@1s, btcusdt@bookTicker, btcusdt@forceOrder
     try:
         base = stream.split("@", 1)[0]
         return base.upper()
@@ -90,20 +96,19 @@ def _stream_symbol(stream: str) -> str:
 @dataclass
 class _TapeRec:
     ts: float
-    delta_notional: float  # signed notional (buy - sell)
-    notional: float  # abs notional
+    delta_notional: float
+    notional: float
 
 
 @dataclass
 class _LiqRec:
     ts: float
     notional: float
-    side: str  # BUY/SELL
+    side: str
 
 
 @dataclass
 class _SymbolState:
-    # last market data
     mark_price: float = 0.0
     index_price: float = 0.0
     funding_rate: float = 0.0
@@ -114,7 +119,6 @@ class _SymbolState:
     bid_qty: float = 0.0
     ask_qty: float = 0.0
 
-    # rolling microstructure
     tape: Deque[_TapeRec] = field(default_factory=lambda: deque(maxlen=12000))
     liquidations: Deque[_LiqRec] = field(default_factory=lambda: deque(maxlen=4000))
 
@@ -122,32 +126,38 @@ class _SymbolState:
 
 
 class InstitutionalWSHub:
-    """
-    One WS connection, live SUBSCRIBE/UNSUBSCRIBE, per-symbol cache.
-    Designed to be read by scanner/watcher without REST spam.
-    """
-
     def __init__(self, *, mark_speed: str = _DEFAULT_MARK_SPEED) -> None:
         self._mark_speed = (mark_speed or _DEFAULT_MARK_SPEED).strip()
 
-        self._desired_symbols: Set[str] = set()
+        self._desired_symbols: List[str] = []
+        self._desired_set: Set[str] = set()
+
         self._subscribed_streams: Set[str] = set()
         self._state: Dict[str, _SymbolState] = {}
 
         self._lock = asyncio.Lock()
         self._stop_evt = asyncio.Event()
         self._ws_task: Optional[asyncio.Task] = None
-        self._ws = None  # websockets connection
+        self._ws = None
 
         self._id_counter = 1
         self._subscribe_batch_size = max(10, min(int(_SUBSCRIBE_BATCH_SIZE), 300))
+
+        # dirty + versioning to avoid resync spam
+        self._dirty = True
+        self._desired_version = 0
+        self._last_synced_version = -1
+        self._last_force_refresh = 0.0
+
+        # cap warning anti-spam
+        self._last_cap_warn_key: Optional[Tuple[int, int]] = None  # (desired_symbols, effective_symbols)
 
     @property
     def is_running(self) -> bool:
         return self._ws_task is not None and not self._ws_task.done()
 
     # -----------------------------
-    # stream builder
+    # streams
     # -----------------------------
     def _streams_for_symbol(self, sym: str) -> List[str]:
         s = sym.lower()
@@ -158,19 +168,16 @@ class InstitutionalWSHub:
             f"{s}@forceOrder",
         ]
 
-    def _streams_for_symbols(self, symbols: Set[str]) -> Set[str]:
-        streams: Set[str] = set()
+    def _streams_for_symbols(self, symbols: List[str]) -> Set[str]:
+        out: Set[str] = set()
         for sym in symbols:
-            streams.update(self._streams_for_symbol(sym))
-        return streams
+            out.update(self._streams_for_symbol(sym))
+        return out
 
     # -----------------------------
-    # control
+    # public API
     # -----------------------------
     async def start(self, symbols: Optional[List[str]] = None, **kwargs: Any) -> None:
-        """
-        kwargs accepted for compatibility (ex: product_type=... in scanner), ignored safely.
-        """
         if symbols:
             await self.set_symbols(symbols)
 
@@ -192,209 +199,185 @@ class InstitutionalWSHub:
         LOGGER.info("[WS_HUB] stopped")
 
     async def set_symbols(self, symbols: List[str]) -> None:
-        desired = {_norm_symbol(s) for s in (symbols or []) if _norm_symbol(s)}
+        cleaned = [_norm_symbol(s) for s in (symbols or [])]
+        cleaned = [s for s in cleaned if s]
+
+        # enforce max symbols deterministically (keep first)
+        desired_count = len(cleaned)
+        effective = cleaned[: max(0, int(_MAX_SYMBOLS))] if int(_MAX_SYMBOLS) > 0 else cleaned
+        effective_count = len(effective)
+
+        # cap warning only when it changes (anti-spam)
+        cap_key = (desired_count, effective_count)
+        if desired_count > effective_count and cap_key != self._last_cap_warn_key:
+            self._last_cap_warn_key = cap_key
+            LOGGER.warning(
+                "[WS_HUB] symbols capped by INST_WS_HUB_MAX_SYMBOLS=%s: desired=%d effective=%d",
+                str(_MAX_SYMBOLS), desired_count, effective_count
+            )
+
         async with self._lock:
-            self._desired_symbols = desired
-            for sym in desired:
+            new_set = set(effective)
+            if new_set == self._desired_set:
+                return
+
+            self._desired_symbols = effective
+            self._desired_set = new_set
+
+            for sym in new_set:
                 self._state.setdefault(sym, _SymbolState())
-        # apply live if already connected
+
+            self._dirty = True
+            self._desired_version += 1
+
+        # apply live if connected
         if self._ws is not None:
             await self._sync_subscriptions(self._ws)
 
-    # -----------------------------
-    # read API (SYNC)
-    # -----------------------------
     def get_snapshot(self, symbol: str) -> Dict[str, Any]:
         sym = _norm_symbol(symbol)
         st = self._state.get(sym)
         if not st:
             return {"available": False, "symbol": sym, "reason": "no_state"}
 
-        t = self._compute_tape(st)
-        liq = self._compute_liq_5m_breakdown(st)
-        ob_imb = self._compute_book_imbalance(st)
-        micro = self._compute_microprice(st)
-        spread_bps = self._compute_spread_bps(st)
+        tape = self._tape_stats(st)
+        liq = self._liq_stats_5m(st)
 
-        px_mid = (st.best_bid + st.best_ask) / 2.0 if (st.best_bid > 0 and st.best_ask > 0) else 0.0
-        price = float(px_mid or st.mark_price or 0.0)
+        spread_bps = self._spread_bps(st)
+        ob_imb = self._book_imbalance(st)
 
         ts = float(st.last_update_ts or 0.0)
         age_s = float(_now() - ts) if ts > 0 else 1e9
         ws_ok = bool(age_s <= _WS_FRESH_MAX_AGE_S)
 
+        # mid as best "tradable last"
+        mid = (st.best_bid + st.best_ask) / 2.0 if (st.best_bid > 0 and st.best_ask > 0) else 0.0
+        last = float(mid or st.mark_price or 0.0)
+
         return {
             "available": True,
             "symbol": sym,
 
-            # timestamps / freshness
             "ts": ts,
             "timestamp": ts,
             "ts_ms": int(ts * 1000) if ts > 0 else 0,
             "age_s": age_s,
             "ws_ok": ws_ok,
 
-            # prices
             "mark_price": st.mark_price,
-            "markPrice": st.mark_price,  # alias
+            "markPrice": st.mark_price,
             "index_price": st.index_price,
             "funding_rate": st.funding_rate,
+            "fundingRate": st.funding_rate,
             "next_funding_time": st.next_funding_time,
+            "nextFundingTime": st.next_funding_time,
 
             "best_bid": st.best_bid,
             "best_ask": st.best_ask,
-
-            # helpful extras
-            "microprice": micro,
-            "spread_bps": spread_bps,
-
-            # top-of-book qty
             "bid_qty": st.bid_qty,
             "ask_qty": st.ask_qty,
-            "orderbook_imbalance": ob_imb,
 
-            # tape ratios (buy-sell / total)
-            "tape_delta_1m": t["ratio_1m"],
-            "tape_delta_5m": t["ratio_5m"],
-            "tape_delta_15m": t["ratio_15m"],
+            "spread_bps": spread_bps,
+            "ob_imbalance": ob_imb,
 
-            # tape signed notionals
-            "tape_delta_1m_notional": t["delta_1m"],
-            "tape_delta_5m_notional": t["delta_5m"],
-            "tape_delta_15m_notional": t["delta_15m"],
+            # tape
+            "tape_delta_ratio_1m": tape["r1"],
+            "tape_delta_ratio_5m": tape["r5"],
+            "tape_delta_ratio_15m": tape["r15"],
+            "tape_delta_notional_1m": tape["d1"],
+            "tape_delta_notional_5m": tape["d5"],
+            "tape_delta_notional_15m": tape["d15"],
+            "tape_notional_1m": tape["n1"],
+            "tape_notional_5m": tape["n5"],
+            "tape_notional_15m": tape["n15"],
 
-            # tape abs notionals
-            "tape_abs_1m": t["abs_1m"],
-            "tape_abs_5m": t["abs_5m"],
-            "tape_abs_15m": t["abs_15m"],
+            # liquidation
+            "liq_notional_5m": liq["tot"],
+            "liq_buy_5m": liq["buy"],
+            "liq_sell_5m": liq["sell"],
+            "liq_delta_ratio_5m": liq["ratio"],
+            "liq_count_5m": liq["cnt"],
 
-            # liquidations
-            "liq_notional_5m": liq["total"],
-            "liq_buy_usd_5m": liq["buy_abs"],
-            "liq_sell_usd_5m": liq["sell_abs"],
-            "liq_delta_ratio_5m": liq["delta_ratio"],
-            "liq_count_5m": liq["count"],
+            # watcher aliases
+            "orderflow_ws": tape["r5"],      # ratio
+            "cvd_notional_5m": tape["d5"],   # signed
+            "cvd_notional_15m": tape["d15"],
 
-            # aliases watcher
-            "cvd_notional_5m": t["delta_5m"],
-            "cvd_notional_15m": t["delta_15m"],
-            "cvd_5m": t["delta_5m"],
-            "cvd_15m": t["delta_15m"],
-
-            "price": price,
-            "last": price,
+            "price": last,
+            "last": last,
         }
 
     # -----------------------------
-    # internals: rolling metrics
+    # metrics
     # -----------------------------
-    def _prune_left(self, dq: Deque, cutoff_ts: float) -> None:
-        try:
-            while dq and getattr(dq[0], "ts", 0.0) < cutoff_ts:
-                dq.popleft()
-        except Exception:
-            return
+    def _prune(self, dq: Deque, cutoff: float) -> None:
+        while dq and getattr(dq[0], "ts", 0.0) < cutoff:
+            dq.popleft()
 
-    def _compute_tape(self, st: _SymbolState) -> Dict[str, float]:
+    def _tape_stats(self, st: _SymbolState) -> Dict[str, float]:
         now = _now()
-        self._prune_left(st.tape, now - (_TAPE_WIN_15M + 5.0))
+        self._prune(st.tape, now - (_TAPE_WIN_15M + 5.0))
 
         d1 = n1 = 0.0
         d5 = n5 = 0.0
         d15 = n15 = 0.0
 
-        for rec in st.tape:
-            if rec.ts >= now - _TAPE_WIN_15M:
-                d15 += rec.delta_notional
-                n15 += rec.notional
-            if rec.ts >= now - _TAPE_WIN_5M:
-                d5 += rec.delta_notional
-                n5 += rec.notional
-            if rec.ts >= now - _TAPE_WIN_1M:
-                d1 += rec.delta_notional
-                n1 += rec.notional
+        for r in st.tape:
+            if r.ts >= now - _TAPE_WIN_15M:
+                d15 += r.delta_notional
+                n15 += r.notional
+            if r.ts >= now - _TAPE_WIN_5M:
+                d5 += r.delta_notional
+                n5 += r.notional
+            if r.ts >= now - _TAPE_WIN_1M:
+                d1 += r.delta_notional
+                n1 += r.notional
 
         r1 = (d1 / n1) if n1 > 1e-9 else 0.0
         r5 = (d5 / n5) if n5 > 1e-9 else 0.0
         r15 = (d15 / n15) if n15 > 1e-9 else 0.0
 
-        return {
-            "delta_1m": float(d1),
-            "delta_5m": float(d5),
-            "delta_15m": float(d15),
-            "abs_1m": float(n1),
-            "abs_5m": float(n5),
-            "abs_15m": float(n15),
-            "ratio_1m": float(r1),
-            "ratio_5m": float(r5),
-            "ratio_15m": float(r15),
-        }
+        return {"d1": d1, "n1": n1, "r1": r1, "d5": d5, "n5": n5, "r5": r5, "d15": d15, "n15": n15, "r15": r15}
 
-    def _compute_liq_5m_breakdown(self, st: _SymbolState) -> Dict[str, Any]:
+    def _liq_stats_5m(self, st: _SymbolState) -> Dict[str, Any]:
         now = _now()
-        self._prune_left(st.liquidations, now - (_LIQ_WIN_5M + 5.0))
+        self._prune(st.liquidations, now - (_LIQ_WIN_5M + 5.0))
 
-        buy_abs = 0.0
-        sell_abs = 0.0
+        buy = sell = 0.0
         cnt = 0
 
-        for rec in st.liquidations:
-            if rec.ts < now - _LIQ_WIN_5M:
+        for r in st.liquidations:
+            if r.ts < now - _LIQ_WIN_5M:
                 continue
-            n = abs(float(rec.notional))
+            n = abs(float(r.notional))
             if n <= 0:
                 continue
             cnt += 1
-            s = str(rec.side or "").upper()
+            s = str(r.side or "").upper()
             if s == "BUY":
-                buy_abs += n
+                buy += n
             elif s == "SELL":
-                sell_abs += n
+                sell += n
 
-        total = float(buy_abs + sell_abs)
-        delta_ratio = float((buy_abs - sell_abs) / total) if total > 1e-12 else 0.0
+        tot = buy + sell
+        ratio = ((buy - sell) / tot) if tot > 1e-12 else 0.0
+        return {"tot": tot, "buy": buy, "sell": sell, "ratio": ratio, "cnt": cnt}
 
-        return {
-            "total": float(total),
-            "buy_abs": float(buy_abs),
-            "sell_abs": float(sell_abs),
-            "delta_ratio": float(delta_ratio),
-            "count": int(cnt),
-        }
-
-    def _compute_book_imbalance(self, st: _SymbolState) -> float:
-        denom = (abs(st.bid_qty) + abs(st.ask_qty))
-        if denom <= 1e-12:
+    def _book_imbalance(self, st: _SymbolState) -> float:
+        den = abs(st.bid_qty) + abs(st.ask_qty)
+        if den <= 1e-12:
             return 0.0
-        return float((st.bid_qty - st.ask_qty) / denom)
+        return (st.bid_qty - st.ask_qty) / den
 
-    def _compute_microprice(self, st: _SymbolState) -> float:
-        try:
-            b = float(st.best_bid or 0.0)
-            a = float(st.best_ask or 0.0)
-            B = float(st.bid_qty or 0.0)
-            A = float(st.ask_qty or 0.0)
-            if b <= 0 or a <= 0:
-                return 0.0
-            den = (A + B)
-            if den <= 1e-12:
-                return (a + b) / 2.0
-            return float((b * A + a * B) / den)
-        except Exception:
+    def _spread_bps(self, st: _SymbolState) -> float:
+        b = float(st.best_bid or 0.0)
+        a = float(st.best_ask or 0.0)
+        if b <= 0 or a <= 0:
             return 0.0
-
-    def _compute_spread_bps(self, st: _SymbolState) -> float:
-        try:
-            b = float(st.best_bid or 0.0)
-            a = float(st.best_ask or 0.0)
-            if b <= 0 or a <= 0:
-                return 0.0
-            mid = (a + b) / 2.0
-            if mid <= 0:
-                return 0.0
-            return float((a - b) / mid * 10000.0)
-        except Exception:
+        mid = (a + b) / 2.0
+        if mid <= 0:
             return 0.0
+        return (a - b) / mid * 10000.0
 
     # -----------------------------
     # WS helpers
@@ -403,46 +386,47 @@ class InstitutionalWSHub:
         self._id_counter += 1
         return self._id_counter
 
-    async def _send_json(self, ws, payload: Dict[str, Any]) -> None:
-        # compact JSON reduces payload size
+    async def _send(self, ws, payload: Dict[str, Any]) -> None:
         await ws.send(json.dumps(payload, separators=(",", ":")))
 
     async def _send_ctrl_chunked(self, ws, method: str, streams: List[str]) -> None:
-        """
-        SUBSCRIBE/UNSUBSCRIBE in batches to avoid 1008 payload-too-long.
-        Also enforces a small delay between control messages.
-        """
         if not streams:
             return
-
         bs = self._subscribe_batch_size
         for i in range(0, len(streams), bs):
             batch = streams[i : i + bs]
-            await self._send_json(ws, {"method": method, "params": batch, "id": self._next_id()})
+            await self._send(ws, {"method": method, "params": batch, "id": self._next_id()})
             await asyncio.sleep(_CTRL_MSG_DELAY_S)
 
     async def _sync_subscriptions(self, ws) -> None:
         """
-        Compute diff between desired and subscribed streams,
-        then apply using CHUNKED control messages.
+        Only sync when dirty OR on periodic forced refresh.
+        Avoids spam and reduces ws control traffic.
         """
         async with self._lock:
-            desired_symbols = set(self._desired_symbols)
+            desired_symbols = list(self._desired_symbols)
+            desired_version = self._desired_version
+            dirty = self._dirty
+
+        force_refresh = (_now() - self._last_force_refresh) >= _FORCE_REFRESH_S
+        if (not dirty) and (desired_version == self._last_synced_version) and (not force_refresh):
+            return
 
         desired_streams = self._streams_for_symbols(desired_symbols)
 
-        # safety cap: never exceed stream cap per conn
+        # hard cap by streams (defensive)
         if len(desired_streams) > _MAX_STREAMS_PER_CONN:
-            # keep deterministic by symbol order
-            desired_list = sorted(desired_symbols)
-            keep: Set[str] = set()
-            for sym in desired_list:
-                streams = set(self._streams_for_symbol(sym))
-                if len(keep) + len(streams) > _MAX_STREAMS_PER_CONN:
+            # shrink symbols until streams fit
+            kept: List[str] = []
+            sset: Set[str] = set()
+            for sym in desired_symbols:
+                add = set(self._streams_for_symbol(sym))
+                if len(sset) + len(add) > _MAX_STREAMS_PER_CONN:
                     break
-                keep |= streams
-            desired_streams = keep
-            LOGGER.warning("[WS_HUB] desired streams capped to %d", len(desired_streams))
+                kept.append(sym)
+                sset |= add
+            desired_symbols = kept
+            desired_streams = sset
 
         to_add = sorted(list(desired_streams - self._subscribed_streams))
         to_remove = sorted(list(self._subscribed_streams - desired_streams))
@@ -457,6 +441,11 @@ class InstitutionalWSHub:
             for s in to_add:
                 self._subscribed_streams.add(s)
 
+        async with self._lock:
+            self._dirty = False
+        self._last_synced_version = desired_version
+        self._last_force_refresh = _now()
+
     async def _ensure_state(self, sym: str) -> _SymbolState:
         sym = _norm_symbol(sym)
         async with self._lock:
@@ -465,59 +454,53 @@ class InstitutionalWSHub:
     # -----------------------------
     # WS event handlers
     # -----------------------------
-    async def _handle_event_mark(self, sym: str, data: Dict[str, Any]) -> None:
+    async def _handle_mark(self, sym: str, d: Dict[str, Any]) -> None:
         st = await self._ensure_state(sym)
-        st.mark_price = _safe_float(data.get("p"), st.mark_price)
-        st.index_price = _safe_float(data.get("i"), st.index_price)
-        st.funding_rate = _safe_float(data.get("r"), st.funding_rate)
-        nft = data.get("T")
+        st.mark_price = _safe_float(d.get("p"), st.mark_price)
+        st.index_price = _safe_float(d.get("i"), st.index_price)
+        st.funding_rate = _safe_float(d.get("r"), st.funding_rate)
+        nft = d.get("T")
         try:
             st.next_funding_time = int(nft) if nft is not None else st.next_funding_time
         except Exception:
             pass
         st.last_update_ts = _now()
 
-    async def _handle_event_book(self, sym: str, data: Dict[str, Any]) -> None:
+    async def _handle_book(self, sym: str, d: Dict[str, Any]) -> None:
         st = await self._ensure_state(sym)
-        st.best_bid = _safe_float(data.get("b"), st.best_bid)
-        st.best_ask = _safe_float(data.get("a"), st.best_ask)
-        st.bid_qty = _safe_float(data.get("B"), st.bid_qty)
-        st.ask_qty = _safe_float(data.get("A"), st.ask_qty)
+        st.best_bid = _safe_float(d.get("b"), st.best_bid)
+        st.best_ask = _safe_float(d.get("a"), st.best_ask)
+        st.bid_qty = _safe_float(d.get("B"), st.bid_qty)
+        st.ask_qty = _safe_float(d.get("A"), st.ask_qty)
         st.last_update_ts = _now()
-
-        # fallback: approximate mark from mid if missing
         if st.mark_price <= 0 and st.best_bid > 0 and st.best_ask > 0:
             st.mark_price = (st.best_bid + st.best_ask) / 2.0
 
-    async def _handle_event_aggtrade(self, sym: str, data: Dict[str, Any]) -> None:
+    async def _handle_trade(self, sym: str, d: Dict[str, Any]) -> None:
         st = await self._ensure_state(sym)
-        price = _safe_float(data.get("p"), 0.0)
-        qty = _safe_float(data.get("q"), 0.0)
-        notional = abs(price * qty)
-
-        # Binance aggTrade: m=True => buyer is market maker => SELL pressure
-        m = bool(data.get("m", False))
-        delta = (-notional) if m else (+notional)
-
-        if notional > 0:
-            st.tape.append(_TapeRec(ts=_now(), delta_notional=delta, notional=notional))
+        p = _safe_float(d.get("p"), 0.0)
+        q = _safe_float(d.get("q"), 0.0)
+        n = abs(p * q)
+        m = bool(d.get("m", False))  # True => seller initiated
+        delta = (-n) if m else (+n)
+        if n > 0:
+            st.tape.append(_TapeRec(ts=_now(), delta_notional=delta, notional=n))
         st.last_update_ts = _now()
 
-    async def _handle_event_forceorder(self, sym: str, data: Dict[str, Any]) -> None:
+    async def _handle_liq(self, sym: str, d: Dict[str, Any]) -> None:
         st = await self._ensure_state(sym)
-        o = data.get("o") if isinstance(data.get("o"), dict) else {}
+        o = d.get("o") if isinstance(d.get("o"), dict) else {}
         side = str(o.get("S") or "").upper()
         if side not in ("BUY", "SELL"):
             side = "UNKNOWN"
-        price = _safe_float(o.get("p"), 0.0)
-        qty = _safe_float(o.get("q"), 0.0)
-        notional = abs(price * qty)
-        if notional > 0:
-            st.liquidations.append(_LiqRec(ts=_now(), notional=notional, side=side))
+        p = _safe_float(o.get("p"), 0.0)
+        q = _safe_float(o.get("q"), 0.0)
+        n = abs(p * q)
+        if n > 0:
+            st.liquidations.append(_LiqRec(ts=_now(), notional=n, side=side))
         st.last_update_ts = _now()
 
     async def _handle_combined(self, stream: str, data: Dict[str, Any]) -> None:
-        # combined format: {"stream":"btcusdt@aggTrade","data":{...}}
         sym = _stream_symbol(stream) or _norm_symbol(str(data.get("s") or ""))
         if not sym:
             return
@@ -526,17 +509,13 @@ class InstitutionalWSHub:
         et = str(data.get("e") or "").lower()
 
         if ("@markprice" in sl) or (et == "markpriceupdate"):
-            await self._handle_event_mark(sym, data)
-            return
-        if ("@bookticker" in sl) or (et == "bookticker"):
-            await self._handle_event_book(sym, data)
-            return
-        if ("@aggtrade" in sl) or (et == "aggtrade"):
-            await self._handle_event_aggtrade(sym, data)
-            return
-        if ("@forceorder" in sl) or (et == "forceorder"):
-            await self._handle_event_forceorder(sym, data)
-            return
+            await self._handle_mark(sym, data)
+        elif ("@bookticker" in sl) or (et == "bookticker"):
+            await self._handle_book(sym, data)
+        elif ("@aggtrade" in sl) or (et == "aggtrade"):
+            await self._handle_trade(sym, data)
+        elif ("@forceorder" in sl) or (et == "forceorder"):
+            await self._handle_liq(sym, data)
 
     async def _handle_raw(self, payload: Dict[str, Any]) -> None:
         et = str(payload.get("e") or "").lower()
@@ -545,20 +524,16 @@ class InstitutionalWSHub:
             return
 
         if et == "markpriceupdate":
-            await self._handle_event_mark(sym, payload)
-            return
-        if et == "bookticker":
-            await self._handle_event_book(sym, payload)
-            return
-        if et == "aggtrade":
-            await self._handle_event_aggtrade(sym, payload)
-            return
-        if et == "forceorder":
-            await self._handle_event_forceorder(sym, payload)
-            return
+            await self._handle_mark(sym, payload)
+        elif et == "bookticker":
+            await self._handle_book(sym, payload)
+        elif et == "aggtrade":
+            await self._handle_trade(sym, payload)
+        elif et == "forceorder":
+            await self._handle_liq(sym, payload)
 
     # -----------------------------
-    # WS loop
+    # WS main loop
     # -----------------------------
     async def _run_loop(self) -> None:
         try:
@@ -581,28 +556,21 @@ class InstitutionalWSHub:
                     self._ws = ws
                     LOGGER.info("[WS_HUB] connected %s", BINANCE_FUTURES_WS)
 
-                    # reset local subscription state per new connection
+                    # reset per connection
                     self._subscribed_streams = set()
+                    self._last_force_refresh = 0.0
                     backoff = _RECONNECT_MIN_S
 
-                    # enable combined payloads if desired
                     if _ENABLE_COMBINED:
-                        await self._send_json(
-                            ws,
-                            {"method": "SET_PROPERTY", "params": ["combined", True], "id": self._next_id()},
-                        )
+                        await self._send(ws, {"method": "SET_PROPERTY", "params": ["combined", True], "id": self._next_id()})
                         await asyncio.sleep(_CTRL_MSG_DELAY_S)
 
-                    # initial subscribe (chunked)
+                    # first sync
                     await self._sync_subscriptions(ws)
 
-                    last_sync = _now()
-
                     while not self._stop_evt.is_set():
-                        # periodic sync (handles live symbol list updates)
-                        if _now() - last_sync >= 2.0:
-                            await self._sync_subscriptions(ws)
-                            last_sync = _now()
+                        # sync only when needed
+                        await self._sync_subscriptions(ws)
 
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
@@ -617,20 +585,16 @@ class InstitutionalWSHub:
                         except Exception:
                             continue
 
-                        # acks / property responses
+                        # ack
                         if isinstance(payload, dict) and "result" in payload and "id" in payload:
                             continue
 
-                        # combined format
-                        if (
-                            isinstance(payload, dict)
-                            and isinstance(payload.get("stream"), str)
-                            and isinstance(payload.get("data"), dict)
-                        ):
+                        # combined
+                        if isinstance(payload, dict) and isinstance(payload.get("stream"), str) and isinstance(payload.get("data"), dict):
                             await self._handle_combined(payload["stream"], payload["data"])
                             continue
 
-                        # raw events
+                        # raw
                         if isinstance(payload, dict) and isinstance(payload.get("e"), str):
                             await self._handle_raw(payload)
                             continue
@@ -640,16 +604,12 @@ class InstitutionalWSHub:
                 s = str(e)
                 LOGGER.warning("[WS_HUB] disconnected: %s", s)
 
-                # If we still hit payload-too-long, reduce batch size automatically
+                # if still hitting payload-too-long, auto-reduce batch size
                 if "1008" in s and "Payload too long" in s:
                     old = self._subscribe_batch_size
                     self._subscribe_batch_size = max(10, int(self._subscribe_batch_size * 0.6))
                     if self._subscribe_batch_size != old:
-                        LOGGER.warning(
-                            "[WS_HUB] auto-reducing subscribe batch size: %d -> %d",
-                            old,
-                            self._subscribe_batch_size,
-                        )
+                        LOGGER.warning("[WS_HUB] auto-reducing subscribe batch size: %d -> %d", old, self._subscribe_batch_size)
 
                 await asyncio.sleep(backoff)
                 backoff = min(_RECONNECT_MAX_S, max(_RECONNECT_MIN_S, backoff * 1.6))
