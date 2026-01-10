@@ -16,6 +16,13 @@
 # ✅ Optional volatility-targeted risk sizing (if you pass volatility_atr_pct)
 # ✅ Net RR helper (compute_rr_net) + rr_net support in gating when provided
 # ✅ Safety fix: forbid opening a new position on a symbol that already has one
+#
+# UPGRADE #2 (Portfolio / Institutional):
+# ✅ Cluster exposure cap for high-BTC-correlation symbols:
+#    - if abs(corr_btc) >= CORR_BTC_THRESHOLD -> cluster = BTC_BETA_HIGH
+#    - enforce cap: cluster_notional_after <= CORR_GROUP_CAP * equity
+#    - includes open + reservations (concurrency-safe)
+#    - stored in Reservation/Position for monitoring
 # =====================================================================
 
 from __future__ import annotations
@@ -46,6 +53,9 @@ from settings import (
     DRAWDOWN_RISK_FACTOR,
     SYMBOL_MAX_DAILY_LOSS,
     SYMBOL_MAX_TRADES_PER_DAY,
+    # NEW: portfolio cluster caps
+    CORR_GROUP_CAP,
+    CORR_BTC_THRESHOLD,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -85,6 +95,10 @@ class RiskConfig:
     max_gross_exposure: float = float(MAX_GROSS_EXPOSURE)     # e.g. 2.0 => 2x equity notional
     max_symbol_exposure: float = float(MAX_SYMBOL_EXPOSURE)   # e.g. 0.25 => 25% equity per symbol
 
+    # NEW: portfolio cluster cap for correlated symbols
+    corr_btc_threshold: float = float(CORR_BTC_THRESHOLD)     # e.g. 0.7
+    corr_group_cap: float = float(CORR_GROUP_CAP)             # e.g. 0.5 => 50% equity cap for cluster
+
     # reservations: prevent stuck exposure if order flow never confirms
     reservation_ttl_seconds: int = 6 * 60  # 6 minutes
 
@@ -93,7 +107,6 @@ class RiskConfig:
 
     # optional volatility targeting:
     # if you pass volatility_atr_pct (ATR/price), risk can be scaled.
-    # Example: volatility_atr_pct=0.01 means 1% ATR.
     use_volatility_targeting: bool = False
     target_atr_pct: float = 0.010  # 1%
     vol_risk_min_factor: float = 0.35
@@ -128,9 +141,14 @@ class PositionState:
     notional: float
     risk: float
     opened_at: float = field(default_factory=lambda: time.time())
+
     # for partial fill tracking
     filled_notional: float = 0.0
-    avg_entry: Optional[float] = None  # optional, if you want to store it later
+    avg_entry: Optional[float] = None
+
+    # NEW: portfolio clustering
+    cluster: Optional[str] = None          # e.g. "BTC_BETA_HIGH"
+    corr_btc: Optional[float] = None       # correlation estimate [-1, 1]
 
 
 @dataclass
@@ -141,6 +159,10 @@ class Reservation:
     notional: float
     risk: float
     created_at: float = field(default_factory=lambda: time.time())
+
+    # NEW: portfolio clustering
+    cluster: Optional[str] = None
+    corr_btc: Optional[float] = None
 
 
 # =====================================================================
@@ -204,7 +226,6 @@ class RiskManager:
             for rid in expired:
                 self._reservations.pop(rid, None)
         except Exception:
-            # never break risk flow
             return
 
     def _ensure_daily_state(self) -> None:
@@ -213,14 +234,12 @@ class RiskManager:
             self._daily = DailyState(date_key=today)
             self._tilt_active = False
             self._tilt_activated_at = 0.0
-            # do not auto-close open positions; clear reservations to avoid stuck state
             self._reservations.clear()
         else:
             if self._daily.symbol_pnl is None:
                 self._daily.symbol_pnl = {}
             if self._daily.symbol_trades is None:
                 self._daily.symbol_trades = {}
-        # also keep the reservation map clean in runtime
         self._purge_expired_reservations_nolock()
 
     def _daily_loss(self) -> float:
@@ -260,6 +279,35 @@ class RiskManager:
             return s
         return "LONG"
 
+    @staticmethod
+    def _norm_cluster(cluster: Optional[str]) -> Optional[str]:
+        if cluster is None:
+            return None
+        c = str(cluster).strip()
+        return c if c else None
+
+    def _derive_cluster(self, corr_btc: Optional[float], cluster: Optional[str]) -> Optional[str]:
+        """
+        Derive a portfolio cluster if caller didn't provide one.
+        """
+        c_in = self._norm_cluster(cluster)
+        if c_in:
+            return c_in
+
+        v = None
+        try:
+            if corr_btc is not None:
+                v = float(corr_btc)
+        except Exception:
+            v = None
+
+        if v is None:
+            return None
+
+        if abs(v) >= float(self.config.corr_btc_threshold):
+            return "BTC_BETA_HIGH"
+        return None
+
     # ------------------------------------------------------------------
     # exposure computations
     # ------------------------------------------------------------------
@@ -278,6 +326,18 @@ class RiskManager:
     def _symbol_reserved_notional(self, symbol: str) -> float:
         sym = (symbol or "").upper()
         return float(sum(r.notional for r in self._reservations.values() if r.symbol == sym))
+
+    def _cluster_open_notional(self, cluster: Optional[str]) -> float:
+        c = self._norm_cluster(cluster)
+        if not c:
+            return 0.0
+        return float(sum(p.notional for p in self.open_positions.values() if (p.cluster or None) == c))
+
+    def _cluster_reserved_notional(self, cluster: Optional[str]) -> float:
+        c = self._norm_cluster(cluster)
+        if not c:
+            return 0.0
+        return float(sum(r.notional for r in self._reservations.values() if (r.cluster or None) == c))
 
     # ------------------------------------------------------------------
     # Level 1 gate: can_open
@@ -307,7 +367,6 @@ class RiskManager:
             return False, "max_short_exposure"
 
         # SAFETY FIX:
-        # with open_positions keyed by symbol, allowing opposite-side opens would overwrite state.
         if sym in self.open_positions:
             return False, "position_already_open_symbol"
 
@@ -343,17 +402,19 @@ class RiskManager:
         inst_score: Optional[int] = None,
         commitment: Optional[float] = None,
         volatility_atr_pct: Optional[float] = None,
+        # NEW:
+        corr_btc: Optional[float] = None,
+        cluster: Optional[str] = None,
         **_extra: Any,
     ) -> Tuple[bool, str, Optional[str]]:
         """
         Returns (allowed, reason, reservation_id).
         If allowed, reserves exposure immediately (prevents overfill in concurrent scan tasks).
-
-        Pass volatility_atr_pct if you want volatility targeting.
-        Pass rr_net if you computed net RR (fees/funding/slippage).
         """
         async with self._lock:
             self._ensure_daily_state()
+
+            derived_cluster = self._derive_cluster(corr_btc, cluster)
 
             allowed, reason = self._can_trade_core(
                 symbol=symbol,
@@ -364,6 +425,8 @@ class RiskManager:
                 inst_score=inst_score,
                 commitment=commitment,
                 volatility_atr_pct=volatility_atr_pct,
+                corr_btc=corr_btc,
+                cluster=derived_cluster,
             )
             if not allowed:
                 return False, reason, None
@@ -380,6 +443,8 @@ class RiskManager:
                 side=s,
                 notional=float(notional),
                 risk=float(risk_used),
+                cluster=derived_cluster,
+                corr_btc=float(corr_btc) if corr_btc is not None else None,
             )
 
             return True, "OK", rid
@@ -401,9 +466,7 @@ class RiskManager:
     ) -> None:
         """
         Turns reservation into an open position and increments daily trades.
-        Supports partial fills:
-          - filled_notional: if None, uses reserved notional
-          - filled_risk: if None, uses reserved risk
+        Supports partial fills.
         """
         async with self._lock:
             self._ensure_daily_state()
@@ -414,11 +477,19 @@ class RiskManager:
             notional = float(filled_notional) if (filled_notional is not None) else float(r.notional)
             risk = float(filled_risk) if (filled_risk is not None) else float(r.risk)
 
-            # If filled is 0 => treat as no position opened (avoid polluting state)
             if notional <= 0:
                 return
 
-            self._register_open_nolock(r.symbol, r.side, notional, risk, filled_notional=notional, avg_entry=avg_entry)
+            self._register_open_nolock(
+                r.symbol,
+                r.side,
+                notional,
+                risk,
+                filled_notional=notional,
+                avg_entry=avg_entry,
+                cluster=r.cluster,
+                corr_btc=r.corr_btc,
+            )
 
     async def apply_fill(
         self,
@@ -431,9 +502,6 @@ class RiskManager:
     ) -> None:
         """
         Apply incremental fills to an already-open position (partial fills / adds).
-        This does NOT bypass exposure gates; scanner should reserve/confirm for adds.
-
-        - fill_notional_delta can be positive (more filled) or negative (reduce)
         """
         async with self._lock:
             self._ensure_daily_state()
@@ -451,7 +519,6 @@ class RiskManager:
             if avg_entry is not None:
                 p.avg_entry = float(avg_entry)
 
-            # If position is effectively gone
             if p.notional <= 0.0:
                 self.open_positions.pop(sym, None)
                 self.direction_counts[s] = max(0, self.direction_counts.get(s, 0) - 1)
@@ -463,9 +530,6 @@ class RiskManager:
     def risk_for_this_trade(self, *, volatility_atr_pct: Optional[float] = None) -> float:
         """
         Base risk sizing with optional drawdown reduction + optional volatility targeting.
-
-        Volatility targeting requires passing volatility_atr_pct (ATR/price).
-        If not passed, this returns baseline risk (with drawdown reducer only).
         """
         self._ensure_daily_state()
         base = float(self.config.risk_per_trade)
@@ -490,7 +554,6 @@ class RiskManager:
             return float(base)
 
         tgt = float(max(1e-9, self.config.target_atr_pct))
-        # scale risk inversely to volatility
         factor = tgt / v
         factor = float(max(self.config.vol_risk_min_factor, min(self.config.vol_risk_max_factor, factor)))
         return float(base * factor)
@@ -507,7 +570,6 @@ class RiskManager:
         s = self._norm_side(side)
         sym = (symbol or "UNKNOWN").upper()
 
-        # keep same safety rule as can_open
         if sym in self.open_positions:
             return
 
@@ -522,6 +584,8 @@ class RiskManager:
         *,
         filled_notional: float = 0.0,
         avg_entry: Optional[float] = None,
+        cluster: Optional[str] = None,
+        corr_btc: Optional[float] = None,
     ) -> None:
         self.open_positions[sym] = PositionState(
             symbol=sym,
@@ -530,6 +594,8 @@ class RiskManager:
             risk=float(risk),
             filled_notional=float(filled_notional),
             avg_entry=float(avg_entry) if avg_entry is not None else None,
+            cluster=self._norm_cluster(cluster),
+            corr_btc=float(corr_btc) if corr_btc is not None else None,
         )
         self.direction_counts[side] = self.direction_counts.get(side, 0) + 1
         if self._daily:
@@ -586,7 +652,15 @@ class RiskManager:
         for sym, p in self.open_positions.items():
             age = float(max(0.0, time.time() - float(p.opened_at)))
             if age >= limit:
-                out.append({"symbol": sym, "side": p.side, "age_s": age, "notional": float(p.notional), "risk": float(p.risk)})
+                out.append({
+                    "symbol": sym,
+                    "side": p.side,
+                    "age_s": age,
+                    "notional": float(p.notional),
+                    "risk": float(p.risk),
+                    "cluster": p.cluster,
+                    "corr_btc": p.corr_btc,
+                })
         return out
 
     # ------------------------------------------------------------------
@@ -604,6 +678,9 @@ class RiskManager:
         inst_score: Optional[int],
         commitment: Optional[float],
         volatility_atr_pct: Optional[float],
+        # NEW:
+        corr_btc: Optional[float] = None,
+        cluster: Optional[str] = None,
     ) -> Tuple[bool, str]:
         self._ensure_daily_state()
         sym = (symbol or "UNKNOWN").upper()
@@ -645,8 +722,15 @@ class RiskManager:
         if sym_after > sym_cap:
             return False, "symbol_exposure_cap"
 
+        # NEW: portfolio cluster cap for high-BTC-corr names
+        derived_cluster = self._derive_cluster(corr_btc, cluster)
+        if derived_cluster == "BTC_BETA_HIGH":
+            cluster_cap = float(self.config.corr_group_cap) * eq
+            cluster_after = self._cluster_open_notional(derived_cluster) + self._cluster_reserved_notional(derived_cluster) + notional
+            if cluster_after > cluster_cap:
+                return False, "cluster_exposure_cap_btc_beta_high"
+
         # Optional EV sanity gates.
-        # Prefer rr_net if provided, else rr.
         rr_used = None
         if rr_net is not None:
             try:
@@ -660,11 +744,9 @@ class RiskManager:
                 rr_used = None
 
         if rr_used is not None and rr_used > 0:
-            # If no/low institutional info and rr below strict => veto
             if (inst_score is None or int(inst_score) < int(MIN_INST_SCORE)) and rr_used < float(RR_MIN_STRICT):
                 return False, "rr_below_strict_no_inst"
 
-            # If inst strong, allow down to tolerated threshold
             if inst_score is not None and int(inst_score) >= int(MIN_INST_SCORE):
                 if rr_used < float(RR_MIN_TOLERATED_WITH_INST):
                     return False, "rr_below_tolerated_even_with_inst"
@@ -673,13 +755,11 @@ class RiskManager:
         if DESK_EV_MODE and commitment is not None:
             pass
 
-        # Optional volatility targeting check (non-blocking): if targeting is enabled
-        # and volatility is extremely high, you might want a desk veto.
+        # Optional volatility targeting check (non-blocking desk veto)
         if self.config.use_volatility_targeting and volatility_atr_pct is not None:
             try:
                 v = float(volatility_atr_pct)
                 if v > 0.0 and v >= 4.5 * float(self.config.target_atr_pct):
-                    # very volatile regime -> veto to avoid nasty spreads/liquidations
                     return False, "volatility_too_high"
             except Exception:
                 pass
@@ -699,6 +779,8 @@ class RiskManager:
           - rr_actual (gross) / rr_net (preferred)
           - inst_score / institutional_score
           - volatility_atr_pct / atr_pct / vol_atr_pct
+          - corr_btc / btc_corr / corr_to_btc / btc_correlation
+          - cluster / corr_group
         """
         symbol = kwargs.get("symbol")
         side = kwargs.get("side")
@@ -715,6 +797,15 @@ class RiskManager:
             or kwargs.get("volatility")
         )
 
+        corr_btc = (
+            kwargs.get("corr_btc")
+            or kwargs.get("btc_corr")
+            or kwargs.get("corr_to_btc")
+            or kwargs.get("btc_correlation")
+        )
+
+        cluster = kwargs.get("cluster") or kwargs.get("corr_group")
+
         str_args = [a for a in args if isinstance(a, str)]
         num_args = [a for a in args if isinstance(a, (int, float))]
 
@@ -723,11 +814,9 @@ class RiskManager:
         if side is None and len(str_args) >= 2:
             side = str_args[1]
 
-        # pick biggest numeric as notional (common pattern)
         if notional is None and num_args:
             notional = float(max(num_args))
 
-        # rr: smallest positive < 10 if not provided
         if rr is None and num_args:
             cands = [float(x) for x in num_args if 0 < float(x) < 10]
             if cands:
@@ -776,6 +865,14 @@ class RiskManager:
         except Exception:
             vol_f = None
 
+        # normalize corr_btc
+        corr_f = None
+        try:
+            if corr_btc is not None:
+                corr_f = float(corr_btc)
+        except Exception:
+            corr_f = None
+
         return {
             "symbol": str(symbol),
             "side": str(side),
@@ -785,6 +882,8 @@ class RiskManager:
             "inst_score": inst_score,
             "commitment": commitment,
             "volatility_atr_pct": vol_f,
+            "corr_btc": corr_f,
+            "cluster": self._norm_cluster(cluster),
         }
 
     # ------------------------------------------------------------------
@@ -798,20 +897,14 @@ class RiskManager:
         stop: float,
         tp: float,
         side: str,
-        fee_rate_roundtrip: float = 0.0,     # e.g. 0.001 means 0.10% total entry+exit
-        funding_rate_per_hour: float = 0.0,  # e.g. 0.00001 means 0.001%/hour
+        fee_rate_roundtrip: float = 0.0,
+        funding_rate_per_hour: float = 0.0,
         funding_hours: float = 0.0,
-        slippage_bps_roundtrip: float = 0.0, # e.g. 5 => 5 bps total
+        slippage_bps_roundtrip: float = 0.0,
     ) -> Optional[float]:
         """
         Computes a net R:R using explicit parameters only.
         Returns None if inputs invalid.
-
-        - fee_rate_roundtrip is applied on notional, approximated as price cost in move terms.
-        - slippage_bps_roundtrip is converted to a rate (bps -> fraction).
-        - funding cost is applied as rate = funding_rate_per_hour * funding_hours.
-
-        This is a simplification; it avoids hidden assumptions.
         """
         try:
             e = float(entry)
@@ -839,8 +932,6 @@ class RiskManager:
             slip = float(max(0.0, slippage_bps_roundtrip)) / 10000.0
             funding = float(max(0.0, funding_rate_per_hour)) * float(max(0.0, funding_hours))
 
-            # Convert rates into an approximate "price move" cost:
-            # cost_move ≈ entry * total_rate; then convert to R units via / risk
             total_rate = fee + slip + funding
             cost_move = e * total_rate
             rr_net = rr_gross - (cost_move / risk)
@@ -872,6 +963,8 @@ class RiskManager:
                     "age_s": float(max(0.0, time.time() - float(pos.opened_at))),
                     "filled_notional": float(pos.filled_notional),
                     "avg_entry": float(pos.avg_entry) if pos.avg_entry is not None else None,
+                    "cluster": pos.cluster,
+                    "corr_btc": pos.corr_btc,
                 }
                 for sym, pos in self.open_positions.items()
             },
@@ -883,6 +976,8 @@ class RiskManager:
                     "risk": float(r.risk),
                     "created_at": float(r.created_at),
                     "age_s": float(max(0.0, time.time() - float(r.created_at))),
+                    "cluster": r.cluster,
+                    "corr_btc": r.corr_btc,
                 }
                 for rid, r in self._reservations.items()
             },
@@ -896,6 +991,8 @@ class RiskManager:
                 "max_open_positions": int(self.config.max_open_positions),
                 "max_gross_exposure": float(self.config.max_gross_exposure),
                 "max_symbol_exposure": float(self.config.max_symbol_exposure),
+                "corr_btc_threshold": float(self.config.corr_btc_threshold),
+                "corr_group_cap": float(self.config.corr_group_cap),
                 "symbol_max_daily_loss": float(self.config.symbol_max_daily_loss),
                 "symbol_max_trades_per_day": int(self.config.symbol_max_trades_per_day),
                 "reservation_ttl_seconds": int(self.config.reservation_ttl_seconds),
