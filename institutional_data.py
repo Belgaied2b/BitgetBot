@@ -1,6 +1,12 @@
 # =====================================================================
-# institutional_data.py — Ultra Desk 3.1 (max institutional)
+# institutional_data.py — Ultra Desk 3.1.1 (max institutional)
 # Binance USDT-M Futures (public endpoints + optional WebSocket orderflow)
+#
+# Notes (3.1.1):
+# - Bias hardening: accepte LONG/SHORT, sinon "UNKNOWN" + scoring neutre
+# - WS orderflow hub: envoi thread-safe (send_lock) + subscribe sans tenir le lock d’état
+# - Re-subscribe reconnect: copie locale des subs (évite await sous lock)
+# - Micro fixes: log-return fallback via math.log, quelques garde-fous
 #
 # + Microstructure upgrade:
 #   - spread_bps / mid / microprice / book_skew
@@ -36,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -134,6 +141,13 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _normalize_bias(bias: str) -> str:
+    b = (bias or "").upper().strip()
+    if b in ("LONG", "SHORT"):
+        return b
+    return "UNKNOWN"
+
+
 def _is_hard_banned() -> bool:
     return _now_ms() < int(_BINANCE_HARD_BAN_UNTIL_MS)
 
@@ -212,6 +226,7 @@ class _SymbolOFState:
 class _BinanceOrderflowHub:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
         self._ws_task: Optional[asyncio.Task] = None
         self._stop: Optional[asyncio.Event] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -248,13 +263,15 @@ class _BinanceOrderflowHub:
         if INST_WS_INCLUDE_MARKPRICE:
             streams.append(f"{s}@markPrice@1s")
 
+        to_add: List[str] = []
         async with self._lock:
             if sym not in self._state:
                 self._state[sym] = _SymbolOFState()
             to_add = [x for x in streams if x not in self._subs]
-            if not to_add:
-                return
-            self._subs.update(to_add)
+            if to_add:
+                self._subs.update(to_add)
+
+        if to_add:
             await self._send({"method": "SUBSCRIBE", "params": to_add, "id": self._next_id()})
 
     def get_snapshot(self, binance_symbol: str) -> Optional[Dict[str, Any]]:
@@ -279,7 +296,6 @@ class _BinanceOrderflowHub:
 
         ob_imb = self._tob_imbalance(st.book)
 
-        # microstructure quality
         spread_bps, mid, microprice, book_skew = self._book_micro(st.book)
 
         return {
@@ -318,7 +334,8 @@ class _BinanceOrderflowHub:
         if ws is None or ws.closed:
             return
         try:
-            await ws.send_str(json.dumps(payload))
+            async with self._send_lock:
+                await ws.send_str(json.dumps(payload))
         except Exception:
             return
 
@@ -424,7 +441,12 @@ class _BinanceOrderflowHub:
             den_q = (bq + aq)
             book_skew = ((bq - aq) / den_q) if den_q > 0 else None
             microprice = ((bp * aq) + (ap * bq)) / den_q if den_q > 0 else None
-            return float(spread_bps) if spread_bps is not None else None, float(mid), float(microprice) if microprice is not None else None, float(book_skew) if book_skew is not None else None
+            return (
+                float(spread_bps) if spread_bps is not None else None,
+                float(mid),
+                float(microprice) if microprice is not None else None,
+                float(book_skew) if book_skew is not None else None,
+            )
         except Exception:
             return None, None, None, None
 
@@ -447,10 +469,11 @@ class _BinanceOrderflowHub:
                     except Exception:
                         pass
 
-                    # Re-subscribe after reconnect
+                    # Re-subscribe after reconnect (copy subs outside lock)
                     async with self._lock:
-                        if self._subs:
-                            await self._send({"method": "SUBSCRIBE", "params": sorted(self._subs), "id": self._next_id()})
+                        subs = sorted(self._subs)
+                    if subs:
+                        await self._send({"method": "SUBSCRIBE", "params": subs, "id": self._next_id()})
 
                     async for msg in ws:
                         if self._stop is not None and self._stop.is_set():
@@ -1079,7 +1102,6 @@ def _map_symbol_to_binance(symbol: str, binance_symbols: Set[str]) -> Optional[s
         if alt in binance_symbols:
             return alt
 
-    # last resort: remove leading digits (only if still not mapped)
     m = re.match(r"^(\d+)([A-Z].+)$", s)
     if m:
         alt2 = m.group(2)
@@ -1442,7 +1464,11 @@ def _compute_tape_delta_notional(trades: List[Dict[str, Any]], window_sec: int =
         return None
 
 
-def _compute_large_trade_imbalance(trades: List[Dict[str, Any]], window_sec: int = 300, threshold_usd: float = 250000.0) -> Tuple[Optional[float], Optional[int], Optional[int]]:
+def _compute_large_trade_imbalance(
+    trades: List[Dict[str, Any]],
+    window_sec: int = 300,
+    threshold_usd: float = 250000.0
+) -> Tuple[Optional[float], Optional[int], Optional[int]]:
     """
     Large trades imbalance in [-1,+1] based on count of prints above threshold_usd.
     Returns: (imbalance, buy_count, sell_count)
@@ -1556,9 +1582,7 @@ def _compute_oi_hist_slope(oi_hist: Optional[List[Dict[str, Any]]]) -> Optional[
 
 
 def _extract_oi_usd_from_hist(oi_hist: Optional[List[Dict[str, Any]]]) -> Optional[float]:
-    """
-    Try to extract latest open interest value in USD (sumOpenInterestValue) from openInterestHist.
-    """
+    """Try to extract latest open interest value in USD (sumOpenInterestValue) from openInterestHist."""
     try:
         if not oi_hist:
             return None
@@ -1632,8 +1656,13 @@ def _compute_realized_vol_24h_from_klines(klines: List[List[Any]]) -> Optional[f
             return None
         rets: List[float] = []
         for i in range(1, len(closes)):
-            if closes[i - 1] > 0 and closes[i] > 0:
-                rets.append(float(np.log(closes[i] / closes[i - 1])) if np is not None else float((closes[i] - closes[i - 1]) / closes[i - 1]))
+            a = closes[i - 1]
+            b = closes[i]
+            if a > 0 and b > 0:
+                if np is not None:
+                    rets.append(float(np.log(b / a)))
+                else:
+                    rets.append(float(math.log(b / a)))
         if len(rets) < 10:
             return None
         _, std = _mean_std(rets[-24:])
@@ -1786,7 +1815,10 @@ def _classify_crowding(bias: str, funding_rate: Optional[float], basis_pct: Opti
     if funding_rate is None and basis_pct is None:
         return "unknown"
 
-    b = (bias or "").upper()
+    b = _normalize_bias(bias)
+    if b not in ("LONG", "SHORT"):
+        return "unknown"
+
     fr = float(funding_rate) if funding_rate is not None else 0.0
     bs = float(basis_pct) if basis_pct is not None else 0.0
 
@@ -1852,9 +1884,13 @@ def _score_institutional_v1(
     """
     Score legacy en [0..4] (conservé pour debug).
     """
-    b = (bias or "").upper()
+    b = _normalize_bias(bias)
     comp: Dict[str, int] = {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0}
     meta: Dict[str, Any] = {}
+
+    if b not in ("LONG", "SHORT"):
+        meta["invalid_bias"] = True
+        return 0, comp, meta
 
     flow_points = 0
 
@@ -1974,9 +2010,13 @@ def _score_institutional_v2_regime(
     """
     Score regime-aware en [0..4]. Utilise z-scores si dispo, sinon seuils raw.
     """
-    b = (bias or "").upper().strip()
+    b = _normalize_bias(bias)
     comp: Dict[str, int] = {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0}
     meta: Dict[str, Any] = {"used_z": {}, "penalties": []}
+
+    if b not in ("LONG", "SHORT"):
+        meta["invalid_bias"] = True
+        return 0, comp, meta
 
     # FLOW
     flow_points = 0
@@ -2118,10 +2158,14 @@ def _score_institutional_v3_quality(
     Score v3: part de v2, puis ajuste avec microstructure quality + build-up.
     Conserve la plage [0..4].
     """
-    b = (bias or "").upper().strip()
+    b = _normalize_bias(bias)
     score = int(base_score)
     meta: Dict[str, Any] = {"penalties": [], "bonuses": []}
     comp = dict(base_components or {})
+
+    if b not in ("LONG", "SHORT"):
+        meta["invalid_bias"] = True
+        return 0, {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0}, meta
 
     # penalties quality
     if spread_bps is not None and float(spread_bps) > float(INST_SPREAD_MAX_BPS):
@@ -2138,7 +2182,7 @@ def _score_institutional_v3_quality(
             score -= 1
             meta["penalties"].append("crowding_risky_no_strong_flow")
 
-    # build-up bonus: if build-up aligns with bias and we already have flow+oi ok
+    # build-up bonus
     aligns = False
     if b == "LONG" and build_up_regime == "long_build_up":
         aligns = True
@@ -2216,13 +2260,16 @@ async def compute_full_institutional_analysis(
     """
     Institutional analysis for a symbol (KuCoin/Bitget format) using Binance USDT-M Futures.
     """
-    bias = (bias or "").upper().strip()
+    bias_norm = _normalize_bias(bias)
     eff_mode = (mode or INST_MODE).upper().strip()
     if eff_mode not in ("LIGHT", "NORMAL", "FULL"):
         eff_mode = "LIGHT"
 
     warnings: List[str] = []
     sources: Dict[str, str] = {}
+
+    if bias_norm == "UNKNOWN":
+        warnings.append("invalid_bias_expected_LONG_or_SHORT")
 
     use_liq = bool(INST_INCLUDE_LIQUIDATIONS or include_liquidations)
 
@@ -2351,7 +2398,6 @@ async def compute_full_institutional_analysis(
     ob_10: Optional[float] = None
     ob_25: Optional[float] = None
 
-    # depth microstructure
     spread_bps: Optional[float] = None
     microprice: Optional[float] = None
     depth_bid_usd_10: Optional[float] = None
@@ -2365,27 +2411,23 @@ async def compute_full_institutional_analysis(
     depth_usd_50: Optional[float] = None
     depth_ratio_25: Optional[float] = None
 
-    # large prints (rest or ws if provided by hub)
     large_trade_imb_5m: Optional[float] = None
     large_buy_cnt_5m: Optional[int] = None
     large_sell_cnt_5m: Optional[int] = None
 
-    cvd_slope: Optional[float] = None  # FULL fallback (kline-based)
-    cvd_notional_5m: Optional[float] = None  # WS micro-CVD
+    cvd_slope: Optional[float] = None
+    cvd_notional_5m: Optional[float] = None
 
-    # Liquidations
     liq_buy_usd_5m: Optional[float] = None
     liq_sell_usd_5m: Optional[float] = None
     liq_total_usd_5m: Optional[float] = None
     liq_delta_ratio_5m: Optional[float] = None
     liq_regime: str = "unknown"
 
-    # build-up / vol
     price_ret_1h: Optional[float] = None
     realized_vol_24h: Optional[float] = None
     build_up_regime: str = "unknown"
 
-    # Optional LSR
     lsr_global_last = lsr_global_slope = None
     lsr_top_last = lsr_top_slope = None
     taker_ls_last = taker_ls_slope = None
@@ -2507,7 +2549,6 @@ async def compute_full_institutional_analysis(
                     tape_5m = float(tape_5m)
                 sources["tape"] = "ws" if tape_5m is not None else "none"
 
-                # extended micro
                 if ws_snap.get("tape_delta_1m_notional") is not None:
                     tape_1m_notional = float(ws_snap.get("tape_delta_1m_notional"))
                 if ws_snap.get("tape_delta_5m_notional") is not None:
@@ -2654,7 +2695,7 @@ async def compute_full_institutional_analysis(
             except Exception:
                 warnings.append("lsr_error")
 
-        build_up_regime = _classify_build_up(bias, price_ret_1h, oi_slope)
+        build_up_regime = _classify_build_up(bias_norm, price_ret_1h, oi_slope)
 
     # Normalization (rolling z)
     oi_slope_z = _norm_update(binance_symbol, "oi_slope", oi_slope)
@@ -2668,13 +2709,13 @@ async def compute_full_institutional_analysis(
     # Regimes
     funding_regime = _classify_funding(funding_rate, z=funding_z)
     basis_regime = _classify_basis(basis_pct)
-    crowding_regime = _classify_crowding(bias, funding_rate, basis_pct, funding_z)
+    crowding_regime = _classify_crowding(bias_norm, funding_rate, basis_pct, funding_z)
     flow_regime = _classify_flow(cvd_slope, tape_5m)
     ob_regime = _classify_orderbook(ob_25)
 
     # Scoring v1 + v2
     inst_score_raw, components_raw, meta_raw = _score_institutional_v1(
-        bias,
+        bias_norm,
         oi_slope=oi_slope,
         oi_hist_slope=oi_hist_slope,
         cvd_slope=cvd_slope,
@@ -2688,7 +2729,7 @@ async def compute_full_institutional_analysis(
     )
 
     inst_score_v2, components_v2, meta_v2 = _score_institutional_v2_regime(
-        bias,
+        bias_norm,
         crowding_regime=crowding_regime,
         tape_5m=tape_5m,
         ob_imb=ob_25,
@@ -2706,7 +2747,7 @@ async def compute_full_institutional_analysis(
     )
 
     inst_score_v3, components_v3, meta_v3 = _score_institutional_v3_quality(
-        bias,
+        bias_norm,
         base_score=inst_score_v2,
         base_components=components_v2,
         crowding_regime=crowding_regime,
@@ -2716,7 +2757,6 @@ async def compute_full_institutional_analysis(
         large_trade_imb_5m=large_trade_imb_5m,
     )
 
-    # choose main score output
     inst_score_main = inst_score_v2
     components_main = components_v2
     meta_main = {"scoring": "v2_regime", "v2": meta_v2, "v1_raw": meta_raw}
