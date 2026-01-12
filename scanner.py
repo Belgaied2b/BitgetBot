@@ -2979,12 +2979,12 @@ async def scan_once(client, trader: BitgetTrader) -> None:
 
     if INST_HUB:
         try:
-        # Démarre (ou redémarre) le WS hub avec l’univers courant
-        await INST_HUB.start(symbols, shards=int(os.getenv("INST_WS_SHARDS", "4")))
-        if getattr(INST_HUB, "is_running", None) and INST_HUB.is_running():
-            logger.info("[INST_HUB] running symbols=%d", len(symbols))
-        else:
-            logger.warning("[INST_HUB] not running (check institutional_ws_hub logs)")
+            # Démarre (ou redémarre) le WS hub avec l’univers courant
+            await INST_HUB.start(symbols, shards=int(os.getenv("INST_WS_SHARDS", "4")))
+            if getattr(INST_HUB, "is_running", None) and INST_HUB.is_running():
+                logger.info("[INST_HUB] running symbols=%d", len(symbols))
+            else:
+                logger.warning("[INST_HUB] not running (check institutional_ws_hub logs)")
     except Exception as e:
         logger.debug("[INST_HUB] start failed: %s", e)
 
