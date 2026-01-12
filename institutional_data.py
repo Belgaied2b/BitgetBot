@@ -1,12 +1,16 @@
+# institutional_data.py
 # =====================================================================
 # institutional_data.py — Ultra Desk 3.1 (Bitget-only, public endpoints)
-# Bitget USDT-M Futures (Mix) — REST only + optional external WS hub
+# Bitget USDT-M Futures (Mix) — REST + optional external WS hub
 #
 # Confirmed endpoints used (Bitget API docs):
-# - GET /api/v2/mix/market/merge-depth              (orderbook)  ✅
-# - GET /api/v2/mix/market/history-fund-rate        (funding hist)✅
+# - GET /api/v2/mix/market/merge-depth              (orderbook)
+# - GET /api/v2/mix/market/history-fund-rate        (funding hist)
+# - GET /api/v2/mix/market/current-fund-rate        (current funding)  [fallback]
 #
-# Everything else is optional / best-effort (can be disabled).
+# Open interest endpoint is implemented (optional flag):
+# - GET /api/v2/mix/market/open-interest
+#
 # Keeps legacy keys to avoid KeyError: openInterest, fundingRate, binance_symbol...
 # =====================================================================
 
@@ -30,7 +34,7 @@ except Exception:  # pragma: no cover
 
 LOGGER = logging.getLogger(__name__)
 
-INST_VERSION = "UltraDesk3.1-bitget-only+trace-2026-01-12"
+INST_VERSION = "UltraDesk3.1-bitget-only+trace-2026-01-12+funding-fallback"
 
 BITGET_API_BASE = "https://api.bitget.com"
 
@@ -68,11 +72,12 @@ if INST_MODE not in ("LIGHT", "NORMAL", "FULL"):
     INST_MODE = "LIGHT"
 
 # ---------------------------------------------------------------------
-# Optional “best-effort” features (disabled by default)
-# (In your current code, these are intentionally not implemented as real fetches)
+# Optional features
+# - Current funding: enabled by default (fixes funding_rate_ok=False in LIGHT/NORMAL when WS hub isn’t running)
+# - Open interest: opt-in (can add load)
 # ---------------------------------------------------------------------
 INST_ENABLE_OPEN_INTEREST = str(os.getenv("INST_ENABLE_OPEN_INTEREST", "0")).strip() == "1"
-INST_ENABLE_CURRENT_FUNDING = str(os.getenv("INST_ENABLE_CURRENT_FUNDING", "0")).strip() == "1"
+INST_ENABLE_CURRENT_FUNDING = str(os.getenv("INST_ENABLE_CURRENT_FUNDING", "1")).strip() == "1"
 INST_ENABLE_RECENT_FILLS = str(os.getenv("INST_ENABLE_RECENT_FILLS", "0")).strip() == "1"
 INST_ENABLE_CANDLES = str(os.getenv("INST_ENABLE_CANDLES", "0")).strip() == "1"
 
@@ -103,6 +108,15 @@ _SYM_STATE: Dict[str, "SymbolBackoff"] = {}
 # ---------------------------------------------------------------------
 _SESSION: Optional[aiohttp.ClientSession] = None
 _SESSION_LOCK = asyncio.Lock()
+
+# ---------------------------------------------------------------------
+# Small caches (reduce load when scanning many symbols)
+# ---------------------------------------------------------------------
+_FUNDING_CACHE: Dict[str, Tuple[float, float, Optional[int]]] = {}  # sym -> (funding_rate, ts_s, next_update_ms)
+_OI_CACHE: Dict[str, Tuple[float, float]] = {}  # sym -> (oi_size, ts_s)
+
+_FUNDING_TTL_S = float(os.getenv("INST_FUNDING_TTL_S", "45"))
+_OI_TTL_S = float(os.getenv("INST_OI_TTL_S", "45"))
 
 
 def _now_ms() -> int:
@@ -464,7 +478,7 @@ def _norm_update(sym: str, metric: str, value: Optional[float]) -> Optional[floa
 
 
 # =====================================================================
-# Bitget confirmed endpoints (docs)
+# Bitget confirmed endpoints
 # =====================================================================
 
 async def _fetch_merge_depth(symbol: str) -> Optional[Dict[str, Any]]:
@@ -498,6 +512,85 @@ async def _fetch_funding_history(symbol: str, limit: int = 30) -> Optional[List[
     if not isinstance(d, list) or not d:
         return None
     return d
+
+
+async def _fetch_current_funding_rate(symbol: str) -> Tuple[Optional[float], Optional[int]]:
+    # small TTL cache
+    now_s = time.time()
+    c = _FUNDING_CACHE.get(symbol)
+    if c is not None:
+        fr, ts_s, next_ms = c
+        if (now_s - ts_s) <= float(_FUNDING_TTL_S):
+            return fr, next_ms
+
+    data = await _http_get(
+        "/api/v2/mix/market/current-fund-rate",
+        params={"productType": INST_BITGET_PRODUCT_TYPE, "symbol": symbol},
+        symbol=symbol,
+    )
+    if not isinstance(data, dict):
+        return None, None
+    arr = data.get("data")
+    if not isinstance(arr, list) or not arr:
+        return None, None
+
+    d0 = arr[0]
+    if not isinstance(d0, dict):
+        return None, None
+
+    try:
+        fr = float(d0.get("fundingRate"))
+    except Exception:
+        fr = None
+
+    next_ms = None
+    try:
+        nu = d0.get("nextUpdate")
+        if nu is not None:
+            next_ms = int(float(nu))
+    except Exception:
+        next_ms = None
+
+    if fr is not None:
+        _FUNDING_CACHE[symbol] = (float(fr), now_s, next_ms)
+
+    return fr, next_ms
+
+
+async def _fetch_open_interest(symbol: str) -> Optional[float]:
+    now_s = time.time()
+    c = _OI_CACHE.get(symbol)
+    if c is not None:
+        oi, ts_s = c
+        if (now_s - ts_s) <= float(_OI_TTL_S):
+            return oi
+
+    data = await _http_get(
+        "/api/v2/mix/market/open-interest",
+        params={"productType": INST_BITGET_PRODUCT_TYPE, "symbol": symbol},
+        symbol=symbol,
+    )
+    if not isinstance(data, dict):
+        return None
+    d = data.get("data")
+    if not isinstance(d, dict):
+        return None
+    lst = d.get("openInterestList")
+    if not isinstance(lst, list) or not lst:
+        return None
+    d0 = lst[0]
+    if not isinstance(d0, dict):
+        return None
+
+    try:
+        oi = float(d0.get("size"))
+    except Exception:
+        oi = None
+
+    if oi is not None:
+        _OI_CACHE[symbol] = (float(oi), now_s)
+
+    return oi
 
 
 def _compute_funding_stats_bitget(hist: Optional[List[Dict[str, Any]]]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
@@ -602,6 +695,7 @@ async def compute_full_institutional_analysis(
     include_liquidations: bool = False,  # kept for signature compatibility
     mode: Optional[str] = None,
 ) -> Dict[str, Any]:
+    _ = include_liquidations  # not used in bitget-only build
     bias = (bias or "").upper().strip()
     eff_mode = (mode or INST_MODE).upper().strip()
     if eff_mode not in ("LIGHT", "NORMAL", "FULL"):
@@ -639,6 +733,7 @@ async def compute_full_institutional_analysis(
         spread_bps = _compute_spread_bps_from_depth(depth)
         microprice = _compute_microprice_from_depth(depth)
 
+    # Funding history only in FULL
     funding_mean = funding_std = funding_z = None
     if eff_mode == "FULL":
         hist = await _fetch_funding_history(sym, limit=30)
@@ -649,32 +744,57 @@ async def compute_full_institutional_analysis(
             funding_mean, funding_std, funding_z = _compute_funding_stats_bitget(hist)
             sources["funding_hist"] = "bitget_rest"
 
-    funding_rate = None
-    tape_5m = None
+    # Current funding / OI: prefer WS hub, fallback to REST (funding enabled by default)
+    funding_rate: Optional[float] = None
+    next_funding_time_ms: Optional[int] = None
+    tape_5m: Optional[float] = None
+    oi_value: Optional[float] = None
+
     if ws_snap is not None:
         try:
             if ws_snap.get("funding_rate") is not None:
                 funding_rate = float(ws_snap.get("funding_rate"))
                 sources["funding_rate"] = "ws_hub"
+            if ws_snap.get("next_funding_time_ms") is not None:
+                next_funding_time_ms = int(float(ws_snap.get("next_funding_time_ms")))
+                sources["next_funding_time"] = "ws_hub"
             if ws_snap.get("tape_delta_5m") is not None:
                 tape_5m = float(ws_snap.get("tape_delta_5m"))
                 sources["tape"] = "ws_hub"
+            if ws_snap.get("open_interest") is not None:
+                oi_value = float(ws_snap.get("open_interest"))
+                sources["oi"] = "ws_hub"
         except Exception:
             warnings.append("ws_parse_error")
 
-    # Optional best-effort (still not implemented here)
-    oi_value = None
-    if INST_ENABLE_OPEN_INTEREST:
-        warnings.append("open_interest_not_implemented_in_this_file")
-        sources["oi"] = "flag_enabled_but_not_implemented"
+    # REST fallback for funding
+    if funding_rate is None and INST_ENABLE_CURRENT_FUNDING:
+        fr, nu = await _fetch_current_funding_rate(sym)
+        if fr is not None:
+            funding_rate = float(fr)
+            sources["funding_rate"] = "bitget_rest"
+        else:
+            warnings.append("no_current_funding")
+            sources["funding_rate"] = sources.get("funding_rate", "none")
+        if nu is not None:
+            next_funding_time_ms = int(nu)
+            sources["next_funding_time"] = sources.get("next_funding_time", "bitget_rest")
 
-    if INST_ENABLE_CURRENT_FUNDING and funding_rate is None:
-        warnings.append("current_funding_flag_on_but_ws_missing")
-        sources["funding_rate"] = sources.get("funding_rate", "flag_on_but_missing")
+    # REST open interest (opt-in)
+    if oi_value is None and INST_ENABLE_OPEN_INTEREST:
+        oi = await _fetch_open_interest(sym)
+        if oi is not None:
+            oi_value = float(oi)
+            sources["oi"] = "bitget_rest"
+        else:
+            warnings.append("no_open_interest")
+            sources["oi"] = sources.get("oi", "none")
 
     if INST_ENABLE_RECENT_FILLS and tape_5m is None:
-        warnings.append("recent_fills_flag_on_but_ws_missing")
-        sources["tape"] = sources.get("tape", "flag_on_but_missing")
+        warnings.append("recent_fills_flag_on_but_not_implemented_here")
+
+    if INST_ENABLE_CANDLES:
+        warnings.append("candles_flag_on_but_not_implemented_here")
 
     # Normalization
     ob_imb_z = _norm_update(sym, "ob_imb", ob_25)
@@ -684,6 +804,7 @@ async def compute_full_institutional_analysis(
     funding_regime = _classify_funding(funding_rate, z=funding_z)
     ob_regime = _classify_orderbook(ob_25)
 
+    # Score components (kept simple & compatible)
     components = {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0}
     score = 0
 
@@ -693,6 +814,10 @@ async def compute_full_institutional_analysis(
 
     if funding_rate is not None or funding_z is not None:
         components["crowding"] = 1
+        score += 1
+
+    if oi_value is not None:
+        components["oi"] = 1
         score += 1
 
     score = max(0, min(4, int(score)))
@@ -707,11 +832,12 @@ async def compute_full_institutional_analysis(
         # legacy name kept (your logs expect binance_symbol=...)
         "binance_symbol": sym,
 
-        "available": bool(depth is not None or ws_used),
+        "available": bool(depth is not None or ws_used or funding_rate is not None),
 
         "oi": oi_value,
         "oi_slope": None,
-        "cvd_slope": None,
+        "cvd_slope": None
+        ,
         "cvd_notional_5m": None,
 
         "funding_rate": funding_rate,
@@ -719,7 +845,7 @@ async def compute_full_institutional_analysis(
         "funding_mean": funding_mean,
         "funding_std": funding_std,
         "funding_z": funding_z,
-        "next_funding_time_ms": None,
+        "next_funding_time_ms": next_funding_time_ms,
 
         "basis_pct": None,
         "basis_regime": "unknown",
