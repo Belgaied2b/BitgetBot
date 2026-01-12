@@ -20,10 +20,29 @@ log = get_logger("institutional_ws_hub")
 # Settings (env overrides)
 # ========================
 
-INST_WS_URL = os.getenv("INST_WS_URL", "wss://ws.bitget.com/mix/v1/stream")
+# Bitget WebSocket v2 (public)
+# Source (endpoint): https://www.bitget.com/api-doc/common/websocket-intro
+INST_WS_URL = os.getenv("INST_WS_URL", "wss://ws.bitget.com/v2/ws/public")
 
-# ton choix historique: "mc" (on ne change pas)
-INST_PRODUCT_TYPE = os.getenv("INST_PRODUCT_TYPE_WS", "mc")
+# Bitget contract WS v2 expects instType like: USDT-FUTURES / COIN-FUTURES / USDC-FUTURES
+# Source (instType/instId format): https://www.bitget.com/api-doc/contract/websocket/public/Order-Book-Channel
+_INST_TYPE_RAW = os.getenv("INST_WS_INST_TYPE") or os.getenv("INST_PRODUCT_TYPE_WS") or "USDT-FUTURES"
+
+def _normalize_inst_type(v: str) -> str:
+    v0 = (v or "").strip()
+    v1 = v0.upper().replace("_", "-")
+    alias = {
+        "MC": "USDT-FUTURES",
+        "UMCBL": "USDT-FUTURES",
+        "USDT": "USDT-FUTURES",
+        "USDT-FUTURE": "USDT-FUTURES",
+        "COIN": "COIN-FUTURES",
+        "DMCBL": "COIN-FUTURES",
+        "USDC": "USDC-FUTURES",
+    }
+    return alias.get(v1, v1)
+
+INST_PRODUCT_TYPE = _normalize_inst_type(_INST_TYPE_RAW)
 
 INST_WS_SHARDS = int(float(os.getenv("INST_WS_SHARDS", "4")))
 
@@ -66,26 +85,13 @@ def _norm_symbol(sym: str) -> str:
     return (sym or "").strip().upper()
 
 
-def _candidate_inst_ids(sym: str) -> List[str]:
+def _candidate_inst_ids(sym: str, product_type: str):
     """
-    Essaie plusieurs variantes (sans suffixe / _UMCBL / _DMCBL).
+    Bitget contract WS v2 uses plain instId like 'BTCUSDT' (no _UMCBL suffix)
+    Source: https://www.bitget.com/api-doc/contract/websocket/public/Order-Book-Channel
     """
-    s = _norm_symbol(sym)
-    out: List[str] = []
-
-    def add(x: str) -> None:
-        x = _norm_symbol(x)
-        if x and x not in out:
-            out.append(x)
-
-    add(s)
-
-    if s.endswith("_UMCBL") or s.endswith("_DMCBL") or s.endswith("_CMCBL"):
-        return out
-
-    add(f"{s}_UMCBL")
-    add(f"{s}_DMCBL")
-    return out
+    sym = (sym or "").upper().strip()
+    return [sym]
 
 
 def _depth_usd(levels: List[Any], topn: int = 5) -> Optional[float]:
