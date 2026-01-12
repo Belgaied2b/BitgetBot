@@ -24,7 +24,7 @@ log = get_logger("institutional_ws_hub")
 # Bitget WebSocket v2 (public)
 INST_WS_URL = os.getenv("INST_WS_URL", "wss://ws.bitget.com/v2/ws/public")
 
-# Bitget futures WS v2 expects instType like: USDT-FUTURES / COIN-FUTURES / USDC-FUTURES
+# Bitget contract WS v2 expects instType like: USDT-FUTURES / COIN-FUTURES / USDC-FUTURES
 _INST_TYPE_RAW = os.getenv("INST_WS_INST_TYPE") or os.getenv("INST_PRODUCT_TYPE_WS") or "USDT-FUTURES"
 
 
@@ -58,7 +58,7 @@ INST_WS_STALE_S = float(os.getenv("INST_WS_STALE_S", "15"))
 # Tape window for delta computation
 TAPE_WINDOW_S = float(os.getenv("INST_TAPE_WINDOW_S", "300"))  # 5 minutes
 
-# Channels (futures public WS)
+# Channels (Bitget Futures WS public)
 CHAN_BOOKS = "books5"
 CHAN_TRADES = "trade"
 CHAN_TICKER = "ticker"
@@ -77,30 +77,24 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
-def _norm_symbol(sym: str) -> str:
-    return (sym or "").strip().upper()
-
-
-def _parse_ts_ms(d: Dict[str, Any]) -> int:
-    """
-    Bitget WS payloads often include `ts` in ms (string/int).
-    Fall back to local time if absent/unparseable.
-    """
-    ts = d.get("ts")
+def _safe_int(x: Any) -> Optional[int]:
     try:
-        if ts is None:
-            return _now_ms()
-        # sometimes it's string
-        return int(float(ts))
+        if x is None:
+            return None
+        return int(float(x))
     except Exception:
-        return _now_ms()
+        return None
 
 
-def _candidate_inst_ids(sym: str) -> List[str]:
-    """
-    Bitget futures WS v2 uses plain instId like 'BTCUSDT' (no _UMCBL suffix).
-    """
-    sym = (sym or "").upper().strip()
+def _norm_symbol(sym: str) -> str:
+    return (sym or "").strip().upper().replace("-", "").replace("_", "")
+
+
+def _candidate_inst_ids(sym: str, product_type: str) -> List[str]:
+    # For Bitget Futures WS v2, instId is typically like "BTCUSDT"
+    # (no _UMCBL suffix for v2 public channels)
+    _ = product_type  # reserved if you want per-product variants later
+    sym = _norm_symbol(sym)
     return [sym] if sym else []
 
 
@@ -145,7 +139,8 @@ class _TickerState:
     mark_price: Optional[float] = None
     index_price: Optional[float] = None
     funding: Optional[float] = None
-    holding: Optional[float] = None  # holdingAmount (open interest proxy in Bitget ticker)
+    holding: Optional[float] = None
+    next_funding_time_ms: Optional[int] = None
     ts_ms: int = field(default_factory=_now_ms)
 
 
@@ -155,9 +150,8 @@ class _SymbolState:
     book: _BookState = field(default_factory=_BookState)
     trade: _TradeState = field(default_factory=_TradeState)
     ticker: _TickerState = field(default_factory=_TickerState)
-
     # rolling signed notional for tape delta
-    tape: Deque[Tuple[int, float]] = field(default_factory=lambda: deque(maxlen=8000))
+    tape: Deque[Tuple[int, float]] = field(default_factory=lambda: deque(maxlen=6000))
 
 
 # ========================
@@ -188,11 +182,10 @@ class InstitutionalWSHubShard:
     def _compute_tape_delta_5m(self, st: _SymbolState) -> Optional[float]:
         if not st.tape:
             return None
-
         now_ms = _now_ms()
         cutoff = now_ms - int(TAPE_WINDOW_S * 1000.0)
 
-        # purge old (left side)
+        # purge old
         while st.tape and st.tape[0][0] < cutoff:
             st.tape.popleft()
 
@@ -216,18 +209,16 @@ class InstitutionalWSHubShard:
 
         tape_5m = self._compute_tape_delta_5m(st)
 
-        # IMPORTANT: format attendu par institutional_data.py:
-        # - available: bool
-        # - ts: float (seconds)
         return {
             "available": bool(available),
             "ts": float(latest_ms / 1000.0),
             "symbol": sym,
 
-            # fields directly usable by institutional_data.py
+            # fields used by institutional_data.py
             "funding_rate": st.ticker.funding,
             "open_interest": st.ticker.holding,
             "tape_delta_5m": tape_5m,
+            "next_funding_time_ms": st.ticker.next_funding_time_ms,
 
             # extra debug/info
             "best_bid": st.book.best_bid,
@@ -270,7 +261,6 @@ class InstitutionalWSHubShard:
                 pass
 
     async def _safe_send(self, payload: Any) -> None:
-        # avoid concurrent writes when closing/reconnecting
         async with self._send_lock:
             if not self._ws or self._ws.closed:
                 return
@@ -292,7 +282,7 @@ class InstitutionalWSHubShard:
 
         args: List[Dict[str, str]] = []
         for sym in self.symbols:
-            for inst_id in _candidate_inst_ids(sym):
+            for inst_id in _candidate_inst_ids(sym, inst_type):
                 for ch in channels:
                     args.append({"instType": inst_type, "channel": ch, "instId": inst_id})
 
@@ -300,10 +290,10 @@ class InstitutionalWSHubShard:
             return
 
         batch_size = max(50, int(INST_WS_SUB_BATCH))
-        log.info(f"[WS_HUB:hub{self.shard_id}] subscribing args={len(args)} batch={batch_size} instType={inst_type}")
+        log.info(f"[WS_HUB:hub{self.shard_id}] subscribing args={len(args)} batch={batch_size}")
 
         for i in range(0, len(args), batch_size):
-            batch = args[i:i + batch_size]
+            batch = args[i: i + batch_size]
             if not self._ws or self._ws.closed:
                 break
             await self._safe_send({"op": "subscribe", "args": batch})
@@ -317,7 +307,7 @@ class InstitutionalWSHubShard:
             idle = time.monotonic() - self._last_msg_monotonic
             if idle < float(INST_WS_PING_INTERVAL_S):
                 continue
-            # Bitget WS v2 heartbeat expects plain "ping" / "pong"
+            # Bitget WS v2 commonly accepts "ping" / returns "pong"
             await self._safe_send("ping")
 
     async def _run_forever(self) -> None:
@@ -350,28 +340,20 @@ class InstitutionalWSHubShard:
                         txt = msg.data
                         if txt == "pong":
                             continue
-                        if txt == "ping":
-                            # server heartbeat
-                            await self._safe_send("pong")
-                            continue
                         await self._handle_text(txt)
 
                     elif msg.type == aiohttp.WSMsgType.BINARY:
-                        # some deployments may gzip binary frames
+                        raw = msg.data
+                        # Some deployments may compress; handle best-effort
                         try:
-                            raw = msg.data
-                            try:
-                                txt = raw.decode("utf-8")
-                            except Exception:
-                                txt = gzip.decompress(raw).decode("utf-8")
-                            if txt == "pong":
-                                continue
-                            if txt == "ping":
-                                await self._safe_send("pong")
-                                continue
-                            await self._handle_text(txt)
+                            if raw[:2] == b"\x1f\x8b":
+                                raw = gzip.decompress(raw)
+                            txt = raw.decode("utf-8", errors="ignore")
                         except Exception:
                             continue
+                        if txt == "pong":
+                            continue
+                        await self._handle_text(txt)
 
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                         break
@@ -403,7 +385,7 @@ class InstitutionalWSHubShard:
         if not isinstance(payload, dict):
             return
 
-        # event frames (subscribe/unsubscribe/error)
+        # event frames (subscribe/unsubscribe/errors)
         if payload.get("event"):
             if payload.get("event") == "error":
                 log.warning(f"[WS_HUB:hub{self.shard_id}] ws event error: {payload}")
@@ -421,7 +403,6 @@ class InstitutionalWSHubShard:
 
         inst_id = _norm_symbol(inst_id)
 
-        # states indexed by base symbol (e.g. SANDUSDT)
         st = self._states.get(inst_id)
         if st is None:
             base = inst_id.split("_")[0]
@@ -429,14 +410,17 @@ class InstitutionalWSHubShard:
         if st is None:
             return
 
-        # books5/ticker usually send a list with one dict; trades can send multiple
-        if channel == CHAN_BOOKS:
-            d0 = data[0] if data else None
-            if not isinstance(d0, dict):
-                return
+        d0 = data[0] if data else None
+        if not isinstance(d0, dict):
+            return
 
+        # Prefer exchange timestamp if present
+        ts_ms = _safe_int(d0.get("ts")) or _safe_int(payload.get("ts")) or _now_ms()
+
+        if channel == CHAN_BOOKS:
             asks = d0.get("asks") or []
             bids = d0.get("bids") or []
+
             if asks:
                 st.book.best_ask = _safe_float(asks[0][0])
             if bids:
@@ -449,54 +433,34 @@ class InstitutionalWSHubShard:
 
             st.book.bid_depth_usd = _depth_usd(bids, topn=5)
             st.book.ask_depth_usd = _depth_usd(asks, topn=5)
-            st.book.ts_ms = _parse_ts_ms(d0)
+            st.book.ts_ms = ts_ms
 
         elif channel == CHAN_TRADES:
-            # process ALL trades in the frame (important for tape delta)
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                px = _safe_float(item.get("price") or item.get("px"))
-                sz = _safe_float(item.get("size") or item.get("sz"))
-                side = item.get("side")
-                ts_ms = _parse_ts_ms(item)
+            # Trade channel commonly provides px/sz/side/ts
+            px = _safe_float(d0.get("price") or d0.get("px"))
+            sz = _safe_float(d0.get("size") or d0.get("sz"))
+            side = d0.get("side")
 
-                if px is not None:
-                    st.trade.last_price = px
-                if sz is not None:
-                    st.trade.last_size = sz
-                if side:
-                    st.trade.last_side = side
-                st.trade.ts_ms = ts_ms
+            st.trade.last_price = px
+            st.trade.last_size = sz
+            st.trade.last_side = side
+            st.trade.ts_ms = ts_ms
 
-                # tape delta: signed notional (buy +, sell -)
-                if px is not None and sz is not None and side:
-                    notional = float(px) * float(sz)
-                    sgn = 1.0 if str(side).lower() in ("buy", "b") else -1.0
-                    st.tape.append((ts_ms, sgn * notional))
+            # tape delta: signed notional (buy +, sell -)
+            if px is not None and sz is not None and side:
+                notional = float(px) * float(sz)
+                sgn = 1.0 if str(side).lower() in ("buy", "b") else -1.0
+                st.tape.append((ts_ms, sgn * notional))
 
         elif channel == CHAN_TICKER:
-            d0 = data[0] if data else None
-            if not isinstance(d0, dict):
-                return
-
             st.ticker.mark_price = _safe_float(d0.get("markPrice") or d0.get("mark_price"))
             st.ticker.index_price = _safe_float(d0.get("indexPrice") or d0.get("index_price"))
 
-            st.ticker.funding = _safe_float(
-                d0.get("fundingRate")
-                or d0.get("capitalRate")
-                or d0.get("funding_rate")
-            )
+            st.ticker.funding = _safe_float(d0.get("fundingRate") or d0.get("capitalRate") or d0.get("funding_rate"))
+            st.ticker.holding = _safe_float(d0.get("holdingAmount") or d0.get("holding") or d0.get("openInterest") or d0.get("open_interest"))
+            st.ticker.next_funding_time_ms = _safe_int(d0.get("nextFundingTime") or d0.get("next_funding_time"))
 
-            st.ticker.holding = _safe_float(
-                d0.get("holdingAmount")
-                or d0.get("holding")
-                or d0.get("openInterest")
-                or d0.get("open_interest")
-            )
-
-            st.ticker.ts_ms = _parse_ts_ms(d0)
+            st.ticker.ts_ms = ts_ms
 
 
 # ========================
