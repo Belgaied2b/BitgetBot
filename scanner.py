@@ -57,9 +57,10 @@ except Exception:
     score_options_context = None  # type: ignore
 
 try:
-    from institutional_ws_hub import InstitutionalWSHub  # type: ignore
+    # Singleton partagé avec institutional_data.py
+    from institutional_ws_hub import HUB as INST_HUB  # type: ignore
 except Exception:
-    InstitutionalWSHub = None  # type: ignore
+    INST_HUB = None  # type: ignore
 
 from settings import (
     API_KEY,
@@ -200,8 +201,6 @@ TICK_LOCK = asyncio.Lock()
 MACRO_CACHE = MacroCache() if MacroCache else None
 OPTIONS_CACHE = OptionsCache() if OptionsCache else None
 
-INST_HUB = InstitutionalWSHub() if InstitutionalWSHub else None
-_INST_SYMBOLS_LAST: List[str] = []
 
 # =====================================================================
 # Premium watcher policy — killzones / options veto / distribution / time stop
@@ -2979,13 +2978,15 @@ async def scan_once(client, trader: BitgetTrader) -> None:
     logger.info("📊 Scan %d symboles (TOP_N_SYMBOLS=%s)", len(symbols), TOP_N_SYMBOLS)
 
     if INST_HUB:
-        global _INST_SYMBOLS_LAST
-        try:
-            if symbols != _INST_SYMBOLS_LAST:
-                await INST_HUB.set_symbols(symbols)
-                _INST_SYMBOLS_LAST = list(symbols)
-        except Exception as e:
-            logger.debug("INST_HUB set_symbols failed: %s", e)
+    try:
+        # Démarre (ou redémarre) le WS hub avec l’univers courant
+        await INST_HUB.start(symbols, shards=int(os.getenv("INST_WS_SHARDS", "4")))
+        if getattr(INST_HUB, "is_running", None) and INST_HUB.is_running():
+            logger.info("[INST_HUB] running symbols=%d", len(symbols))
+        else:
+            logger.warning("[INST_HUB] not running (check institutional_ws_hub logs)")
+    except Exception as e:
+        logger.debug("[INST_HUB] start failed: %s", e)
 
     analyze_sem = asyncio.Semaphore(int(MAX_CONCURRENT_ANALYZE))
 
@@ -3135,12 +3136,6 @@ async def start_scanner() -> None:
 
     await _bootstrap_risk_open_positions(trader)
 
-    if INST_HUB:
-        try:
-            await INST_HUB.start([], product_type=trader.product_type)
-            logger.info("[INST_HUB] started")
-        except Exception as e:
-            logger.warning("[INST_HUB] start failed: %s", e)
 
     _ensure_watcher(trader)
 
