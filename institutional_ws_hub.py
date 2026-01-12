@@ -2,6 +2,7 @@
 # Bitget WS Hub (institutional) — robuste + compatible institutional_data.py
 
 import asyncio
+import gzip
 import json
 import os
 import random
@@ -21,12 +22,11 @@ log = get_logger("institutional_ws_hub")
 # ========================
 
 # Bitget WebSocket v2 (public)
-# Source (endpoint): https://www.bitget.com/api-doc/common/websocket-intro
 INST_WS_URL = os.getenv("INST_WS_URL", "wss://ws.bitget.com/v2/ws/public")
 
-# Bitget contract WS v2 expects instType like: USDT-FUTURES / COIN-FUTURES / USDC-FUTURES
-# Source (instType/instId format): https://www.bitget.com/api-doc/contract/websocket/public/Order-Book-Channel
+# Bitget futures WS v2 expects instType like: USDT-FUTURES / COIN-FUTURES / USDC-FUTURES
 _INST_TYPE_RAW = os.getenv("INST_WS_INST_TYPE") or os.getenv("INST_PRODUCT_TYPE_WS") or "USDT-FUTURES"
+
 
 def _normalize_inst_type(v: str) -> str:
     v0 = (v or "").strip()
@@ -42,10 +42,10 @@ def _normalize_inst_type(v: str) -> str:
     }
     return alias.get(v1, v1)
 
+
 INST_PRODUCT_TYPE = _normalize_inst_type(_INST_TYPE_RAW)
 
 INST_WS_SHARDS = int(float(os.getenv("INST_WS_SHARDS", "4")))
-
 INST_WS_SUB_BATCH = int(float(os.getenv("INST_WS_SUB_BATCH", "200")))
 
 INST_WS_PING_INTERVAL_S = float(os.getenv("INST_WS_PING_INTERVAL_S", "15"))
@@ -58,7 +58,7 @@ INST_WS_STALE_S = float(os.getenv("INST_WS_STALE_S", "15"))
 # Tape window for delta computation
 TAPE_WINDOW_S = float(os.getenv("INST_TAPE_WINDOW_S", "300"))  # 5 minutes
 
-# Channels
+# Channels (futures public WS)
 CHAN_BOOKS = "books5"
 CHAN_TRADES = "trade"
 CHAN_TICKER = "ticker"
@@ -66,10 +66,6 @@ CHAN_TICKER = "ticker"
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
-
-def _now_s() -> float:
-    return float(time.time())
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -85,13 +81,27 @@ def _norm_symbol(sym: str) -> str:
     return (sym or "").strip().upper()
 
 
-def _candidate_inst_ids(sym: str, product_type: str):
+def _parse_ts_ms(d: Dict[str, Any]) -> int:
     """
-    Bitget contract WS v2 uses plain instId like 'BTCUSDT' (no _UMCBL suffix)
-    Source: https://www.bitget.com/api-doc/contract/websocket/public/Order-Book-Channel
+    Bitget WS payloads often include `ts` in ms (string/int).
+    Fall back to local time if absent/unparseable.
+    """
+    ts = d.get("ts")
+    try:
+        if ts is None:
+            return _now_ms()
+        # sometimes it's string
+        return int(float(ts))
+    except Exception:
+        return _now_ms()
+
+
+def _candidate_inst_ids(sym: str) -> List[str]:
+    """
+    Bitget futures WS v2 uses plain instId like 'BTCUSDT' (no _UMCBL suffix).
     """
     sym = (sym or "").upper().strip()
-    return [sym]
+    return [sym] if sym else []
 
 
 def _depth_usd(levels: List[Any], topn: int = 5) -> Optional[float]:
@@ -135,7 +145,7 @@ class _TickerState:
     mark_price: Optional[float] = None
     index_price: Optional[float] = None
     funding: Optional[float] = None
-    holding: Optional[float] = None
+    holding: Optional[float] = None  # holdingAmount (open interest proxy in Bitget ticker)
     ts_ms: int = field(default_factory=_now_ms)
 
 
@@ -147,7 +157,7 @@ class _SymbolState:
     ticker: _TickerState = field(default_factory=_TickerState)
 
     # rolling signed notional for tape delta
-    tape: Deque[Tuple[int, float]] = field(default_factory=lambda: deque(maxlen=5000))
+    tape: Deque[Tuple[int, float]] = field(default_factory=lambda: deque(maxlen=8000))
 
 
 # ========================
@@ -178,10 +188,11 @@ class InstitutionalWSHubShard:
     def _compute_tape_delta_5m(self, st: _SymbolState) -> Optional[float]:
         if not st.tape:
             return None
+
         now_ms = _now_ms()
         cutoff = now_ms - int(TAPE_WINDOW_S * 1000.0)
 
-        # purge old
+        # purge old (left side)
         while st.tape and st.tape[0][0] < cutoff:
             st.tape.popleft()
 
@@ -191,7 +202,7 @@ class InstitutionalWSHubShard:
         s = 0.0
         for _, v in st.tape:
             s += float(v)
-        return float(s) if abs(s) > 0 else 0.0
+        return float(s)
 
     def snapshot(self, symbol: str) -> Dict[str, Any]:
         sym = _norm_symbol(symbol)
@@ -205,7 +216,7 @@ class InstitutionalWSHubShard:
 
         tape_5m = self._compute_tape_delta_5m(st)
 
-        # IMPORTANT: format attendu par institutional_data.py :
+        # IMPORTANT: format attendu par institutional_data.py:
         # - available: bool
         # - ts: float (seconds)
         return {
@@ -218,7 +229,7 @@ class InstitutionalWSHubShard:
             "open_interest": st.ticker.holding,
             "tape_delta_5m": tape_5m,
 
-            # extra debug/info (optional)
+            # extra debug/info
             "best_bid": st.book.best_bid,
             "best_ask": st.book.best_ask,
             "spread": st.book.spread,
@@ -259,7 +270,7 @@ class InstitutionalWSHubShard:
                 pass
 
     async def _safe_send(self, payload: Any) -> None:
-        # avoids concurrent writes when closing/reconnecting
+        # avoid concurrent writes when closing/reconnecting
         async with self._send_lock:
             if not self._ws or self._ws.closed:
                 return
@@ -269,7 +280,7 @@ class InstitutionalWSHubShard:
                 else:
                     await self._ws.send_str(json.dumps(payload))
             except Exception as e:
-                log.warning(f"[WS_HUB:hub{self.shard_id}] ws error: {e}")
+                log.warning(f"[WS_HUB:hub{self.shard_id}] ws send error: {e}")
                 await self._close_ws()
 
     async def _subscribe(self) -> None:
@@ -289,10 +300,10 @@ class InstitutionalWSHubShard:
             return
 
         batch_size = max(50, int(INST_WS_SUB_BATCH))
-        log.info(f"[WS_HUB:hub{self.shard_id}] subscribing args={len(args)} batch={batch_size}")
+        log.info(f"[WS_HUB:hub{self.shard_id}] subscribing args={len(args)} batch={batch_size} instType={inst_type}")
 
         for i in range(0, len(args), batch_size):
-            batch = args[i : i + batch_size]
+            batch = args[i:i + batch_size]
             if not self._ws or self._ws.closed:
                 break
             await self._safe_send({"op": "subscribe", "args": batch})
@@ -306,6 +317,7 @@ class InstitutionalWSHubShard:
             idle = time.monotonic() - self._last_msg_monotonic
             if idle < float(INST_WS_PING_INTERVAL_S):
                 continue
+            # Bitget WS v2 heartbeat expects plain "ping" / "pong"
             await self._safe_send("ping")
 
     async def _run_forever(self) -> None:
@@ -338,7 +350,29 @@ class InstitutionalWSHubShard:
                         txt = msg.data
                         if txt == "pong":
                             continue
+                        if txt == "ping":
+                            # server heartbeat
+                            await self._safe_send("pong")
+                            continue
                         await self._handle_text(txt)
+
+                    elif msg.type == aiohttp.WSMsgType.BINARY:
+                        # some deployments may gzip binary frames
+                        try:
+                            raw = msg.data
+                            try:
+                                txt = raw.decode("utf-8")
+                            except Exception:
+                                txt = gzip.decompress(raw).decode("utf-8")
+                            if txt == "pong":
+                                continue
+                            if txt == "ping":
+                                await self._safe_send("pong")
+                                continue
+                            await self._handle_text(txt)
+                        except Exception:
+                            continue
+
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                         break
 
@@ -369,7 +403,7 @@ class InstitutionalWSHubShard:
         if not isinstance(payload, dict):
             return
 
-        # event frames
+        # event frames (subscribe/unsubscribe/error)
         if payload.get("event"):
             if payload.get("event") == "error":
                 log.warning(f"[WS_HUB:hub{self.shard_id}] ws event error: {payload}")
@@ -387,7 +421,7 @@ class InstitutionalWSHubShard:
 
         inst_id = _norm_symbol(inst_id)
 
-        # state index uses base symbol (SANDUSDT), but inst_id may be SANDUSDT_UMCBL
+        # states indexed by base symbol (e.g. SANDUSDT)
         st = self._states.get(inst_id)
         if st is None:
             base = inst_id.split("_")[0]
@@ -395,11 +429,12 @@ class InstitutionalWSHubShard:
         if st is None:
             return
 
-        d0 = data[0] if data else None
-        if not isinstance(d0, dict):
-            return
-
+        # books5/ticker usually send a list with one dict; trades can send multiple
         if channel == CHAN_BOOKS:
+            d0 = data[0] if data else None
+            if not isinstance(d0, dict):
+                return
+
             asks = d0.get("asks") or []
             bids = d0.get("bids") or []
             if asks:
@@ -414,29 +449,45 @@ class InstitutionalWSHubShard:
 
             st.book.bid_depth_usd = _depth_usd(bids, topn=5)
             st.book.ask_depth_usd = _depth_usd(asks, topn=5)
-            st.book.ts_ms = _now_ms()
+            st.book.ts_ms = _parse_ts_ms(d0)
 
         elif channel == CHAN_TRADES:
-            px = _safe_float(d0.get("price") or d0.get("px"))
-            sz = _safe_float(d0.get("size") or d0.get("sz"))
-            side = d0.get("side")
+            # process ALL trades in the frame (important for tape delta)
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                px = _safe_float(item.get("price") or item.get("px"))
+                sz = _safe_float(item.get("size") or item.get("sz"))
+                side = item.get("side")
+                ts_ms = _parse_ts_ms(item)
 
-            st.trade.last_price = px
-            st.trade.last_size = sz
-            st.trade.last_side = side
-            st.trade.ts_ms = _now_ms()
+                if px is not None:
+                    st.trade.last_price = px
+                if sz is not None:
+                    st.trade.last_size = sz
+                if side:
+                    st.trade.last_side = side
+                st.trade.ts_ms = ts_ms
 
-            # tape delta: signed notional (buy +, sell -)
-            if px is not None and sz is not None and side:
-                notional = float(px) * float(sz)
-                sgn = 1.0 if str(side).lower() in ("buy", "b") else -1.0
-                st.tape.append((_now_ms(), sgn * notional))
+                # tape delta: signed notional (buy +, sell -)
+                if px is not None and sz is not None and side:
+                    notional = float(px) * float(sz)
+                    sgn = 1.0 if str(side).lower() in ("buy", "b") else -1.0
+                    st.tape.append((ts_ms, sgn * notional))
 
         elif channel == CHAN_TICKER:
+            d0 = data[0] if data else None
+            if not isinstance(d0, dict):
+                return
+
             st.ticker.mark_price = _safe_float(d0.get("markPrice") or d0.get("mark_price"))
             st.ticker.index_price = _safe_float(d0.get("indexPrice") or d0.get("index_price"))
 
-            st.ticker.funding = _safe_float(d0.get("fundingRate") or d0.get("capitalRate") or d0.get("funding_rate"))
+            st.ticker.funding = _safe_float(
+                d0.get("fundingRate")
+                or d0.get("capitalRate")
+                or d0.get("funding_rate")
+            )
 
             st.ticker.holding = _safe_float(
                 d0.get("holdingAmount")
@@ -445,7 +496,7 @@ class InstitutionalWSHubShard:
                 or d0.get("open_interest")
             )
 
-            st.ticker.ts_ms = _now_ms()
+            st.ticker.ts_ms = _parse_ts_ms(d0)
 
 
 # ========================
@@ -509,7 +560,6 @@ class _HubController:
     def __init__(self):
         self._hub: Optional[InstitutionalWSHub] = None
         self._lock = asyncio.Lock()
-        self._started = False
         self._symbols_fingerprint: Optional[Tuple[str, ...]] = None
 
     def is_running(self) -> bool:
@@ -536,7 +586,6 @@ class _HubController:
             self._hub = InstitutionalWSHub(list(syms), shards=shards)
             self._symbols_fingerprint = syms
             await self._hub.start()
-            self._started = True
 
     async def stop(self) -> None:
         async with self._lock:
@@ -547,7 +596,6 @@ class _HubController:
                     pass
             self._hub = None
             self._symbols_fingerprint = None
-            self._started = False
 
     def get_snapshot(self, symbol: str) -> Dict[str, Any]:
         if self._hub is None:
