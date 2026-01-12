@@ -2978,7 +2978,7 @@ async def scan_once(client, trader: BitgetTrader) -> None:
     logger.info("📊 Scan %d symboles (TOP_N_SYMBOLS=%s)", len(symbols), TOP_N_SYMBOLS)
 
     if INST_HUB:
-    try:
+        try:
         # Démarre (ou redémarre) le WS hub avec l’univers courant
         await INST_HUB.start(symbols, shards=int(os.getenv("INST_WS_SHARDS", "4")))
         if getattr(INST_HUB, "is_running", None) and INST_HUB.is_running():
