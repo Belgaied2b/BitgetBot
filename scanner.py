@@ -2986,7 +2986,7 @@ async def scan_once(client, trader: BitgetTrader) -> None:
             else:
                 logger.warning("[INST_HUB] not running (check institutional_ws_hub logs)")
         except Exception as e:
-        logger.debug("[INST_HUB] start failed: %s", e)
+            logger.debug("[INST_HUB] start failed: %s", e)
 
     analyze_sem = asyncio.Semaphore(int(MAX_CONCURRENT_ANALYZE))
 
