@@ -1,13 +1,17 @@
 # =====================================================================
-# settings.py — Desk config (Railway env) — Hardened
+# settings.py — Desk config (Railway env) — Hardened (Bitget-aligned)
 # =====================================================================
 # Objectifs desk-lead :
-# - parsing ENV robuste + clamp + logs optionnels
+# - parsing ENV robuste + clamp
 # - cohérence des seuils (RR / inst / modes) avec garde-fous
 # - valeurs par défaut “safe prod” (pas trop strict = évite 0 signal)
 # - centralise product type / margin coin / execution modes
-# - + (NEW) grading A→E + règles d’exécution associées (auto-order vs alert-only)
-# - + (NEW) TTL / runaway / WS hub flags centralisés
+# - grading A→E + règles d’exécution associées (auto-order vs alert-only)
+# - TTL / runaway / WS hub flags centralisés
+#
+# IMPORTANT (migration Binance -> Bitget):
+# - On conserve des noms d'ENV historiques "BINANCE_*" en alias pour compat,
+#   mais ce fichier expose désormais des variables "BITGET_*" + "INST_*".
 # =====================================================================
 
 from __future__ import annotations
@@ -76,10 +80,6 @@ def _get_float(name: str, default: float, *, min_v: Optional[float] = None, max_
     return float(x)
 
 
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return float(max(lo, min(hi, float(x))))
-
-
 def _normalize_mode(x: str, *, default: str, allowed: Tuple[str, ...]) -> str:
     s = (x or "").strip().lower()
     return s if s in allowed else default
@@ -120,11 +120,47 @@ API_SECRET = _get_str("API_SECRET", "")
 API_PASSPHRASE = _get_str("API_PASSPHRASE", "")
 
 BITGET_BASE_URL = _get_str("BITGET_BASE_URL", "https://api.bitget.com")
+# Mix WS endpoint used in your logs: wss://ws.bitget.com/mix/v1/stream
+BITGET_MIX_WS_URL = _get_str("BITGET_MIX_WS_URL", "wss://ws.bitget.com/mix/v1/stream")
 
-# Product / margin
-# NOTE: Keep PRODUCT_TYPE consistent across client + trader.
-PRODUCT_TYPE = _get_str("PRODUCT_TYPE", "USDT-FUTURES")
-MARGIN_COIN = _get_str("MARGIN_COIN", "USDT")
+# Product / margin (used by private endpoints / trader)
+# NOTE: keep PRODUCT_TYPE consistent across bitget_client + bitget_trader
+PRODUCT_TYPE = _get_str("PRODUCT_TYPE", "USDT-FUTURES").strip()
+MARGIN_COIN = _get_str("MARGIN_COIN", "USDT").strip()
+
+
+def _product_type_to_inst_product_type(product_type: str) -> str:
+    """
+    institutional_data.py (Bitget v2 Mix market endpoints) expects lower-case
+    productType like "usdt-futures".
+    """
+    s = (product_type or "").strip().lower()
+    if s in ("usdt-futures", "coin-futures", "usdc-futures"):
+        return s
+    # Common internal formats:
+    if s in ("usdt-futures", "usdtfutures", "usdt_futures"):
+        return "usdt-futures"
+    if s in ("coin-futures", "coinfutures", "coin_futures"):
+        return "coin-futures"
+    if s in ("usdc-futures", "usdcfutures", "usdc_futures"):
+        return "usdc-futures"
+    # Uppercase formats:
+    if s == "usdt-futures" or s == "usdt_futures":
+        return "usdt-futures"
+    if s == "coin-futures" or s == "coin_futures":
+        return "coin-futures"
+    if s == "usdc-futures" or s == "usdc_futures":
+        return "usdc-futures"
+    # Bitget default (USDT-M)
+    return "usdt-futures"
+
+
+# Institutional (public endpoints) productType
+# If user sets INST_BITGET_PRODUCT_TYPE explicitly, it wins.
+INST_BITGET_PRODUCT_TYPE = _get_str(
+    "INST_BITGET_PRODUCT_TYPE",
+    _product_type_to_inst_product_type(PRODUCT_TYPE),
+).strip()
 
 
 # =====================================================================
@@ -173,8 +209,11 @@ SYMBOL_MAX_TRADES_PER_DAY = _get_int("SYMBOL_MAX_TRADES_PER_DAY", 0, min_v=0, ma
 # INSTITUTIONNEL / STRUCTURE / MOMENTUM FLAGS
 # =====================================================================
 
+# Align with your current scoring scale seen in logs (inst_score up to 4)
+INST_SCORE_MAX = _get_int("INST_SCORE_MAX", 4, min_v=1, max_v=10)
+
 # Institutional score minimum to accept (when data available)
-MIN_INST_SCORE = _get_int("MIN_INST_SCORE", 2, min_v=0, max_v=3)
+MIN_INST_SCORE = _get_int("MIN_INST_SCORE", 2, min_v=0, max_v=INST_SCORE_MAX)
 
 # Hard gating flags
 REQUIRE_STRUCTURE = _get_bool("REQUIRE_STRUCTURE", True)
@@ -189,16 +228,17 @@ RR_MIN_TOLERATED_WITH_INST = _get_float("RR_MIN_TOLERATED_WITH_INST", 1.20, min_
 # Desk EV mode (continuation path)
 DESK_EV_MODE = _get_bool("DESK_EV_MODE", False)
 RR_MIN_DESK_PRIORITY = _get_float("RR_MIN_DESK_PRIORITY", 1.10, min_v=0.5, max_v=5.0)
-INST_SCORE_DESK_PRIORITY = _get_int("INST_SCORE_DESK_PRIORITY", 2, min_v=0, max_v=3)
+INST_SCORE_DESK_PRIORITY = _get_int("INST_SCORE_DESK_PRIORITY", 2, min_v=0, max_v=INST_SCORE_MAX)
 
 # Guardrails: keep hierarchy coherent
-# (if user misconfigures env, we auto-fix to avoid dead bot)
 if RR_MIN_DESK_PRIORITY > RR_MIN_STRICT:
     RR_MIN_DESK_PRIORITY = RR_MIN_STRICT
 if RR_MIN_TOLERATED_WITH_INST > RR_MIN_STRICT:
     RR_MIN_TOLERATED_WITH_INST = RR_MIN_STRICT
-if INST_SCORE_DESK_PRIORITY < MIN_INST_SCORE and DESK_EV_MODE:
+if DESK_EV_MODE and INST_SCORE_DESK_PRIORITY < MIN_INST_SCORE:
     INST_SCORE_DESK_PRIORITY = MIN_INST_SCORE
+if MIN_INST_SCORE > INST_SCORE_MAX:
+    MIN_INST_SCORE = INST_SCORE_MAX
 
 # Commitment (optional future use)
 COMMITMENT_MIN = _get_float("COMMITMENT_MIN", 0.55, min_v=0.0, max_v=1.0)
@@ -208,105 +248,77 @@ if COMMITMENT_DESK_PRIORITY < COMMITMENT_MIN:
 
 
 # =====================================================================
-# ATR / STOPS / LIQUIDITÉ / TP
+# INSTITUTIONAL DATA (public endpoints) — align with institutional_data.py
 # =====================================================================
 
-ATR_LEN = _get_int("ATR_LEN", 14, min_v=5, max_v=100)
-ATR_MULT_SL = _get_float("ATR_MULT_SL", 2.5, min_v=0.5, max_v=10.0)
-ATR_MULT_SL_CAP = _get_float("ATR_MULT_SL_CAP", 3.5, min_v=0.5, max_v=15.0)
-if ATR_MULT_SL_CAP < ATR_MULT_SL:
-    ATR_MULT_SL_CAP = ATR_MULT_SL
+# Mode used by institutional_data/analyze_signal: LIGHT / NORMAL / FULL
+INST_MODE = _get_str("INST_MODE", "LIGHT").strip().upper()
+if INST_MODE not in ("LIGHT", "NORMAL", "FULL"):
+    INST_MODE = "LIGHT"
 
-# --- Stops base buffers ---
-SL_BUFFER_PCT = _get_float("SL_BUFFER_PCT", 0.0020, min_v=0.0, max_v=0.05)
-SL_BUFFER_TICKS = _get_int("SL_BUFFER_TICKS", 3, min_v=0, max_v=50)
-MIN_SL_TICKS = _get_int("MIN_SL_TICKS", 3, min_v=0, max_v=50)
-MAX_SL_PCT = _get_float("MAX_SL_PCT", 0.07, min_v=0.01, max_v=0.50)
+# Optional best-effort features (whether institutional_data should attempt them)
+INST_ENABLE_OPEN_INTEREST = _get_bool("INST_ENABLE_OPEN_INTEREST", True)
+INST_ENABLE_CURRENT_FUNDING = _get_bool("INST_ENABLE_CURRENT_FUNDING", True)
+INST_ENABLE_RECENT_FILLS = _get_bool("INST_ENABLE_RECENT_FILLS", False)
+INST_ENABLE_CANDLES = _get_bool("INST_ENABLE_CANDLES", False)
 
-STRUCT_LOOKBACK = _get_int("STRUCT_LOOKBACK", 20, min_v=10, max_v=200)
+# Normalisation (rolling z-scores)
+INST_NORM_ENABLED = _get_bool("INST_NORM_ENABLED", True)
+INST_NORM_MIN_POINTS = _get_int("INST_NORM_MIN_POINTS", 20, min_v=5, max_v=500)
+INST_NORM_WINDOW = _get_int("INST_NORM_WINDOW", 120, min_v=20, max_v=5000)
 
-# Break-even buffer
-BE_FEE_BUFFER_TICKS = _get_int("BE_FEE_BUFFER_TICKS", 1, min_v=0, max_v=25)
-
-# --- Liquidity zones (used by structure/stops) ---
-LIQ_LOOKBACK = _get_int("LIQ_LOOKBACK", 60, min_v=20, max_v=500)
-LIQ_BUFFER_PCT = _get_float("LIQ_BUFFER_PCT", 0.0008, min_v=0.0, max_v=0.02)
-LIQ_BUFFER_TICKS = _get_int("LIQ_BUFFER_TICKS", 3, min_v=0, max_v=50)
-
-# --- Stops v3 (optional / new) ---
-# Extra padding using ATR to "hide" behind liquidity (stop-hunt buffer)
-LIQ_BUFFER_ATR_MULT = _get_float("LIQ_BUFFER_ATR_MULT", 0.12, min_v=0.0, max_v=2.0)
-
-# Optional: general SL buffer can include ATR too (often 0)
-SL_BUFFER_ATR_MULT = _get_float("SL_BUFFER_ATR_MULT", 0.00, min_v=0.0, max_v=2.0)
-
-# Policies: order of preference among "LIQ,SWING,ATR" (comma-separated)
-# If SL_POLICY_DEFAULT="TIGHT": legacy behavior (pick tightest valid among all).
-SL_POLICY_DEFAULT = _get_str("SL_POLICY_DEFAULT", "TIGHT").strip().upper()
-SL_POLICY_BOS = _get_str("SL_POLICY_BOS", "SWING,LIQ,ATR").strip().upper()
-SL_POLICY_OTE = _get_str("SL_POLICY_OTE", "LIQ,SWING,ATR").strip().upper()
-SL_POLICY_INST = _get_str("SL_POLICY_INST", "LIQ,SWING,ATR").strip().upper()
-
-# --- TP policy ---
-TP1_R_CLAMP_MIN = _get_float("TP1_R_CLAMP_MIN", 1.4, min_v=0.5, max_v=5.0)
-TP1_R_CLAMP_MAX = _get_float("TP1_R_CLAMP_MAX", 1.6, min_v=0.5, max_v=6.0)
-if TP1_R_CLAMP_MAX < TP1_R_CLAMP_MIN:
-    TP1_R_CLAMP_MAX = TP1_R_CLAMP_MIN
-
-TP2_R_TARGET = _get_float("TP2_R_TARGET", 2.8, min_v=0.8, max_v=10.0)
-MIN_TP_TICKS = _get_int("MIN_TP_TICKS", 1, min_v=0, max_v=50)
-TP1_R_BY_VOL = _get_bool("TP1_R_BY_VOL", True)
-
-STOP_TRIGGER_TYPE_SL = _get_str("STOP_TRIGGER_TYPE_SL", "MP")  # "MP" or "FP"
-STOP_TRIGGER_TYPE_TP = _get_str("STOP_TRIGGER_TYPE_TP", "TP")  # kept for compatibility
-
-# --- TP v3 (optional / new) ---
-TP1_USE_EQUAL_LEVELS = _get_bool("TP1_USE_EQUAL_LEVELS", True)
-TP1_USE_SWINGS = _get_bool("TP1_USE_SWINGS", True)
-
-# Liquidity TP acceptance policy
-# 1.00 => only if closer than RR target, >1.00 allows slightly further
-TP1_LIQ_MAX_DIST_FACTOR = _get_float("TP1_LIQ_MAX_DIST_FACTOR", 1.00, min_v=0.2, max_v=3.0)
-
-# Allow liq TP RR >= rr_min - eps (small tolerance)
-TP1_LIQ_MIN_RR_EPS = _get_float("TP1_LIQ_MIN_RR_EPS", 0.08, min_v=0.0, max_v=0.50)
-
-# Front-run buffer for EQH/EQL / swings liquidity TP
-TP_LIQ_BUFFER_PCT = _get_float("TP_LIQ_BUFFER_PCT", 0.0000, min_v=0.0, max_v=0.01)
-TP_LIQ_BUFFER_TICKS = _get_int("TP_LIQ_BUFFER_TICKS", 1, min_v=0, max_v=20)
-TP_LIQ_BUFFER_ATR_MULT = _get_float("TP_LIQ_BUFFER_ATR_MULT", 0.06, min_v=0.0, max_v=1.0)
-
-# Vol regime for indicators.volatility_regime
-VOL_REGIME_ATR_PCT_LOW = _get_float("VOL_REGIME_ATR_PCT_LOW", 0.015, min_v=0.001, max_v=0.20)
-VOL_REGIME_ATR_PCT_HIGH = _get_float("VOL_REGIME_ATR_PCT_HIGH", 0.035, min_v=0.002, max_v=0.30)
-if VOL_REGIME_ATR_PCT_HIGH <= VOL_REGIME_ATR_PCT_LOW:
-    VOL_REGIME_ATR_PCT_HIGH = VOL_REGIME_ATR_PCT_LOW * 1.5
+# WS hub controls (institutional_ws_hub)
+# - INST_USE_WS_HUB is the switch used by institutional_data.py in your version
+# - INST_WS_HUB_ENABLE is kept as alias for older code paths
+INST_USE_WS_HUB = _get_bool("INST_USE_WS_HUB", True)
+INST_WS_HUB_ENABLE = _get_bool("INST_WS_HUB_ENABLE", _get_bool("ENABLE_INST_WS_HUB", INST_USE_WS_HUB))
+WS_STALE_SEC = _get_float("INST_WS_STALE_SEC", 15.0, min_v=1.0, max_v=300.0)
 
 
 # =====================================================================
-# ACCOUNT / EXPOSURE (Risk Manager)
+# BITGET (HTTP tuning) — replaces BINANCE_* but keeps aliases
 # =====================================================================
 
-ACCOUNT_EQUITY_USDT = _get_float("ACCOUNT_EQUITY_USDT", 10000.0, min_v=100.0, max_v=10_000_000.0)
-MAX_GROSS_EXPOSURE = _get_float("MAX_GROSS_EXPOSURE", 2.0, min_v=0.1, max_v=10.0)
-MAX_SYMBOL_EXPOSURE = _get_float("MAX_SYMBOL_EXPOSURE", 0.25, min_v=0.01, max_v=1.0)
-CORR_GROUP_CAP = _get_float("CORR_GROUP_CAP", 0.5, min_v=0.05, max_v=2.0)
-CORR_BTC_THRESHOLD = _get_float("CORR_BTC_THRESHOLD", 0.7, min_v=0.0, max_v=1.0)
+# These names match your institutional_data.py defaults:
+BITGET_HTTP_CONCURRENCY = _get_int("BITGET_HTTP_CONCURRENCY", 4, min_v=1, max_v=50)
 
-ENABLE_SQUEEZE_ENGINE = _get_bool("ENABLE_SQUEEZE_ENGINE", True)
-FAIL_OPEN_TO_CORE = _get_bool("FAIL_OPEN_TO_CORE", True)
+# Prefer BITGET_MIN_INTERVAL_SEC; allow legacy BINANCE_MIN_INTERVAL_S too.
+BITGET_MIN_INTERVAL_SEC = _get_float(
+    "BITGET_MIN_INTERVAL_SEC",
+    _get_float("BITGET_MIN_INTERVAL_S", _get_float("BINANCE_MIN_INTERVAL_S", 0.08, min_v=0.0, max_v=5.0), min_v=0.0, max_v=5.0),
+    min_v=0.0,
+    max_v=5.0,
+)
 
+BITGET_HTTP_TIMEOUT_S = _get_float(
+    "BITGET_HTTP_TIMEOUT_S",
+    _get_float("BINANCE_HTTP_TIMEOUT_S", 10.0, min_v=2.0, max_v=30.0),
+    min_v=2.0,
+    max_v=60.0,
+)
 
-# =====================================================================
-# BINANCE / INSTITUTIONNEL (HTTP tuning)
-# =====================================================================
+BITGET_HTTP_RETRIES = _get_int(
+    "BITGET_HTTP_RETRIES",
+    _get_int("BINANCE_HTTP_RETRIES", 2, min_v=0, max_v=10),
+    min_v=0,
+    max_v=20,
+)
 
-BINANCE_MIN_INTERVAL_S = _get_float("BINANCE_MIN_INTERVAL_S", 0.35, min_v=0.0, max_v=5.0)
-BINANCE_HTTP_TIMEOUT_S = _get_float("BINANCE_HTTP_TIMEOUT_S", 7.0, min_v=2.0, max_v=30.0)
-BINANCE_HTTP_RETRIES = _get_int("BINANCE_HTTP_RETRIES", 2, min_v=0, max_v=10)
+# Contracts / symbols cache TTL (Bitget)
+BITGET_SYMBOLS_TTL_S = _get_int(
+    "BITGET_SYMBOLS_TTL_S",
+    _get_int("BINANCE_SYMBOLS_TTL_S", 900, min_v=60, max_v=24 * 3600),
+    min_v=60,
+    max_v=24 * 3600,
+)
 
-BINANCE_SYMBOLS_TTL_S = _get_int("BINANCE_SYMBOLS_TTL_S", 900, min_v=60, max_v=24 * 3600)
+# ---- Deprecated aliases (do not remove yet; other modules may import them) ----
+BINANCE_MIN_INTERVAL_S = BITGET_MIN_INTERVAL_SEC
+BINANCE_HTTP_TIMEOUT_S = BITGET_HTTP_TIMEOUT_S
+BINANCE_HTTP_RETRIES = BITGET_HTTP_RETRIES
+BINANCE_SYMBOLS_TTL_S = BITGET_SYMBOLS_TTL_S
 
+# Retry controls (kept generic, used by retry_utils/rate-limit errors)
 RETRY_300011_MAX = _get_int("RETRY_300011_MAX", 3, min_v=0, max_v=20)
 RETRY_BACKOFF_MS_BASE = _get_int("RETRY_BACKOFF_MS_BASE", 250, min_v=50, max_v=5000)
 RETRY_BACKOFF_JITTER_MIN = _get_int("RETRY_BACKOFF_JITTER_MIN", 50, min_v=0, max_v=5000)
@@ -331,11 +343,10 @@ SLIPPAGE_TICKS_LIMIT = _get_int("SLIPPAGE_TICKS_LIMIT", 2, min_v=0, max_v=50)
 
 
 # =====================================================================
-# PRIORITY (A→E) + EXECUTION POLICY (NEW)
+# PRIORITY (A→E) + EXECUTION POLICY
 # =====================================================================
 
 PRIORITY_LEVELS: Tuple[str, ...] = ("A", "B", "C", "D", "E")
-
 _PRIORITY_RANK = {"A": 5, "B": 4, "C": 3, "D": 2, "E": 1}
 
 
@@ -364,37 +375,95 @@ def priority_at_least(p: str, min_p: str) -> bool:
 
 
 # Auto-order seulement si priority >= AUTO_ORDER_MIN_PRIORITY
-# Exemple: "C" => A/B/C auto-order ; D/E => alert-only
 AUTO_ORDER_MIN_PRIORITY = _get_priority("AUTO_ORDER_MIN_PRIORITY", "C")
 
 # Pass2 (= datafeeds/inst lourd) seulement si pre_priority >= PASS2_ONLY_FOR_PRIORITY
-# Exemple: "C" => on calcule pass2 pour A/B/C ; D/E on skip pass2
 PASS2_ONLY_FOR_PRIORITY = _get_priority("PASS2_ONLY_FOR_PRIORITY", "C")
 
 
 # =====================================================================
-# SIGNAL TTL / RUNAWAY / PENDING POLICY (NEW)
+# SIGNAL TTL / RUNAWAY / PENDING POLICY
 # =====================================================================
 
-# Temps max (minutes) pendant lequel un "pending entry" reste éligible (alerte/ordre).
-# Le scanner utilisera ça pour expirer pending_state.json proprement.
 ENTRY_TTL_MINUTES = _get_int("ENTRY_TTL_MINUTES", 45, min_v=1, max_v=24 * 60)
 
-# Si le prix part trop loin avant fill (runaway), on invalide le pending.
-# Interprétation: distance relative entre prix actuel et entry (ex: 0.006 = 0.6%)
+# distance relative entre prix actuel et entry (ex: 0.006 = 0.6%)
 RUNAWAY_PCT = _get_float("RUNAWAY_PCT", 0.006, min_v=0.0, max_v=0.20)
 
-# Intervalle mini (secondes) entre checks de pending par symbole (anti-spam API)
 PENDING_RECHECK_INTERVAL_S = _get_float("PENDING_RECHECK_INTERVAL_S", 20.0, min_v=0.0, max_v=600.0)
 
 
 # =====================================================================
-# INSTITUTIONAL WS HUB FLAGS (NEW)
+# ATR / STOPS / LIQUIDITÉ / TP
 # =====================================================================
 
-# Active le hub WS institutionnel (liquidations/trades/orderbook selon ton implémentation).
-# Alias rétro-compatible : ENABLE_INST_WS_HUB
-INST_WS_HUB_ENABLE = _get_bool("INST_WS_HUB_ENABLE", _get_bool("ENABLE_INST_WS_HUB", False))
+ATR_LEN = _get_int("ATR_LEN", 14, min_v=5, max_v=100)
+ATR_MULT_SL = _get_float("ATR_MULT_SL", 2.5, min_v=0.5, max_v=10.0)
+ATR_MULT_SL_CAP = _get_float("ATR_MULT_SL_CAP", 3.5, min_v=0.5, max_v=15.0)
+if ATR_MULT_SL_CAP < ATR_MULT_SL:
+    ATR_MULT_SL_CAP = ATR_MULT_SL
+
+SL_BUFFER_PCT = _get_float("SL_BUFFER_PCT", 0.0020, min_v=0.0, max_v=0.05)
+SL_BUFFER_TICKS = _get_int("SL_BUFFER_TICKS", 3, min_v=0, max_v=50)
+MIN_SL_TICKS = _get_int("MIN_SL_TICKS", 3, min_v=0, max_v=50)
+MAX_SL_PCT = _get_float("MAX_SL_PCT", 0.07, min_v=0.01, max_v=0.50)
+
+STRUCT_LOOKBACK = _get_int("STRUCT_LOOKBACK", 20, min_v=10, max_v=200)
+
+BE_FEE_BUFFER_TICKS = _get_int("BE_FEE_BUFFER_TICKS", 1, min_v=0, max_v=25)
+
+LIQ_LOOKBACK = _get_int("LIQ_LOOKBACK", 60, min_v=20, max_v=500)
+LIQ_BUFFER_PCT = _get_float("LIQ_BUFFER_PCT", 0.0008, min_v=0.0, max_v=0.02)
+LIQ_BUFFER_TICKS = _get_int("LIQ_BUFFER_TICKS", 3, min_v=0, max_v=50)
+
+LIQ_BUFFER_ATR_MULT = _get_float("LIQ_BUFFER_ATR_MULT", 0.12, min_v=0.0, max_v=2.0)
+SL_BUFFER_ATR_MULT = _get_float("SL_BUFFER_ATR_MULT", 0.00, min_v=0.0, max_v=2.0)
+
+SL_POLICY_DEFAULT = _get_str("SL_POLICY_DEFAULT", "TIGHT").strip().upper()
+SL_POLICY_BOS = _get_str("SL_POLICY_BOS", "SWING,LIQ,ATR").strip().upper()
+SL_POLICY_OTE = _get_str("SL_POLICY_OTE", "LIQ,SWING,ATR").strip().upper()
+SL_POLICY_INST = _get_str("SL_POLICY_INST", "LIQ,SWING,ATR").strip().upper()
+
+TP1_R_CLAMP_MIN = _get_float("TP1_R_CLAMP_MIN", 1.4, min_v=0.5, max_v=5.0)
+TP1_R_CLAMP_MAX = _get_float("TP1_R_CLAMP_MAX", 1.6, min_v=0.5, max_v=6.0)
+if TP1_R_CLAMP_MAX < TP1_R_CLAMP_MIN:
+    TP1_R_CLAMP_MAX = TP1_R_CLAMP_MIN
+
+TP2_R_TARGET = _get_float("TP2_R_TARGET", 2.8, min_v=0.8, max_v=10.0)
+MIN_TP_TICKS = _get_int("MIN_TP_TICKS", 1, min_v=0, max_v=50)
+TP1_R_BY_VOL = _get_bool("TP1_R_BY_VOL", True)
+
+STOP_TRIGGER_TYPE_SL = _get_str("STOP_TRIGGER_TYPE_SL", "MP")  # "MP" or "FP"
+STOP_TRIGGER_TYPE_TP = _get_str("STOP_TRIGGER_TYPE_TP", "TP")  # kept for compatibility
+
+TP1_USE_EQUAL_LEVELS = _get_bool("TP1_USE_EQUAL_LEVELS", True)
+TP1_USE_SWINGS = _get_bool("TP1_USE_SWINGS", True)
+
+TP1_LIQ_MAX_DIST_FACTOR = _get_float("TP1_LIQ_MAX_DIST_FACTOR", 1.00, min_v=0.2, max_v=3.0)
+TP1_LIQ_MIN_RR_EPS = _get_float("TP1_LIQ_MIN_RR_EPS", 0.08, min_v=0.0, max_v=0.50)
+
+TP_LIQ_BUFFER_PCT = _get_float("TP_LIQ_BUFFER_PCT", 0.0000, min_v=0.0, max_v=0.01)
+TP_LIQ_BUFFER_TICKS = _get_int("TP_LIQ_BUFFER_TICKS", 1, min_v=0, max_v=20)
+TP_LIQ_BUFFER_ATR_MULT = _get_float("TP_LIQ_BUFFER_ATR_MULT", 0.06, min_v=0.0, max_v=1.0)
+
+VOL_REGIME_ATR_PCT_LOW = _get_float("VOL_REGIME_ATR_PCT_LOW", 0.015, min_v=0.001, max_v=0.20)
+VOL_REGIME_ATR_PCT_HIGH = _get_float("VOL_REGIME_ATR_PCT_HIGH", 0.035, min_v=0.002, max_v=0.30)
+if VOL_REGIME_ATR_PCT_HIGH <= VOL_REGIME_ATR_PCT_LOW:
+    VOL_REGIME_ATR_PCT_HIGH = VOL_REGIME_ATR_PCT_LOW * 1.5
+
+
+# =====================================================================
+# ACCOUNT / EXPOSURE (Risk Manager)
+# =====================================================================
+
+ACCOUNT_EQUITY_USDT = _get_float("ACCOUNT_EQUITY_USDT", 10000.0, min_v=100.0, max_v=10_000_000.0)
+MAX_GROSS_EXPOSURE = _get_float("MAX_GROSS_EXPOSURE", 2.0, min_v=0.1, max_v=10.0)
+MAX_SYMBOL_EXPOSURE = _get_float("MAX_SYMBOL_EXPOSURE", 0.25, min_v=0.01, max_v=1.0)
+CORR_GROUP_CAP = _get_float("CORR_GROUP_CAP", 0.5, min_v=0.05, max_v=2.0)
+CORR_BTC_THRESHOLD = _get_float("CORR_BTC_THRESHOLD", 0.7, min_v=0.0, max_v=1.0)
+
+ENABLE_SQUEEZE_ENGINE = _get_bool("ENABLE_SQUEEZE_ENGINE", True)
+FAIL_OPEN_TO_CORE = _get_bool("FAIL_OPEN_TO_CORE", True)
 
 
 # =====================================================================
@@ -407,14 +476,31 @@ class DeskSettings:
     tz: str
     dry_run: bool
     desk_ev_mode: bool
+
     margin_usdt: float
     leverage: float
     scan_interval_min: int
     top_n_symbols: int
     max_orders_per_scan: int
+
+    # institutional gating
+    inst_mode: str
     min_inst_score: int
+    inst_score_max: int
+
     rr_min_strict: float
     rr_min_desk_priority: float
+
+    # bitget inst http
+    bitget_http_concurrency: int
+    bitget_min_interval_sec: float
+    bitget_http_timeout_s: float
+    bitget_http_retries: int
+
+    # ws hub
+    inst_use_ws_hub: bool
+    ws_stale_sec: float
+    inst_product_type: str
 
 
 def snapshot() -> DeskSettings:
@@ -423,12 +509,26 @@ def snapshot() -> DeskSettings:
         tz=TZ,
         dry_run=DRY_RUN,
         desk_ev_mode=DESK_EV_MODE,
+
         margin_usdt=MARGIN_USDT,
         leverage=LEVERAGE,
         scan_interval_min=SCAN_INTERVAL_MIN,
         top_n_symbols=TOP_N_SYMBOLS,
         max_orders_per_scan=MAX_ORDERS_PER_SCAN,
+
+        inst_mode=INST_MODE,
         min_inst_score=MIN_INST_SCORE,
+        inst_score_max=INST_SCORE_MAX,
+
         rr_min_strict=RR_MIN_STRICT,
         rr_min_desk_priority=RR_MIN_DESK_PRIORITY,
+
+        bitget_http_concurrency=BITGET_HTTP_CONCURRENCY,
+        bitget_min_interval_sec=BITGET_MIN_INTERVAL_SEC,
+        bitget_http_timeout_s=BITGET_HTTP_TIMEOUT_S,
+        bitget_http_retries=BITGET_HTTP_RETRIES,
+
+        inst_use_ws_hub=INST_USE_WS_HUB,
+        ws_stale_sec=WS_STALE_SEC,
+        inst_product_type=INST_BITGET_PRODUCT_TYPE,
     )
