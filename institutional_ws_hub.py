@@ -1,442 +1,420 @@
 # institutional_ws_hub.py
-# =============================================================================
-# Bitget Mix Institutional WebSocket Hub (100% Bitget)
-#
-# Docs (Bitget Mix WS):
-# - WS endpoint: wss://ws.bitget.com/mix/v1/stream
-# - Subscribe: {"op":"subscribe","args":[{"instType":"mc","channel":"ticker","instId":"BTCUSDT_UMCBL"}]}
-# - Heartbeat: send "ping" -> receive "pong"
-# =============================================================================
-
-from __future__ import annotations
+# Bitget WS Hub (institutional) — robuste + ticker fields fallback + subscribe batching
 
 import asyncio
 import json
+import random
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
 
-try:
-    from logger import get_logger  # type: ignore
-except Exception:  # pragma: no cover
-    import logging
-    def get_logger(name: str):
-        logging.basicConfig(level=logging.INFO)
-        return logging.getLogger(name)
+from logger import get_logger
 
 log = get_logger("institutional_ws_hub")
 
-WS_URL = "wss://ws.bitget.com/mix/v1/stream"
+# ========================
+# Settings (local defaults)
+# ========================
 
-DEFAULT_SHARDS = 4
-BOOK_CHANNEL = "books5"
-TRADE_CHANNEL = "trade"
-TICKER_CHANNEL = "ticker"
+# WS endpoint Bitget (Mix v1)
+INST_WS_URL = "wss://ws.bitget.com/mix/v1/stream"
 
-PING_INTERVAL_S = 20.0
-WS_IDLE_TIMEOUT_S = 35.0
+# IMPORTANT: ton code actuel utilise "mc" (et pas "USDT-FUTURES").
+# Je ne change pas ça ici pour éviter de casser ta compatibilité.
+INST_PRODUCT_TYPE = "mc"
 
+# Sharding
+INST_WS_SHARDS = 4
 
-def _norm_symbol(s: str) -> str:
-    return (s or "").upper().replace("-", "").replace("/", "")
+# Subscribe batching (évite les frames trop grosses)
+INST_WS_SUB_BATCH = 200  # nombre d'args par message subscribe
 
+# Ping / reconnect
+INST_WS_PING_INTERVAL_S = 15.0
+INST_WS_RECONNECT_MIN_S = 2.0
+INST_WS_RECONNECT_MAX_S = 25.0
 
-def _candidate_inst_ids(symbol: str, product_type: Optional[str]) -> List[str]:
-    """
-    Bitget WS examples often use instId like BTCUSDT_UMCBL.
-    But many bots manipulate symbols as BTCUSDT.
-    We subscribe to both to avoid hard dependency on suffix mapping.
-    """
-    sym = _norm_symbol(symbol)
-    if not sym:
-        return []
-    if "_" in sym:
-        return [sym]
-    # Prefer a plausible USDT-perp suffix, but keep raw fallback.
-    return [sym + "_UMCBL", sym]
+# Channels
+CHAN_BOOKS = "books5"
+CHAN_TRADES = "trade"
+CHAN_TICKER = "ticker"
 
 
-@dataclass
-class _TradeAgg:
-    window_s: int
-    buys_notional: float = 0.0
-    sells_notional: float = 0.0
-    buys_qty: float = 0.0
-    sells_qty: float = 0.0
-    events: List[Tuple[int, str, float, float]] = field(default_factory=list)
-
-    def add(self, ts_ms: int, side: str, qty: float, price: float) -> None:
-        notional = qty * price
-        side_l = (side or "").lower()
-        if side_l == "buy":
-            self.buys_notional += notional
-            self.buys_qty += qty
-        else:
-            self.sells_notional += notional
-            self.sells_qty += qty
-        self.events.append((ts_ms, side_l, qty, notional))
-        self.prune(ts_ms)
-
-    def prune(self, now_ms: int) -> None:
-        cutoff = now_ms - self.window_s * 1000
-        i = 0
-        while i < len(self.events) and self.events[i][0] < cutoff:
-            ts, side, qty, notional = self.events[i]
-            if side == "buy":
-                self.buys_notional -= notional
-                self.buys_qty -= qty
-            else:
-                self.sells_notional -= notional
-                self.sells_qty -= qty
-            i += 1
-        if i:
-            del self.events[:i]
-
-    def snapshot(self, now_ms: int) -> Dict[str, float]:
-        self.prune(now_ms)
-        return {
-            "delta_qty": self.buys_qty - self.sells_qty,
-            "delta_notional": self.buys_notional - self.sells_notional,
-            "buy_notional": max(self.buys_notional, 0.0),
-            "sell_notional": max(self.sells_notional, 0.0),
-        }
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
-@dataclass
-class _BookState:
-    ts_ms: int = 0
-    bids: List[Tuple[float, float]] = field(default_factory=list)
-    asks: List[Tuple[float, float]] = field(default_factory=list)
-
-    def top(self):
-        bid = self.bids[0] if self.bids else (None, None)
-        ask = self.asks[0] if self.asks else (None, None)
-        return bid[0], bid[1], ask[0], ask[1]
-
-
-@dataclass
-class _TickerState:
-    ts_ms: int = 0
-    last: Optional[float] = None
-    mark: Optional[float] = None
-    index: Optional[float] = None
-    funding: Optional[float] = None
-    holding: Optional[float] = None
-    best_bid: Optional[float] = None
-    best_ask: Optional[float] = None
-
-
-@dataclass
-class _SymbolState:
-    base_symbol: str
-    inst_id: str
-    ticker: _TickerState = field(default_factory=_TickerState)
-    book: _BookState = field(default_factory=_BookState)
-    tape_1m: _TradeAgg = field(default_factory=lambda: _TradeAgg(60))
-    tape_5m: _TradeAgg = field(default_factory=lambda: _TradeAgg(300))
-
-
-def _safe_float(v: Any) -> Optional[float]:
+def _safe_float(x: Any) -> Optional[float]:
     try:
-        return None if v is None else float(v)
+        if x is None:
+            return None
+        return float(x)
     except Exception:
         return None
 
 
-def _safe_int(v: Any, default: int) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return default
+@dataclass
+class _BookState:
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    bid_depth_usd: Optional[float] = None
+    ask_depth_usd: Optional[float] = None
+    spread: Optional[float] = None
+    ts_ms: int = field(default_factory=_now_ms)
 
 
-def _parse_book_side(side: Any) -> List[Tuple[float, float]]:
-    out = []
-    if not isinstance(side, list):
+@dataclass
+class _TradeState:
+    last_price: Optional[float] = None
+    last_size: Optional[float] = None
+    last_side: Optional[str] = None
+    ts_ms: int = field(default_factory=_now_ms)
+
+
+@dataclass
+class _TickerState:
+    mark_price: Optional[float] = None
+    index_price: Optional[float] = None
+    funding: Optional[float] = None
+    holding: Optional[float] = None
+    ts_ms: int = field(default_factory=_now_ms)
+
+
+@dataclass
+class _SymbolState:
+    symbol: str
+    book: _BookState = field(default_factory=_BookState)
+    trade: _TradeState = field(default_factory=_TradeState)
+    ticker: _TickerState = field(default_factory=_TickerState)
+
+
+def _norm_symbol(sym: str) -> str:
+    return sym.strip().upper()
+
+
+def _candidate_inst_ids(sym: str) -> List[str]:
+    """
+    Ton code original essaye plusieurs variantes (sans suffixe / _UMCBL / _DMCBL).
+    Je garde cette logique pour éviter de casser des symboles,
+    mais on s'assure de ne pas dupliquer inutilement.
+    """
+    s = _norm_symbol(sym)
+    out: List[str] = []
+
+    def add(x: str):
+        x = _norm_symbol(x)
+        if x not in out:
+            out.append(x)
+
+    add(s)
+
+    # si déjà suffixé, ne rajoute pas de suffixes
+    if s.endswith("_UMCBL") or s.endswith("_DMCBL") or s.endswith("_CMCBL"):
         return out
-    for lvl in side:
-        if isinstance(lvl, list) and len(lvl) >= 2:
-            px = _safe_float(lvl[0])
-            sz = _safe_float(lvl[1])
-            if px is not None and sz is not None:
-                out.append((px, sz))
+
+    add(f"{s}_UMCBL")
+    add(f"{s}_DMCBL")
     return out
 
 
-def _compute_snapshot(st: _SymbolState) -> Dict[str, Any]:
-    now_ms = int(time.time() * 1000)
-
-    t5 = st.tape_5m.snapshot(now_ms)
-
-    bid_px, bid_sz, ask_px, ask_sz = st.book.top()
-    if bid_px is None:
-        bid_px = st.ticker.best_bid
-    if ask_px is None:
-        ask_px = st.ticker.best_ask
-
-    mid = None
-    spread_bps = None
-    if bid_px and ask_px and bid_px > 0 and ask_px > 0:
-        mid = (bid_px + ask_px) / 2.0
-        spread_bps = ((ask_px - bid_px) / mid) * 10_000 if mid else None
-
-    imb = None
-    microprice = None
-    if st.book.bids and st.book.asks and mid:
-        bid_val = sum(px * sz for px, sz in st.book.bids[:5])
-        ask_val = sum(px * sz for px, sz in st.book.asks[:5])
-        tot = bid_val + ask_val
-        imb = ((bid_val - ask_val) / tot) if tot else None
-
-        if bid_px and ask_px and bid_sz and ask_sz and (bid_sz + ask_sz) > 0:
-            microprice = (bid_px * ask_sz + ask_px * bid_sz) / (bid_sz + ask_sz)
-
-    return {
-        "available": True,
-        "ts": now_ms / 1000.0,
-        "symbol": st.base_symbol,
-        "inst_id": st.inst_id,
-        "tape_delta_5m": t5["delta_qty"],
-        "tape_delta_5m_notional": t5["delta_notional"],
-        "buy_notional_5m": t5["buy_notional"],
-        "sell_notional_5m": t5["sell_notional"],
-        "mid": mid,
-        "spread_bps": spread_bps,
-        "orderbook_imbalance": imb,
-        "microprice": microprice,
-        "mark_price": st.ticker.mark,
-        "index_price": st.ticker.index,
-        "funding_rate": st.ticker.funding,
-        "open_interest": st.ticker.holding,
-    }
+def _depth_usd(levels: List[Any], topn: int = 5) -> Optional[float]:
+    if not levels:
+        return None
+    total = 0.0
+    for lvl in levels[:topn]:
+        try:
+            px = float(lvl[0])
+            sz = float(lvl[1])
+            total += px * sz
+        except Exception:
+            continue
+    return total if total > 0 else None
 
 
-class _BitgetShard:
-    def __init__(self, shard_id: int, product_type: Optional[str]):
+class InstitutionalWSHubShard:
+    def __init__(self, shard_id: int, symbols: List[str]):
         self.shard_id = shard_id
-        self.product_type = product_type
+        self.symbols: List[str] = [_norm_symbol(s) for s in symbols]
+        self._states: Dict[str, _SymbolState] = {s: _SymbolState(symbol=s) for s in self.symbols}
+
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
-        self._task: Optional[asyncio.Task] = None
-        self._running = False
 
-        self._symbols: Set[str] = set()
-        self.state: Dict[str, _SymbolState] = {}
-
+        self._stop = asyncio.Event()
         self._last_msg_monotonic = time.monotonic()
-        self._lock = asyncio.Lock()
 
-    def _pfx(self):
-        return f"[WS_HUB:hub{self.shard_id}]"
+    def snapshot(self, symbol: str) -> Dict[str, Any]:
+        sym = _norm_symbol(symbol)
+        st = self._states.get(sym)
+        if not st:
+            return {"ok": False, "symbol": sym, "reason": "unknown_symbol"}
+
+        return {
+            "ok": True,
+            "symbol": sym,
+            # book
+            "best_bid": st.book.best_bid,
+            "best_ask": st.book.best_ask,
+            "spread": st.book.spread,
+            "bid_depth_usd": st.book.bid_depth_usd,
+            "ask_depth_usd": st.book.ask_depth_usd,
+            "book_ts": st.book.ts_ms,
+            # trade
+            "last_price": st.trade.last_price,
+            "last_size": st.trade.last_size,
+            "last_side": st.trade.last_side,
+            "trade_ts": st.trade.ts_ms,
+            # ticker
+            "mark_price": st.ticker.mark_price,
+            "index_price": st.ticker.index_price,
+            "funding_rate": st.ticker.funding,
+            "open_interest": st.ticker.holding,
+            "ticker_ts": st.ticker.ts_ms,
+        }
 
     async def start(self):
-        if self._running:
-            return
-        self._running = True
-        self._task = asyncio.create_task(self._run_forever())
-        log.info("%s started (Bitget)", self._pfx())
+        if self._session is None:
+            timeout = aiohttp.ClientTimeout(total=30)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        asyncio.create_task(self._run_forever(), name=f"ws_hub_shard_{self.shard_id}")
+        log.info(f"[WS_HUB:hub{self.shard_id}] started (Bitget)")
 
     async def stop(self):
-        self._running = False
-        if self._task:
-            self._task.cancel()
+        self._stop.set()
         await self._close_ws()
         if self._session:
             await self._session.close()
-
-    async def set_symbols(self, symbols: List[str]):
-        async with self._lock:
-            self._symbols = {_norm_symbol(s) for s in symbols if _norm_symbol(s)}
-        await self._close_ws()
-
-    async def _ensure_session(self):
-        if not self._session or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
-        return self._session
+            self._session = None
 
     async def _close_ws(self):
-        if self._ws and not self._ws.closed:
+        ws = self._ws
+        self._ws = None
+        if ws and not ws.closed:
             try:
-                await self._ws.close()
+                await ws.close()
             except Exception:
                 pass
-        self._ws = None
-
-    async def _connect(self):
-        s = await self._ensure_session()
-        log.info("%s connecting %s", self._pfx(), WS_URL)
-        self._ws = await s.ws_connect(
-            WS_URL, heartbeat=None, autoping=False, max_msg_size=4 * 1024 * 1024
-        )
-        self._last_msg_monotonic = time.monotonic()
 
     async def _subscribe(self):
-        async with self._lock:
-            symbols = list(self._symbols)
+        """
+        Subscribe books5 + trade + ticker
+        Envoie en batch pour éviter les frames trop grosses.
+        """
+        if not self._ws or self._ws.closed:
+            return
 
-        args = []
-        for base in symbols:
-            for inst_id in _candidate_inst_ids(base, self.product_type):
-                self.state.setdefault(inst_id, _SymbolState(base_symbol=base, inst_id=inst_id))
-                args.extend([
-                    {"instType": "mc", "channel": TICKER_CHANNEL, "instId": inst_id},
-                    {"instType": "mc", "channel": TRADE_CHANNEL, "instId": inst_id},
-                    {"instType": "mc", "channel": BOOK_CHANNEL, "instId": inst_id},
-                ])
+        inst_type = INST_PRODUCT_TYPE
+        channels = [CHAN_BOOKS, CHAN_TRADES, CHAN_TICKER]
 
-        if args and self._ws:
-            await self._ws.send_str(json.dumps({"op": "subscribe", "args": args}))
+        args: List[Dict[str, str]] = []
+        for sym in self.symbols:
+            for inst_id in _candidate_inst_ids(sym):
+                for ch in channels:
+                    args.append({"instType": inst_type, "channel": ch, "instId": inst_id})
 
-    async def _ping(self):
-        if self._ws and not self._ws.closed:
+        if not args:
+            return
+
+        batch_size = max(50, int(INST_WS_SUB_BATCH))
+        for i in range(0, len(args), batch_size):
+            batch = args[i : i + batch_size]
+            try:
+                if not self._ws or self._ws.closed:
+                    break
+                await self._ws.send_str(json.dumps({"op": "subscribe", "args": batch}))
+            except Exception as e:
+                log.warning(f"[WS_HUB:hub{self.shard_id}] ws error: {e}")
+                try:
+                    await self._close_ws()
+                except Exception:
+                    pass
+                break
+            await asyncio.sleep(0.05)
+
+    async def _ping_loop(self):
+        while not self._stop.is_set():
+            await asyncio.sleep(INST_WS_PING_INTERVAL_S)
+            if not self._ws or self._ws.closed:
+                continue
+            idle = time.monotonic() - self._last_msg_monotonic
+            if idle < INST_WS_PING_INTERVAL_S:
+                continue
             try:
                 await self._ws.send_str("ping")
-            except Exception:
+            except Exception as e:
+                # typiquement: "Cannot write to closing transport"
+                log.warning(f"[WS_HUB:hub{self.shard_id}] ws error: {e}")
                 await self._close_ws()
 
-    async def _handle(self, payload: dict):
-        self._last_msg_monotonic = time.monotonic()
+    async def _run_forever(self):
+        assert self._session is not None
 
-        if payload.get("event") in {"subscribe", "unsubscribe"}:
+        backoff = float(INST_WS_RECONNECT_MIN_S)
+        backoff_max = float(INST_WS_RECONNECT_MAX_S)
+
+        while not self._stop.is_set():
+            ping_task: Optional[asyncio.Task] = None
+            try:
+                log.info(f"[WS_HUB:hub{self.shard_id}] connecting {INST_WS_URL}")
+                self._ws = await self._session.ws_connect(
+                    INST_WS_URL,
+                    heartbeat=None,
+                    autoping=False,
+                    max_msg_size=0,
+                )
+                self._last_msg_monotonic = time.monotonic()
+
+                await self._subscribe()
+                ping_task = asyncio.create_task(self._ping_loop(), name=f"ws_ping_{self.shard_id}")
+
+                backoff = float(INST_WS_RECONNECT_MIN_S)
+
+                async for msg in self._ws:
+                    self._last_msg_monotonic = time.monotonic()
+
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        txt = msg.data
+                        if txt == "pong":
+                            continue
+                        await self._handle_text(txt)
+                    elif msg.type in (
+                        aiohttp.WSMsgType.CLOSED,
+                        aiohttp.WSMsgType.CLOSE,
+                        aiohttp.WSMsgType.ERROR,
+                    ):
+                        break
+
+            except Exception as e:
+                log.warning(f"[WS_HUB:hub{self.shard_id}] ws error: {e}")
+            finally:
+                if ping_task:
+                    ping_task.cancel()
+                    try:
+                        await ping_task
+                    except Exception:
+                        pass
+                await self._close_ws()
+
+            if self._stop.is_set():
+                break
+
+            sleep_s = min(backoff, backoff_max)
+            sleep_s *= 0.75 + random.random() * 0.5
+            await asyncio.sleep(sleep_s)
+            backoff = min(backoff * 2.0, backoff_max)
+
+    async def _handle_text(self, txt: str):
+        try:
+            payload = json.loads(txt)
+        except Exception:
+            return
+
+        if not isinstance(payload, dict):
+            return
+
+        if payload.get("event"):
+            if payload.get("event") == "error":
+                log.warning(f"[WS_HUB:hub{self.shard_id}] ws event error: {payload}")
             return
 
         arg = payload.get("arg") or {}
-        inst_id = arg.get("instId")
+        data = payload.get("data") or []
+        if not arg or not data:
+            return
+
         channel = arg.get("channel")
-        data = payload.get("data")
-        if not inst_id or not channel or not data:
+        inst_id = arg.get("instId")
+        if not channel or not inst_id:
             return
 
-        st = self.state.get(inst_id)
-        if not st:
+        inst_id = _norm_symbol(inst_id)
+
+        # IMPORTANT:
+        # Ton state est indexé par symbol "scan" (ex: SANDUSDT)
+        # mais ici on reçoit possiblement "SANDUSDT_UMCBL".
+        # On tente les deux: exact inst_id, puis fallback sans suffixe si besoin.
+        st = self._states.get(inst_id)
+        if st is None:
+            base = inst_id.split("_")[0]
+            st = self._states.get(base)
+        if st is None:
             return
 
-        now_ms = int(time.time() * 1000)
+        d0 = data[0] if data else None
+        if not isinstance(d0, dict):
+            return
 
-        if channel == TICKER_CHANNEL and isinstance(data, list) and data and isinstance(data[0], dict):
-            d0 = data[0]
-            st.ticker.ts_ms = now_ms
-            st.ticker.last = _safe_float(d0.get("last"))
-            st.ticker.mark = _safe_float(d0.get("markPrice"))
-            st.ticker.index = _safe_float(d0.get("indexPrice"))
-            st.ticker.funding = _safe_float(d0.get("capitalRate"))
-            st.ticker.holding = _safe_float(d0.get("holding"))
-            st.ticker.best_bid = _safe_float(d0.get("bestBid"))
-            st.ticker.best_ask = _safe_float(d0.get("bestAsk"))
+        if channel == CHAN_BOOKS:
+            asks = d0.get("asks") or []
+            bids = d0.get("bids") or []
+            if asks:
+                st.book.best_ask = _safe_float(asks[0][0])
+            if bids:
+                st.book.best_bid = _safe_float(bids[0][0])
 
-        elif channel == TRADE_CHANNEL and isinstance(data, list):
-            for t in data:
-                if isinstance(t, list) and len(t) >= 4:
-                    ts = _safe_int(t[0], now_ms)
-                    px = _safe_float(t[1])
-                    qty = _safe_float(t[2])
-                    side = str(t[3])
-                    if px and qty:
-                        st.tape_1m.add(ts, side, qty, px)
-                        st.tape_5m.add(ts, side, qty, px)
+            if st.book.best_bid is not None and st.book.best_ask is not None and st.book.best_ask > 0:
+                st.book.spread = (st.book.best_ask - st.book.best_bid) / st.book.best_ask
+            else:
+                st.book.spread = None
 
-        elif channel == BOOK_CHANNEL and isinstance(data, list) and data and isinstance(data[0], dict):
-            d0 = data[0]
-            st.book.ts_ms = now_ms
-            st.book.bids = _parse_book_side(d0.get("bids"))
-            st.book.asks = _parse_book_side(d0.get("asks"))
+            st.book.bid_depth_usd = _depth_usd(bids, topn=5)
+            st.book.ask_depth_usd = _depth_usd(asks, topn=5)
+            st.book.ts_ms = _now_ms()
 
-    async def _run_forever(self):
-        backoff = 1.0
-        while self._running:
-            try:
-                await self._connect()
-                await self._subscribe()
-                backoff = 1.0
+        elif channel == CHAN_TRADES:
+            st.trade.last_price = _safe_float(d0.get("price") or d0.get("px"))
+            st.trade.last_size = _safe_float(d0.get("size") or d0.get("sz"))
+            st.trade.last_side = d0.get("side")
+            st.trade.ts_ms = _now_ms()
 
-                while self._running and self._ws and not self._ws.closed:
-                    if (time.monotonic() - self._last_msg_monotonic) > PING_INTERVAL_S:
-                        await self._ping()
+        elif channel == CHAN_TICKER:
+            # ✅ Robust parsing: accepte plusieurs noms de champs.
+            st.ticker.mark_price = _safe_float(d0.get("markPrice") or d0.get("mark_price"))
+            st.ticker.index_price = _safe_float(d0.get("indexPrice") or d0.get("index_price"))
 
-                    try:
-                        msg = await self._ws.receive(timeout=WS_IDLE_TIMEOUT_S)
-                    except asyncio.TimeoutError:
-                        await self._ping()
-                        continue
+            # funding: certains flux utilisent fundingRate, d’autres capitalRate
+            st.ticker.funding = _safe_float(
+                d0.get("fundingRate") or d0.get("capitalRate") or d0.get("funding_rate")
+            )
 
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        if msg.data == "pong":
-                            continue
-                        try:
-                            payload = json.loads(msg.data)
-                        except Exception:
-                            continue
-                        await self._handle(payload)
-                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        break
+            # open interest / holding: holdingAmount ou holding
+            st.ticker.holding = _safe_float(
+                d0.get("holdingAmount")
+                or d0.get("holding")
+                or d0.get("openInterest")
+                or d0.get("open_interest")
+            )
 
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log.warning("%s ws error: %s", self._pfx(), e)
-            finally:
-                await self._close_ws()
-
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2.0, 30.0)
+            st.ticker.ts_ms = _now_ms()
 
 
 class InstitutionalWSHub:
-    def __init__(self, shards: int = DEFAULT_SHARDS, product_type: Optional[str] = None):
+    def __init__(self, symbols: List[str], shards: int = INST_WS_SHARDS):
+        self.symbols = [_norm_symbol(s) for s in symbols]
         self.shards = max(1, int(shards))
-        self.product_type = product_type
-        self._running = False
-        self._shards = [_BitgetShard(i, product_type) for i in range(self.shards)]
+        self._shards: List[InstitutionalWSHubShard] = []
 
-    @property
-    def is_running(self):
-        return self._running
+    async def start(self):
+        buckets = [[] for _ in range(self.shards)]
+        for i, sym in enumerate(self.symbols):
+            buckets[i % self.shards].append(sym)
 
-    async def start(self, symbols: Optional[List[str]] = None, product_type: Optional[str] = None):
-        if product_type:
-            self.product_type = product_type
-            for sh in self._shards:
-                sh.product_type = product_type
-
-        if self._running:
-            if symbols is not None:
-                await self.set_symbols(symbols)
-            return
-
-        self._running = True
+        self._shards = [InstitutionalWSHubShard(i, buckets[i]) for i in range(self.shards)]
         for sh in self._shards:
             await sh.start()
 
-        if symbols is not None:
-            await self.set_symbols(symbols)
-
-        log.info("[WS_HUB] sharded started (Bitget) shards=%s", self.shards)
+        log.info(f"[WS_HUB] sharded started (Bitget) shards={self.shards}")
 
     async def stop(self):
-        self._running = False
         for sh in self._shards:
             await sh.stop()
-
-    async def set_symbols(self, symbols: List[str]):
-        buckets = [[] for _ in range(self.shards)]
-        for s in symbols:
-            base = _norm_symbol(s)
-            buckets[hash(base) % self.shards].append(base)
-        await asyncio.gather(*[self._shards[i].set_symbols(buckets[i]) for i in range(self.shards)])
+        self._shards = []
 
     def get_snapshot(self, symbol: str) -> Dict[str, Any]:
-        base = _norm_symbol(symbol)
-        best = None
-        for sh in self._shards:
-            for inst_id, st in sh.state.items():
-                if st.base_symbol == base or inst_id == base:
-                    snap = _compute_snapshot(st)
-                    if snap.get("available"):
-                        best = snap
-        return best or {"available": False, "symbol": base, "reason": "no_ws_state"}
-
-
-INST_HUB = InstitutionalWSHub()
-HUB = INST_HUB
+        sym = _norm_symbol(symbol)
+        if not self._shards:
+            return {"ok": False, "symbol": sym, "reason": "not_started"}
+        idx = hash(sym) % len(self._shards)
+        return self._shards[idx].snapshot(sym)
