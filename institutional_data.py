@@ -9,7 +9,12 @@
 # - GET /api/v2/mix/market/current-fund-rate        (current funding)  [fallback]
 # - GET /api/v2/mix/market/open-interest            (open interest)    [optional flag]
 #
-# Keeps legacy keys to avoid KeyError: openInterest, fundingRate, binance_symbol...
+# Improvements in this version:
+# ✅ Derived metrics (no extra endpoints): OI % change (15m/1h), funding change (1h), funding flip flag
+# ✅ Uses WS hub values when available to compute derived metrics even if REST OI is disabled
+# ✅ Optional OI REST fallback when WS missing (env: INST_OI_FALLBACK_WHEN_WS_MISSING=1)
+# ✅ Safer caches + symbol-normalized series storage
+# ✅ Keeps legacy keys to avoid KeyError: openInterest, fundingRate, binance_symbol...
 # =====================================================================
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ except Exception:  # pragma: no cover
 
 LOGGER = logging.getLogger(__name__)
 
-INST_VERSION = "UltraDesk3.1-bitget-only+funding-fallback+oi-optin-2026-01-13"
+INST_VERSION = "UltraDesk3.1-bitget-only+funding-fallback+oi-optin+derived-2026-01-13"
 
 BITGET_API_BASE = str(os.getenv("BITGET_API_BASE", "https://api.bitget.com")).strip()
 
@@ -73,9 +78,11 @@ if INST_MODE not in ("LIGHT", "NORMAL", "FULL"):
 # Optional features
 # - Current funding: enabled by default (fixes funding_rate_ok=False when WS hub isn’t running)
 # - Open interest: opt-in (can add load on big scans)
+# - OI fallback when WS missing: optional, still respects TTL cache
 # ---------------------------------------------------------------------
 INST_ENABLE_OPEN_INTEREST = str(os.getenv("INST_ENABLE_OPEN_INTEREST", "0")).strip() == "1"
 INST_ENABLE_CURRENT_FUNDING = str(os.getenv("INST_ENABLE_CURRENT_FUNDING", "1")).strip() == "1"
+INST_OI_FALLBACK_WHEN_WS_MISSING = str(os.getenv("INST_OI_FALLBACK_WHEN_WS_MISSING", "0")).strip() == "1"
 
 # kept for compatibility (not implemented in this file)
 INST_ENABLE_RECENT_FILLS = str(os.getenv("INST_ENABLE_RECENT_FILLS", "0")).strip() == "1"
@@ -87,6 +94,13 @@ INST_ENABLE_CANDLES = str(os.getenv("INST_ENABLE_CANDLES", "0")).strip() == "1"
 INST_NORM_ENABLED = str(os.getenv("INST_NORM_ENABLED", "1")).strip() == "1"
 INST_NORM_MIN_POINTS = int(float(os.getenv("INST_NORM_MIN_POINTS", "20")))
 INST_NORM_WINDOW = int(float(os.getenv("INST_NORM_WINDOW", "120")))
+
+# ---------------------------------------------------------------------
+# Derived series (no extra endpoints)
+# ---------------------------------------------------------------------
+INST_DERIVED_ENABLED = str(os.getenv("INST_DERIVED_ENABLED", "1")).strip() == "1"
+INST_DERIVED_MAX_AGE_S = float(os.getenv("INST_DERIVED_MAX_AGE_S", "10800"))  # 3h
+INST_DERIVED_MAXLEN = int(float(os.getenv("INST_DERIVED_MAXLEN", "480")))     # ~8 min sampling @1s; or ~8h @60s
 
 # ---------------------------------------------------------------------
 # Global rate limiting + retries
@@ -489,6 +503,120 @@ def _norm_update(sym: str, metric: str, value: Optional[float]) -> Optional[floa
 
 
 # =====================================================================
+# Derived series (OI/funding change without new endpoints)
+# =====================================================================
+@dataclass
+class _Series:
+    maxlen: int = INST_DERIVED_MAXLEN
+    pts: Deque[Tuple[int, float]] = field(default_factory=lambda: deque(maxlen=INST_DERIVED_MAXLEN))
+
+    def append(self, ts_ms: int, v: float) -> None:
+        self.pts.append((int(ts_ms), float(v)))
+
+    def purge_older_than(self, cutoff_ms: int) -> None:
+        while self.pts and int(self.pts[0][0]) < int(cutoff_ms):
+            self.pts.popleft()
+
+    def last(self) -> Optional[Tuple[int, float]]:
+        return self.pts[-1] if self.pts else None
+
+    def value_at_or_before(self, ts_ms: int) -> Optional[Tuple[int, float]]:
+        if not self.pts:
+            return None
+        # walk from right to left (fast for recent history)
+        for t, v in reversed(self.pts):
+            if int(t) <= int(ts_ms):
+                return int(t), float(v)
+        return None
+
+
+@dataclass
+class _DerivedState:
+    oi: _Series = field(default_factory=_Series)
+    funding: _Series = field(default_factory=_Series)
+
+
+_DERIVED: Dict[str, _DerivedState] = {}
+
+
+def _derived_state(sym: str) -> _DerivedState:
+    st = _DERIVED.get(sym)
+    if st is None:
+        st = _DerivedState()
+        _DERIVED[sym] = st
+    return st
+
+
+def _update_derived(sym: str, ts_ms: int, *, oi: Optional[float], funding: Optional[float]) -> None:
+    if not INST_DERIVED_ENABLED:
+        return
+    if not sym:
+        return
+    st = _derived_state(sym)
+    cutoff = int(ts_ms - (float(INST_DERIVED_MAX_AGE_S) * 1000.0))
+    try:
+        st.oi.purge_older_than(cutoff)
+        st.funding.purge_older_than(cutoff)
+    except Exception:
+        pass
+
+    try:
+        if oi is not None:
+            st.oi.append(ts_ms, float(oi))
+    except Exception:
+        pass
+
+    try:
+        if funding is not None:
+            st.funding.append(ts_ms, float(funding))
+    except Exception:
+        pass
+
+
+def _pct_change(series: _Series, now_ms: int, horizon_s: float) -> Optional[float]:
+    try:
+        if not series.pts:
+            return None
+        last = series.last()
+        if last is None:
+            return None
+        t1, v1 = last
+        if v1 is None:
+            return None
+        t0_target = int(now_ms - float(horizon_s) * 1000.0)
+        old = series.value_at_or_before(t0_target)
+        if old is None:
+            return None
+        _, v0 = old
+        if v0 is None:
+            return None
+        v0f = float(v0)
+        if abs(v0f) <= 1e-12:
+            return None
+        return float(((float(v1) - v0f) / v0f) * 100.0)
+    except Exception:
+        return None
+
+
+def _delta(series: _Series, now_ms: int, horizon_s: float) -> Optional[float]:
+    try:
+        if not series.pts:
+            return None
+        last = series.last()
+        if last is None:
+            return None
+        _, v1 = last
+        t0_target = int(now_ms - float(horizon_s) * 1000.0)
+        old = series.value_at_or_before(t0_target)
+        if old is None:
+            return None
+        _, v0 = old
+        return float(float(v1) - float(v0))
+    except Exception:
+        return None
+
+
+# =====================================================================
 # Bitget confirmed endpoints
 # =====================================================================
 async def _fetch_merge_depth(symbol: str) -> Optional[Dict[str, Any]]:
@@ -712,6 +840,10 @@ def _available_components_list(payload: Dict[str, Any]) -> List[str]:
         out.append("funding")
     if payload.get("tape_delta_5m") is not None:
         out.append("tape")
+    if payload.get("oi_change_1h_pct") is not None:
+        out.append("oi_change_1h")
+    if payload.get("funding_change_1h") is not None:
+        out.append("funding_change_1h")
     return out
 
 
@@ -747,6 +879,15 @@ async def compute_full_institutional_analysis(
 
     ws_snap = _ws_snapshot(sym)
     ws_used = bool(ws_snap is not None)
+
+    # Determine a consistent sample timestamp (ms)
+    now_ms = _now_ms()
+    snap_ts_ms = now_ms
+    if isinstance(ws_snap, dict) and ws_snap.get("ts") is not None:
+        try:
+            snap_ts_ms = int(float(ws_snap.get("ts")) * 1000.0)
+        except Exception:
+            snap_ts_ms = now_ms
 
     # 1) Depth (always)
     depth = await _fetch_merge_depth(sym)
@@ -792,7 +933,6 @@ async def compute_full_institutional_analysis(
                 funding_rate = float(ws_snap.get("funding_rate"))
                 sources["funding_rate"] = "ws_hub"
 
-            # optional if hub provides it (your hub may not)
             if ws_snap.get("next_funding_time_ms") is not None:
                 next_funding_time_ms = int(float(ws_snap.get("next_funding_time_ms")))
                 sources["next_funding_time"] = "ws_hub"
@@ -821,12 +961,13 @@ async def compute_full_institutional_analysis(
             next_funding_time_ms = int(nu)
             sources["next_funding_time"] = sources.get("next_funding_time", "bitget_rest")
 
-    # REST open interest (opt-in)
-    if oi_value is None and INST_ENABLE_OPEN_INTEREST:
+    # REST open interest (opt-in OR optional fallback when WS missing)
+    need_oi_rest = bool(INST_ENABLE_OPEN_INTEREST) or (INST_OI_FALLBACK_WHEN_WS_MISSING and (oi_value is None))
+    if oi_value is None and need_oi_rest:
         oi = await _fetch_open_interest(sym)
         if oi is not None:
             oi_value = float(oi)
-            sources["oi"] = "bitget_rest"
+            sources["oi"] = "bitget_rest" if sources.get("oi") != "ws_hub" else "ws_hub"
         else:
             warnings.append("no_open_interest")
             sources["oi"] = sources.get("oi", "none")
@@ -837,15 +978,51 @@ async def compute_full_institutional_analysis(
     if INST_ENABLE_CANDLES:
         warnings.append("candles_flag_on_but_not_implemented_here")
 
+    # ---- Derived series update (OI change, funding change) ----
+    if INST_DERIVED_ENABLED:
+        _update_derived(sym, snap_ts_ms, oi=oi_value, funding=funding_rate)
+
+    oi_change_15m_pct = None
+    oi_change_1h_pct = None
+    funding_change_1h = None
+    funding_flip = None
+
+    if INST_DERIVED_ENABLED:
+        try:
+            st = _derived_state(sym)
+            oi_change_15m_pct = _pct_change(st.oi, snap_ts_ms, horizon_s=900.0)
+            oi_change_1h_pct = _pct_change(st.oi, snap_ts_ms, horizon_s=3600.0)
+            funding_change_1h = _delta(st.funding, snap_ts_ms, horizon_s=3600.0)
+        except Exception:
+            pass
+
+        # Funding flip heuristic: sign changed vs 1h-ago (if available)
+        try:
+            if funding_rate is not None:
+                st = _derived_state(sym)
+                old = st.funding.value_at_or_before(int(snap_ts_ms - 3600_000))
+                if old is not None:
+                    _, fr0 = old
+                    fr1 = float(funding_rate)
+                    if fr0 == 0.0:
+                        funding_flip = None
+                    else:
+                        funding_flip = bool((float(fr0) > 0 and fr1 < 0) or (float(fr0) < 0 and fr1 > 0))
+        except Exception:
+            funding_flip = None
+
     # Normalization
     ob_imb_z = _norm_update(sym, "ob_imb", ob_25)
     spread_bps_z = _norm_update(sym, "spread_bps", spread_bps)
     depth_25_z = _norm_update(sym, "depth_25", depth_usd_25)
+    oi_z = _norm_update(sym, "oi", oi_value) if oi_value is not None else None
+    funding_z2 = _norm_update(sym, "funding", funding_rate) if funding_rate is not None else None
 
-    funding_regime = _classify_funding(funding_rate, z=funding_z)
+    funding_regime = _classify_funding(funding_rate, z=funding_z if funding_z is not None else funding_z2)
     ob_regime = _classify_orderbook(ob_25)
 
-    # Score components (simple & compatible)
+    # Score components (simple & compatible, but slightly richer)
+    # Keep the original keys exactly (flow/oi/crowding/orderbook) to avoid surprises.
     components = {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0}
     score = 0
 
@@ -859,6 +1036,11 @@ async def compute_full_institutional_analysis(
 
     if oi_value is not None:
         components["oi"] = 1
+        score += 1
+
+    # Optional “flow” component if we have tape signal
+    if tape_5m is not None:
+        components["flow"] = 1
         score += 1
 
     score = max(0, min(4, int(score)))
@@ -876,7 +1058,7 @@ async def compute_full_institutional_analysis(
         "available": bool(depth is not None or ws_used or (funding_rate is not None) or (oi_value is not None)),
 
         "oi": oi_value,
-        "oi_slope": None,
+        "oi_slope": oi_change_1h_pct,  # kept as slope-ish proxy (pct over 1h)
 
         "cvd_slope": None,
         "cvd_notional_5m": None,
@@ -885,7 +1067,7 @@ async def compute_full_institutional_analysis(
         "funding_regime": funding_regime,
         "funding_mean": funding_mean,
         "funding_std": funding_std,
-        "funding_z": funding_z,
+        "funding_z": funding_z,  # funding history z (FULL mode)
         "next_funding_time_ms": next_funding_time_ms,
 
         "basis_pct": None,
@@ -911,6 +1093,19 @@ async def compute_full_institutional_analysis(
         "crowding_regime": "unknown",
         "flow_regime": "unknown",
 
+        # ---- Derived fields used by scanner veto (safe if None) ----
+        "oi_change_15m_pct": oi_change_15m_pct,
+        "oi_change_1h_pct": oi_change_1h_pct,
+        "funding_change_1h": funding_change_1h,
+        "funding_flip_1h": funding_flip,
+
+        # Placeholder for future liq aggregation (kept for scanner key lookups)
+        "liq_1h_usdt": None,
+
+        # Extra normalized helpers (optional)
+        "oi_z": oi_z,
+        "funding_z_rt": funding_z2,
+
         "warnings": warnings,
 
         "score_components": components,
@@ -923,6 +1118,8 @@ async def compute_full_institutional_analysis(
             "norm_window": int(INST_NORM_WINDOW),
             "bitget_product_type": INST_BITGET_PRODUCT_TYPE,
             "inst_version": INST_VERSION,
+            "derived_enabled": bool(INST_DERIVED_ENABLED),
+            "derived_max_age_s": float(INST_DERIVED_MAX_AGE_S),
         },
 
         "available_components": [],
@@ -968,7 +1165,7 @@ async def compute_full_institutional_analysis(
 
     if INST_TRACE_PAYLOAD:
         LOGGER.info(
-            "[INST_PAYLOAD] sym=%s ob_imb=%s spread_bps=%s depth_usd_25=%s funding_rate=%s funding_z=%s oi=%s",
+            "[INST_PAYLOAD] sym=%s ob_imb=%s spread_bps=%s depth_usd_25=%s funding_rate=%s funding_z=%s oi=%s oi_chg_1h=%s tape_5m=%s",
             sym,
             None if ob_25 is None else float(ob_25),
             spread_bps,
@@ -976,6 +1173,8 @@ async def compute_full_institutional_analysis(
             funding_rate,
             funding_z,
             oi_value,
+            oi_change_1h_pct,
+            tape_5m,
         )
 
     return payload
