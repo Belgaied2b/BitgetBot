@@ -15,6 +15,9 @@
 # ✅ Optional OI REST fallback when WS missing (env: INST_OI_FALLBACK_WHEN_WS_MISSING=1)
 # ✅ Safer caches + symbol-normalized series storage
 # ✅ Keeps legacy keys to avoid KeyError: openInterest, fundingRate, binance_symbol...
+# ✅ NEW: prefer settings.py values when present (avoid split-brain defaults)
+# ✅ NEW: z-score clamp via INST_NORM_CLIP
+# ✅ NEW: quality_score + quality_flags in score_meta
 # =====================================================================
 
 from __future__ import annotations
@@ -42,6 +45,25 @@ INST_VERSION = "UltraDesk3.1-bitget-only+funding-fallback+oi-optin+derived-2026-
 BITGET_API_BASE = str(os.getenv("BITGET_API_BASE", "https://api.bitget.com")).strip()
 
 # ---------------------------------------------------------------------
+# Optional: prefer settings.py as source of truth (prevents split-brain defaults)
+# ---------------------------------------------------------------------
+try:
+    import settings as _SETTINGS  # type: ignore
+except Exception:  # pragma: no cover
+    _SETTINGS = None  # type: ignore
+
+
+def _cfg(name: str, default: Any) -> Any:
+    """Return settings.NAME if available, else default."""
+    try:
+        if _SETTINGS is not None and hasattr(_SETTINGS, name):
+            return getattr(_SETTINGS, name)
+    except Exception:
+        pass
+    return default
+
+
+# ---------------------------------------------------------------------
 # Debug flags
 # ---------------------------------------------------------------------
 INST_DEBUG = str(os.getenv("INST_DEBUG", "0")).strip() == "1"
@@ -58,8 +80,8 @@ try:
 except Exception:
     _WS_HUB = None
 
-INST_USE_WS_HUB = str(os.getenv("INST_USE_WS_HUB", "1")).strip() == "1"
-WS_STALE_SEC = float(os.getenv("INST_WS_STALE_SEC", "15"))
+INST_USE_WS_HUB = bool(_cfg("INST_USE_WS_HUB", str(os.getenv("INST_USE_WS_HUB", "1")).strip() == "1"))
+WS_STALE_SEC = float(_cfg("WS_STALE_SEC", float(os.getenv("INST_WS_STALE_SEC", "15"))))
 
 # ---------------------------------------------------------------------
 # Product type (Bitget v2 uses lower-case values in request examples)
@@ -70,7 +92,7 @@ INST_BITGET_PRODUCT_TYPE = str(os.getenv("INST_BITGET_PRODUCT_TYPE", "usdt-futur
 # ---------------------------------------------------------------------
 # Modes
 # ---------------------------------------------------------------------
-INST_MODE = str(os.getenv("INST_MODE", "LIGHT")).upper().strip()
+INST_MODE = str(_cfg("INST_MODE", os.getenv("INST_MODE", "LIGHT"))).upper().strip()
 if INST_MODE not in ("LIGHT", "NORMAL", "FULL"):
     INST_MODE = "LIGHT"
 
@@ -80,20 +102,21 @@ if INST_MODE not in ("LIGHT", "NORMAL", "FULL"):
 # - Open interest: opt-in (can add load on big scans)
 # - OI fallback when WS missing: optional, still respects TTL cache
 # ---------------------------------------------------------------------
-INST_ENABLE_OPEN_INTEREST = str(os.getenv("INST_ENABLE_OPEN_INTEREST", "0")).strip() == "1"
-INST_ENABLE_CURRENT_FUNDING = str(os.getenv("INST_ENABLE_CURRENT_FUNDING", "1")).strip() == "1"
-INST_OI_FALLBACK_WHEN_WS_MISSING = str(os.getenv("INST_OI_FALLBACK_WHEN_WS_MISSING", "0")).strip() == "1"
+INST_ENABLE_OPEN_INTEREST = bool(_cfg("INST_ENABLE_OPEN_INTEREST", str(os.getenv("INST_ENABLE_OPEN_INTEREST", "0")).strip() == "1"))
+INST_ENABLE_CURRENT_FUNDING = bool(_cfg("INST_ENABLE_CURRENT_FUNDING", str(os.getenv("INST_ENABLE_CURRENT_FUNDING", "1")).strip() == "1"))
+INST_OI_FALLBACK_WHEN_WS_MISSING = bool(_cfg("INST_OI_FALLBACK_WHEN_WS_MISSING", str(os.getenv("INST_OI_FALLBACK_WHEN_WS_MISSING", "0")).strip() == "1"))
 
 # kept for compatibility (not implemented in this file)
-INST_ENABLE_RECENT_FILLS = str(os.getenv("INST_ENABLE_RECENT_FILLS", "0")).strip() == "1"
-INST_ENABLE_CANDLES = str(os.getenv("INST_ENABLE_CANDLES", "0")).strip() == "1"
+INST_ENABLE_RECENT_FILLS = bool(_cfg("INST_ENABLE_RECENT_FILLS", str(os.getenv("INST_ENABLE_RECENT_FILLS", "0")).strip() == "1"))
+INST_ENABLE_CANDLES = bool(_cfg("INST_ENABLE_CANDLES", str(os.getenv("INST_ENABLE_CANDLES", "0")).strip() == "1"))
 
 # ---------------------------------------------------------------------
 # Normalisation (rolling z-scores)
 # ---------------------------------------------------------------------
-INST_NORM_ENABLED = str(os.getenv("INST_NORM_ENABLED", "1")).strip() == "1"
-INST_NORM_MIN_POINTS = int(float(os.getenv("INST_NORM_MIN_POINTS", "20")))
-INST_NORM_WINDOW = int(float(os.getenv("INST_NORM_WINDOW", "120")))
+INST_NORM_ENABLED = bool(_cfg("INST_NORM_ENABLED", str(os.getenv("INST_NORM_ENABLED", "1")).strip() == "1"))
+INST_NORM_MIN_POINTS = int(_cfg("INST_NORM_MIN_POINTS", int(float(os.getenv("INST_NORM_MIN_POINTS", "20")))))
+INST_NORM_WINDOW = int(_cfg("INST_NORM_WINDOW", int(float(os.getenv("INST_NORM_WINDOW", "120")))))
+INST_NORM_CLIP = float(os.getenv("INST_NORM_CLIP", "5.0"))
 
 # ---------------------------------------------------------------------
 # Derived series (no extra endpoints)
@@ -475,6 +498,10 @@ class _RollingZ:
             mean, std = _mean_std(vals)
             if mean is not None and std is not None and std > 1e-12:
                 z = float((vf - float(mean)) / float(std))
+                try:
+                    z = float(max(-float(INST_NORM_CLIP), min(float(INST_NORM_CLIP), float(z))))
+                except Exception:
+                    pass
 
         self.values.append(vf)
         return z
@@ -523,7 +550,6 @@ class _Series:
     def value_at_or_before(self, ts_ms: int) -> Optional[Tuple[int, float]]:
         if not self.pts:
             return None
-        # walk from right to left (fast for recent history)
         for t, v in reversed(self.pts):
             if int(t) <= int(ts_ms):
                 return int(t), float(v)
@@ -580,16 +606,12 @@ def _pct_change(series: _Series, now_ms: int, horizon_s: float) -> Optional[floa
         last = series.last()
         if last is None:
             return None
-        t1, v1 = last
-        if v1 is None:
-            return None
+        _, v1 = last
         t0_target = int(now_ms - float(horizon_s) * 1000.0)
         old = series.value_at_or_before(t0_target)
         if old is None:
             return None
         _, v0 = old
-        if v0 is None:
-            return None
         v0f = float(v0)
         if abs(v0f) <= 1e-12:
             return None
@@ -654,7 +676,6 @@ async def _fetch_funding_history(symbol: str, limit: int = 30) -> Optional[List[
 
 
 def _parse_next_update_ms(d0: Dict[str, Any]) -> Optional[int]:
-    # docs for current-fund-rate show "nextUpdate" (ms). Keep tolerant for variants.
     for k in ("nextUpdate", "nextUpdateTime", "nextFundingTime", "nextSettleTime", "next_settle_time", "next_funding_time"):
         if k in d0 and d0.get(k) is not None:
             try:
@@ -665,7 +686,6 @@ def _parse_next_update_ms(d0: Dict[str, Any]) -> Optional[int]:
 
 
 async def _fetch_current_funding_rate(symbol: str) -> Tuple[Optional[float], Optional[int]]:
-    # TTL cache
     now_s = time.time()
     c = _FUNDING_CACHE.get(symbol)
     if c is not None:
@@ -704,7 +724,6 @@ async def _fetch_current_funding_rate(symbol: str) -> Tuple[Optional[float], Opt
 
 
 async def _fetch_open_interest(symbol: str) -> Optional[float]:
-    # TTL cache
     now_s = time.time()
     c = _OI_CACHE.get(symbol)
     if c is not None:
@@ -820,6 +839,50 @@ def _components_ok_count(components: Dict[str, int]) -> int:
         return 0
 
 
+def _quality_assessment(
+    *,
+    ok_count: int,
+    ws_used: bool,
+    depth_ok: bool,
+    funding_ok: bool,
+    oi_ok: bool,
+    warnings: List[str],
+) -> Tuple[int, List[str]]:
+    """Heuristic completeness score (0..100) for data reliability."""
+    score = 100
+    flags: List[str] = []
+
+    if ok_count <= 0:
+        score -= 60
+        flags.append("no_components_ok")
+    elif ok_count == 1:
+        score -= 35
+        flags.append("only_1_component_ok")
+    elif ok_count == 2:
+        score -= 15
+        flags.append("only_2_components_ok")
+
+    if not ws_used:
+        score -= 10
+        flags.append("ws_not_used")
+    if not depth_ok:
+        score -= 25
+        flags.append("no_orderbook")
+    if not funding_ok:
+        score -= 15
+        flags.append("no_funding")
+    if not oi_ok:
+        score -= 15
+        flags.append("no_oi")
+
+    if warnings:
+        score -= min(20, 5 * len(warnings))
+        flags.append("warnings_present")
+
+    score = max(0, min(100, int(score)))
+    return score, flags
+
+
 def _available_components_list(payload: Dict[str, Any]) -> List[str]:
     out: List[str] = []
     if payload.get("orderbook_imb_25bps") is not None:
@@ -880,7 +943,6 @@ async def compute_full_institutional_analysis(
     ws_snap = _ws_snapshot(sym)
     ws_used = bool(ws_snap is not None)
 
-    # Determine a consistent sample timestamp (ms)
     now_ms = _now_ms()
     snap_ts_ms = now_ms
     if isinstance(ws_snap, dict) and ws_snap.get("ts") is not None:
@@ -889,7 +951,6 @@ async def compute_full_institutional_analysis(
         except Exception:
             snap_ts_ms = now_ms
 
-    # 1) Depth (always)
     depth = await _fetch_merge_depth(sym)
     if depth is None:
         warnings.append("no_depth")
@@ -910,7 +971,6 @@ async def compute_full_institutional_analysis(
         spread_bps = _compute_spread_bps_from_depth(depth)
         microprice = _compute_microprice_from_depth(depth)
 
-    # 2) Funding history only in FULL (heavier)
     funding_mean = funding_std = funding_z = None
     if eff_mode == "FULL":
         hist = await _fetch_funding_history(sym, limit=30)
@@ -921,7 +981,6 @@ async def compute_full_institutional_analysis(
             funding_mean, funding_std, funding_z = _compute_funding_stats_bitget(hist)
             sources["funding_hist"] = "bitget_rest"
 
-    # 3) Current funding / OI: prefer WS hub, fallback to REST
     funding_rate: Optional[float] = None
     next_funding_time_ms: Optional[int] = None
     tape_5m: Optional[float] = None
@@ -947,7 +1006,6 @@ async def compute_full_institutional_analysis(
         except Exception:
             warnings.append("ws_parse_error")
 
-    # REST fallback for funding (enabled by default)
     if funding_rate is None and INST_ENABLE_CURRENT_FUNDING:
         fr, nu = await _fetch_current_funding_rate(sym)
         if fr is not None:
@@ -961,7 +1019,6 @@ async def compute_full_institutional_analysis(
             next_funding_time_ms = int(nu)
             sources["next_funding_time"] = sources.get("next_funding_time", "bitget_rest")
 
-    # REST open interest (opt-in OR optional fallback when WS missing)
     need_oi_rest = bool(INST_ENABLE_OPEN_INTEREST) or (INST_OI_FALLBACK_WHEN_WS_MISSING and (oi_value is None))
     if oi_value is None and need_oi_rest:
         oi = await _fetch_open_interest(sym)
@@ -972,13 +1029,11 @@ async def compute_full_institutional_analysis(
             warnings.append("no_open_interest")
             sources["oi"] = sources.get("oi", "none")
 
-    # Compatibility flags (not implemented here)
     if INST_ENABLE_RECENT_FILLS and tape_5m is None:
         warnings.append("recent_fills_flag_on_but_not_implemented_here")
     if INST_ENABLE_CANDLES:
         warnings.append("candles_flag_on_but_not_implemented_here")
 
-    # ---- Derived series update (OI change, funding change) ----
     if INST_DERIVED_ENABLED:
         _update_derived(sym, snap_ts_ms, oi=oi_value, funding=funding_rate)
 
@@ -996,7 +1051,6 @@ async def compute_full_institutional_analysis(
         except Exception:
             pass
 
-        # Funding flip heuristic: sign changed vs 1h-ago (if available)
         try:
             if funding_rate is not None:
                 st = _derived_state(sym)
@@ -1011,7 +1065,6 @@ async def compute_full_institutional_analysis(
         except Exception:
             funding_flip = None
 
-    # Normalization
     ob_imb_z = _norm_update(sym, "ob_imb", ob_25)
     spread_bps_z = _norm_update(sym, "spread_bps", spread_bps)
     depth_25_z = _norm_update(sym, "depth_25", depth_usd_25)
@@ -1021,8 +1074,6 @@ async def compute_full_institutional_analysis(
     funding_regime = _classify_funding(funding_rate, z=funding_z if funding_z is not None else funding_z2)
     ob_regime = _classify_orderbook(ob_25)
 
-    # Score components (simple & compatible, but slightly richer)
-    # Keep the original keys exactly (flow/oi/crowding/orderbook) to avoid surprises.
     components = {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0}
     score = 0
 
@@ -1038,7 +1089,6 @@ async def compute_full_institutional_analysis(
         components["oi"] = 1
         score += 1
 
-    # Optional “flow” component if we have tape signal
     if tape_5m is not None:
         components["flow"] = 1
         score += 1
@@ -1046,19 +1096,27 @@ async def compute_full_institutional_analysis(
     score = max(0, min(4, int(score)))
     ok_count = _components_ok_count(components)
 
+    quality_score, quality_flags = _quality_assessment(
+        ok_count=int(ok_count),
+        ws_used=bool(ws_used),
+        depth_ok=bool(depth is not None),
+        funding_ok=bool((funding_rate is not None) or (funding_z is not None)),
+        oi_ok=bool(oi_value is not None),
+        warnings=warnings,
+    )
+
     payload: Dict[str, Any] = {
         "institutional_score": int(score),
         "institutional_score_raw": int(score),
         "institutional_score_v2": int(score),
         "institutional_score_v3": int(score),
 
-        # legacy name kept (your logs expect binance_symbol=...)
         "binance_symbol": sym,
 
         "available": bool(depth is not None or ws_used or (funding_rate is not None) or (oi_value is not None)),
 
         "oi": oi_value,
-        "oi_slope": oi_change_1h_pct,  # kept as slope-ish proxy (pct over 1h)
+        "oi_slope": oi_change_1h_pct,
 
         "cvd_slope": None,
         "cvd_notional_5m": None,
@@ -1067,7 +1125,7 @@ async def compute_full_institutional_analysis(
         "funding_regime": funding_regime,
         "funding_mean": funding_mean,
         "funding_std": funding_std,
-        "funding_z": funding_z,  # funding history z (FULL mode)
+        "funding_z": funding_z,
         "next_funding_time_ms": next_funding_time_ms,
 
         "basis_pct": None,
@@ -1093,16 +1151,13 @@ async def compute_full_institutional_analysis(
         "crowding_regime": "unknown",
         "flow_regime": "unknown",
 
-        # ---- Derived fields used by scanner veto (safe if None) ----
         "oi_change_15m_pct": oi_change_15m_pct,
         "oi_change_1h_pct": oi_change_1h_pct,
         "funding_change_1h": funding_change_1h,
         "funding_flip_1h": funding_flip,
 
-        # Placeholder for future liq aggregation (kept for scanner key lookups)
         "liq_1h_usdt": None,
 
-        # Extra normalized helpers (optional)
         "oi_z": oi_z,
         "funding_z_rt": funding_z2,
 
@@ -1112,6 +1167,8 @@ async def compute_full_institutional_analysis(
         "score_meta": {
             "mode": eff_mode,
             "ok_count": int(ok_count),
+            "quality_score": int(quality_score),
+            "quality_flags": list(quality_flags),
             "ws_snapshot_used": bool(ws_used),
             "norm_enabled": bool(INST_NORM_ENABLED),
             "norm_min_points": int(INST_NORM_MIN_POINTS),
@@ -1130,7 +1187,6 @@ async def compute_full_institutional_analysis(
         "normalization_enabled": bool(INST_NORM_ENABLED),
         "data_sources": sources,
 
-        # Legacy/compat keys (KEEP!)
         "openInterest": oi_value,
         "fundingRate": funding_rate,
         "basisPct": None,
