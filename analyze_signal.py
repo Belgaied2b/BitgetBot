@@ -253,6 +253,7 @@ def _inst_micro_filters(inst: Dict[str, Any], bias: str, setup_intent: str) -> T
         if _sign_align(b, funding):
             vetoes.append("funding_extreme_crowded")
         else:
+
 def _inst_micro_filters(inst: Dict[str, Any], bias: str, setup_intent: str) -> T
             align_tags.append("flow_buy")
         if b == "SHORT" and "sell" in flow:
