@@ -267,6 +267,16 @@ INST_NORM_ENABLED = _get_bool("INST_NORM_ENABLED", True)
 INST_NORM_MIN_POINTS = _get_int("INST_NORM_MIN_POINTS", 20, min_v=5, max_v=500)
 INST_NORM_WINDOW = _get_int("INST_NORM_WINDOW", 120, min_v=20, max_v=5000)
 
+# Institutional liquidity guardrails (orderbook-based)
+INST_LIQ_FILTER_ENABLE = _get_bool("INST_LIQ_FILTER_ENABLE", True)
+INST_LIQ_FILTER_STRICT = _get_bool("INST_LIQ_FILTER_STRICT", True)
+INST_LIQ_MIN_DEPTH_USD_25BPS = _get_float("INST_LIQ_MIN_DEPTH_USD_25BPS", 250000.0, min_v=0.0, max_v=1.0e9)
+INST_LIQ_MIN_DEPTH_BID_USD_25BPS = _get_float("INST_LIQ_MIN_DEPTH_BID_USD_25BPS", 80000.0, min_v=0.0, max_v=1.0e9)
+INST_LIQ_MIN_DEPTH_ASK_USD_25BPS = _get_float("INST_LIQ_MIN_DEPTH_ASK_USD_25BPS", 80000.0, min_v=0.0, max_v=1.0e9)
+INST_LIQ_MAX_SPREAD_BPS = _get_float("INST_LIQ_MAX_SPREAD_BPS", 8.0, min_v=0.1, max_v=200.0)
+INST_LIQ_RISK_FLOOR = _get_float("INST_LIQ_RISK_FLOOR", 0.35, min_v=0.05, max_v=1.0)
+INST_LIQ_RISK_CAP = _get_float("INST_LIQ_RISK_CAP", 1.0, min_v=0.1, max_v=2.0)
+
 # WS hub controls (institutional_ws_hub)
 # - INST_USE_WS_HUB is the switch used by institutional_data.py in your version
 # - INST_WS_HUB_ENABLE is kept as alias for older code paths
