@@ -1203,6 +1203,10 @@ async def analyze_symbol(
         opt_regime = str(opt_ctx.get("regime") or "unknown")
         opt_score = int(opt_ctx.get("score") or 0)
 
+        inst_micro = result.get("inst_micro") if isinstance(result.get("inst_micro"), dict) else {}
+        inst_liq_rf = _sanitize_risk_factor(inst_micro.get("liquidity_risk_factor", 1.0))
+        combined_rf = _sanitize_risk_factor(opt_rf * inst_liq_rf)
+
         desk_log(
             logging.INFO,
             "EXITS",
@@ -1219,6 +1223,8 @@ async def analyze_symbol(
             comp=comp_score,
             opt_regime=opt_regime,
             opt_rf=opt_rf,
+            inst_liq_rf=inst_liq_rf,
+            risk_rf=combined_rf,
             fetch_ms=fetch_ms,
             analyze_ms=analyze_ms,
         )
@@ -1266,7 +1272,8 @@ async def analyze_symbol(
             "options": opt_ctx,
             "opt_regime": opt_regime,
             "opt_score": opt_score,
-            "risk_factor": float(opt_rf),
+            "inst_liq_risk_factor": float(inst_liq_rf),
+            "risk_factor": float(combined_rf),
         }
 
 
