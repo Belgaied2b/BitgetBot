@@ -81,7 +81,7 @@ try:
 except Exception:
     compute_smt_divergence = None  # type: ignore
 
-@@ -606,67 +614,171 @@ def _pick_first(inst: Dict[str, Any], keys: List[str]) -> Any:
+def _pick_first(inst: Dict[str, Any], keys: List[str]) -> Any:
     for k in keys:
         if k in inst and inst.get(k) is not None:
             return inst.get(k)
