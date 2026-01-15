@@ -48,6 +48,14 @@ from settings import (
     RR_MIN_DESK_PRIORITY,
     INST_SCORE_DESK_PRIORITY,
     DESK_EV_MODE,
+    INST_LIQ_FILTER_ENABLE,
+    INST_LIQ_FILTER_STRICT,
+    INST_LIQ_MIN_DEPTH_USD_25BPS,
+    INST_LIQ_MIN_DEPTH_BID_USD_25BPS,
+    INST_LIQ_MIN_DEPTH_ASK_USD_25BPS,
+    INST_LIQ_MAX_SPREAD_BPS,
+    INST_LIQ_RISK_FLOOR,
+    INST_LIQ_RISK_CAP,
     REQUIRE_STRUCTURE,
     REQUIRE_MOMENTUM,
     REQUIRE_HTF_ALIGN,
@@ -73,536 +81,7 @@ try:
 except Exception:
     compute_smt_divergence = None  # type: ignore
 
-try:
-    from options_data import OptionsSnapshot, score_options_context  # type: ignore
-except Exception:
-    OptionsSnapshot = None  # type: ignore
-    score_options_context = None  # type: ignore
-
-
-# =====================================================================
-# ✅ ENV helpers
-# =====================================================================
-def _env_flag(name: str, default: str = "0") -> bool:
-    return str(os.getenv(name, default)).strip() == "1"
-
-
-def _env_str(name: str, default: str) -> str:
-    return str(os.getenv(name, default)).strip()
-
-
-def _env_int(name: str, default: str) -> int:
-    try:
-        return int(_env_str(name, default))
-    except Exception:
-        return int(default)
-
-
-def _env_float(name: str, default: str) -> float:
-    try:
-        return float(_env_str(name, default))
-    except Exception:
-        return float(default)
-
-
-# =====================================================================
-# ✅ INSTITUTIONAL MAX: Session / Killzones (UTC windows by default)
-# =====================================================================
-# If enabled: outside killzones -> reject in non-desk, soft veto in desk.
-SESSION_FILTER_ENABLE = _env_flag("SESSION_FILTER_ENABLE", "1")
-SESSION_FILTER_STRICT = _env_flag("SESSION_FILTER_STRICT", "1")  # if 0 and desk -> always soft veto only
-SESSION_TZ = _env_str("SESSION_TZ", "UTC")  # "UTC" recommended for stability
-# London killzone default (UTC)
-LONDON_START = _env_str("LONDON_START", "07:00")
-LONDON_END = _env_str("LONDON_END", "10:00")
-# NY killzone default (UTC)
-NY_START = _env_str("NY_START", "13:00")
-NY_END = _env_str("NY_END", "16:00")
-
-
-def _parse_hhmm(s: str) -> time:
-    try:
-        hh, mm = str(s).strip().split(":")
-        return time(hour=int(hh), minute=int(mm))
-    except Exception:
-        return time(0, 0)
-
-
-def _now_in_tz(tz_name: str) -> datetime:
-    tz_name = (tz_name or "UTC").strip()
-    try:
-        tz = timezone.utc if tz_name.upper() == "UTC" else ZoneInfo(tz_name)
-    except Exception:
-        tz = timezone.utc
-    return datetime.now(tz=tz)
-
-
-def _in_time_window(now_t: time, start: time, end: time) -> bool:
-    # Handles standard window same-day only (start < end)
-    if start <= end:
-        return (now_t >= start) and (now_t <= end)
-    # If someone configures wrap-around (rare), handle it
-    return (now_t >= start) or (now_t <= end)
-
-
-def _session_ok() -> Tuple[bool, str, Dict[str, Any]]:
-    meta: Dict[str, Any] = {}
-    if not SESSION_FILTER_ENABLE:
-        return True, "OK", {"enabled": False}
-
-    now_dt = _now_in_tz(SESSION_TZ)
-    now_t = now_dt.time()
-
-    l_start = _parse_hhmm(LONDON_START)
-    l_end = _parse_hhmm(LONDON_END)
-    ny_start = _parse_hhmm(NY_START)
-    ny_end = _parse_hhmm(NY_END)
-
-    in_london = _in_time_window(now_t, l_start, l_end)
-    in_ny = _in_time_window(now_t, ny_start, ny_end)
-    ok = bool(in_london or in_ny)
-
-    meta.update(
-        {
-            "enabled": True,
-            "tz": SESSION_TZ,
-            "now": now_dt.isoformat(),
-            "in_london": bool(in_london),
-            "in_ny": bool(in_ny),
-            "london": f"{LONDON_START}-{LONDON_END}",
-            "ny": f"{NY_START}-{NY_END}",
-        }
-    )
-    return ok, ("OK" if ok else "outside_killzones"), meta
-
-
-# =====================================================================
-# ✅ TrendGuard (anti-contre-tendance / anti-chop MARKET)
-# =====================================================================
-TG_STRICT_HTF_BIAS = _env_flag("TG_STRICT_HTF_BIAS", "1")
-TG_STRICT_REGIME_MARKET = _env_flag("TG_STRICT_REGIME_MARKET", "1")
-TG_ADX_PERIOD = _env_int("TG_ADX_PERIOD", "14")
-TG_ADX_MIN = _env_float("TG_ADX_MIN", "20")
-TG_BB_PERIOD = _env_int("TG_BB_PERIOD", "20")
-TG_BB_K = _env_float("TG_BB_K", "2")
-TG_BB_SQUEEZE_BW = _env_float("TG_BB_SQUEEZE_BW", "0.04")
-TG_OVEREXT_ATR = _env_float("TG_OVEREXT_ATR", "1.2")
-
-
-def _ema(series: pd.Series, span: int) -> pd.Series:
-    return pd.Series(series).astype(float).ewm(span=int(span), adjust=False).mean()
-
-
-def _ensure_ohlcv(df: pd.DataFrame) -> bool:
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return False
-    for c in REQUIRED_COLS:
-        if c not in df.columns:
-            return False
-    return True
-
-
-def _last_close(df: pd.DataFrame) -> float:
-    try:
-        return float(df["close"].astype(float).iloc[-1])
-    except Exception:
-        return 0.0
-
-
-def _atr(df: pd.DataFrame, n: int = 14) -> float:
-    try:
-        if not _ensure_ohlcv(df) or len(df) < n + 2:
-            return 0.0
-        s = true_atr(df, length=n)
-        v = float(s.iloc[-1]) if s is not None and len(s) else 0.0
-        return float(max(0.0, v)) if np.isfinite(v) else 0.0
-    except Exception:
-        return 0.0
-
-
-def _adx_wilder(df: pd.DataFrame, period: int = 14) -> float:
-    try:
-        if df is None or df.empty or len(df) < period * 3:
-            return 0.0
-        for c in ("high", "low", "close"):
-            if c not in df.columns:
-                return 0.0
-
-        h = pd.to_numeric(df["high"], errors="coerce").astype(float)
-        l = pd.to_numeric(df["low"], errors="coerce").astype(float)
-        c = pd.to_numeric(df["close"], errors="coerce").astype(float)
-
-        up = h.diff()
-        dn = -l.diff()
-
-        plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
-        minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
-
-        prev_close = c.shift(1)
-        tr = pd.concat([(h - l).abs(), (h - prev_close).abs(), (l - prev_close).abs()], axis=1).max(axis=1)
-
-        alpha = 1.0 / float(max(1, int(period)))
-        atr = pd.Series(tr).ewm(alpha=alpha, adjust=False).mean()
-
-        pdi = 100.0 * (pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, np.nan))
-        mdi = 100.0 * (pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, np.nan))
-
-        dx = 100.0 * (abs(pdi - mdi) / (pdi + mdi).replace(0, np.nan))
-        adx_s = pd.Series(dx).ewm(alpha=alpha, adjust=False).mean()
-        v = float(adx_s.iloc[-1])
-        return v if np.isfinite(v) else 0.0
-    except Exception:
-        return 0.0
-
-
-def _bb_bandwidth(df: pd.DataFrame, period: int = 20, k: float = 2.0) -> float:
-    try:
-        if df is None or df.empty or len(df) < period + 5:
-            return 0.0
-        if "close" not in df.columns:
-            return 0.0
-        c = pd.to_numeric(df["close"], errors="coerce").astype(float)
-        mid = c.rolling(int(period)).mean()
-        sd = c.rolling(int(period)).std(ddof=0)
-        upper = mid + float(k) * sd
-        lower = mid - float(k) * sd
-        denom = mid.replace(0, np.nan)
-        bw = (upper - lower) / denom
-        v = float(bw.iloc[-1])
-        return v if np.isfinite(v) else 0.0
-    except Exception:
-        return 0.0
-
-
-def _is_squeeze(df: pd.DataFrame) -> bool:
-    bw = _bb_bandwidth(df, period=TG_BB_PERIOD, k=TG_BB_K)
-    return bool(bw > 0 and bw < TG_BB_SQUEEZE_BW)
-
-
-def _is_market_entry(entry_type: str) -> bool:
-    return "MARKET" in str(entry_type or "").upper()
-
-
-def _htf_bias_from_df(df_h4: pd.DataFrame) -> str:
-    try:
-        st = analyze_structure(df_h4)
-        t = str(st.get("trend") or "").upper()
-        if t in ("LONG", "SHORT"):
-            return t
-    except Exception:
-        pass
-
-    try:
-        if df_h4 is None or df_h4.empty or len(df_h4) < 60 or "close" not in df_h4.columns:
-            return "RANGE"
-        c = pd.to_numeric(df_h4["close"], errors="coerce").astype(float)
-        e20 = _ema(c, 20)
-        e50 = _ema(c, 50)
-        if float(e20.iloc[-1]) > float(e50.iloc[-1]):
-            return "LONG"
-        if float(e20.iloc[-1]) < float(e50.iloc[-1]):
-            return "SHORT"
-        return "RANGE"
-    except Exception:
-        return "RANGE"
-
-
-def _trend_guard(
-    *,
-    df_h1: pd.DataFrame,
-    df_h4: pd.DataFrame,
-    bias: str,
-    entry: Optional[float],
-    entry_type: str,
-) -> Tuple[bool, str, Dict[str, Any]]:
-    meta: Dict[str, Any] = {}
-    b = str(bias or "").upper()
-    et = str(entry_type or "MARKET")
-
-    htf_bias = _htf_bias_from_df(df_h4)
-    meta["htf_bias"] = htf_bias
-    meta["bias"] = b
-    if TG_STRICT_HTF_BIAS and htf_bias in ("LONG", "SHORT") and b in ("LONG", "SHORT") and htf_bias != b:
-        return False, "reject:htf_bias_mismatch", meta
-
-    adx_v = _adx_wilder(df_h4, period=TG_ADX_PERIOD)
-    meta["adx_h4"] = float(adx_v)
-    sq = _is_squeeze(df_h1)
-    meta["squeeze_h1"] = bool(sq)
-
-    if _is_market_entry(et) and TG_STRICT_REGIME_MARKET:
-        if adx_v > 0 and adx_v < TG_ADX_MIN:
-            return False, "reject:weak_trend_no_market", meta
-        if sq:
-            return False, "reject:squeeze_no_market", meta
-
-        try:
-            if entry is not None and "close" in df_h1.columns:
-                a = _atr(df_h1, 14)
-                meta["atr_h1"] = float(a)
-                if a > 0:
-                    c = pd.to_numeric(df_h1["close"], errors="coerce").astype(float)
-                    ema20 = float(_ema(c, 20).iloc[-1])
-                    meta["ema20_h1"] = float(ema20)
-                    if abs(float(entry) - ema20) > float(TG_OVEREXT_ATR) * a:
-                        return False, "reject:overextended_market", meta
-        except Exception:
-            pass
-
-    return True, "OK", meta
-
-
-# =====================================================================
-# Macro unwrap helpers
-# =====================================================================
-def _unwrap_macro(macro: Any) -> Dict[str, Any]:
-    if isinstance(macro, dict):
-        return macro
-    return {}
-
-
-def _get_macro_ref_df(macro: Any) -> Optional[pd.DataFrame]:
-    try:
-        m = _unwrap_macro(macro)
-        for k in ("btc_h1", "btc_df_h1", "btc_h1_df", "BTC_H1", "BTC", "btc"):
-            v = m.get(k)
-            if isinstance(v, pd.DataFrame) and (not v.empty):
-                return v
-        mm = m.get("macro")
-        if isinstance(mm, dict):
-            for k in ("btc_h1", "btc_df_h1", "btc_h1_df", "BTC_H1", "BTC", "btc"):
-                v = mm.get(k)
-                if isinstance(v, pd.DataFrame) and (not v.empty):
-                    return v
-        return None
-    except Exception:
-        return None
-
-
-def _get_macro_implied_vol(macro: Any, symbol: str) -> Optional[float]:
-    try:
-        m = _unwrap_macro(macro)
-
-        def _probe(d: Dict[str, Any]) -> Optional[float]:
-            iv = d.get("implied_vol", None)
-            if iv is None:
-                iv = d.get("iv", None)
-            if iv is None:
-                return None
-
-            if isinstance(iv, (int, float, np.floating)):
-                v = float(iv)
-                return v if np.isfinite(v) and v > 0 else None
-
-            if isinstance(iv, dict):
-                if symbol in iv:
-                    v = float(iv[symbol])
-                    return v if np.isfinite(v) and v > 0 else None
-                sym2 = str(symbol).replace("-USDT", "").replace("USDTM", "").replace("USDT", "")
-                if sym2 in iv:
-                    v = float(iv[sym2])
-                    return v if np.isfinite(v) and v > 0 else None
-            return None
-
-        v1 = _probe(m)
-        if v1 is not None:
-            return v1
-        mm = m.get("macro")
-        if isinstance(mm, dict):
-            return _probe(mm)
-        return None
-    except Exception:
-        return None
-
-
-def _get_options_obj(macro: Any) -> Any:
-    try:
-        m = _unwrap_macro(macro)
-        if "options" in m:
-            return m.get("options")
-        if "options_snapshot" in m:
-            return m.get("options_snapshot")
-        mm = m.get("macro")
-        if isinstance(mm, dict):
-            if "options" in mm:
-                return mm.get("options")
-            if "options_snapshot" in mm:
-                return mm.get("options_snapshot")
-        return None
-    except Exception:
-        return None
-
-
-def _score_options_context_safe(opt_obj: Any, *, bias: str, setup_type: Optional[str] = None) -> Dict[str, Any]:
-    if score_options_context is None:
-        return {"ok": True, "score": 0, "regime": "unavailable", "reason": "no_options_module"}
-    try:
-        if setup_type is not None:
-            return score_options_context(opt_obj, bias=bias, setup_type=setup_type)  # type: ignore
-        return score_options_context(opt_obj, bias=bias)  # type: ignore
-    except TypeError:
-        try:
-            if setup_type is not None:
-                return score_options_context(opt_obj, bias, setup_type=setup_type)  # type: ignore
-            return score_options_context(opt_obj, bias)  # type: ignore
-        except Exception:
-            return {"ok": True, "score": 0, "regime": "unknown", "reason": "options_error"}
-    except Exception:
-        return {"ok": True, "score": 0, "regime": "unknown", "reason": "options_error"}
-
-
-# =====================================================================
-# ✅ scanner.py compatibility helper (TTL policy uses setup string)
-# =====================================================================
-def _setup_ttl_compatible(setup_type: str, entry_type: str) -> str:
-    base = str(setup_type or "").strip()
-    if not base:
-        base = "OTHER"
-    s = base.upper()
-    et = str(entry_type or "").upper()
-
-    # Don't append _FVG on RAID/SWEEP setups (TTL should follow setup, not generic zone)
-    if ("RAID" in s) or ("SWEEP" in s):
-        return base
-
-    if "RAID" in et and ("RAID" not in s and "SWEEP" not in s):
-        return f"{base}_RAID"
-    if "OTE" in et and "OTE" not in s:
-        return f"{base}_OTE"
-    if "FVG" in et and "FVG" not in s:
-        return f"{base}_FVG"
-    return base
-
-
-# =====================================================================
-# ✅ Liquidations + 2-pass institutional policy
-# =====================================================================
-INST_ENABLE_LIQUIDATIONS = _env_flag("INST_ENABLE_LIQUIDATIONS", "1")
-INST_LIQ_PASS2_ONLY = _env_flag("INST_LIQ_PASS2_ONLY", "1")
-INST_PASS1_MODE = _env_str("INST_PASS1_MODE", "LIGHT").upper()
-INST_PASS2_MODE = _env_str("INST_PASS2_MODE", "NORMAL").upper()
-INST_PASS2_ENABLED = _env_flag("INST_PASS2_ENABLED", "1")
-INST_PASS2_MIN_GATE = _env_int("INST_PASS2_MIN_GATE", "1")
-
-if INST_PASS1_MODE not in ("LIGHT", "NORMAL", "FULL"):
-    INST_PASS1_MODE = "LIGHT"
-if INST_PASS2_MODE not in ("LIGHT", "NORMAL", "FULL"):
-    INST_PASS2_MODE = "NORMAL"
-
-# =====================================================================
-# ✅ INST_CONTINUATION ULTRA-STRICT policy (env-tunable)
-# =====================================================================
-INST_CONT_REQUIRE_TRIGGER = _env_flag("INST_CONT_REQUIRE_TRIGGER", "1")
-INST_CONT_REQUIRE_PASS2 = _env_flag("INST_CONT_REQUIRE_PASS2", "1")
-INST_CONT_DISALLOW_MARKET = _env_flag("INST_CONT_DISALLOW_MARKET", "1")
-INST_CONT_REQUIRE_NO_SOFT_VETO = _env_flag("INST_CONT_REQUIRE_NO_SOFT_VETO", "1")
-INST_CONT_REQUIRE_STRONG_MOM = _env_flag("INST_CONT_REQUIRE_STRONG_MOM", "1")
-INST_CONT_REQUIRE_CLEAR_BIAS = _env_flag("INST_CONT_REQUIRE_CLEAR_BIAS", "1")
-INST_CONT_MIN_COMPOSITE_THR = _env_float("INST_CONT_MIN_COMPOSITE_THR", "70")
-INST_CONT_MIN_GATE = _env_int("INST_CONT_MIN_GATE", str(int(INST_SCORE_DESK_PRIORITY)))
-INST_CONT_RR_MIN = _env_float("INST_CONT_RR_MIN", str(float(max(RR_MIN_STRICT, RR_MIN_DESK_PRIORITY))))
-
-# =====================================================================
-# ✅ INSTITUTIONAL MAX: Tradability / Liquidity filters (OHLCV only)
-# =====================================================================
-LIQ_FILTER_ENABLE = _env_flag("LIQ_FILTER_ENABLE", "1")
-LIQ_FILTER_STRICT = _env_flag("LIQ_FILTER_STRICT", "1")  # if 0 and desk -> soft veto only
-
-MIN_DOLLAR_VOL_20 = _env_float("MIN_DOLLAR_VOL_20", "250000")  # avg(volume*close) over last 20
-MAX_SPREAD_PROXY_20 = _env_float("MAX_SPREAD_PROXY_20", "0.020")  # median((high-low)/close) over last 20
-MAX_WICKINESS_20 = _env_float("MAX_WICKINESS_20", "0.70")  # avg wick ratio over last 20
-MAX_RANGE_ATR_MULT = _env_float("MAX_RANGE_ATR_MULT", "3.5")  # last candle range / ATR(14) too big => noisy/manip
-MIN_BARS_FOR_LIQ = _env_int("MIN_BARS_FOR_LIQ", "120")
-
-
-def _tradability_metrics(df: pd.DataFrame) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    try:
-        if not _ensure_ohlcv(df) or len(df) < MIN_BARS_FOR_LIQ:
-            return {"ok": True, "reason": "insufficient_bars", "enabled": LIQ_FILTER_ENABLE}
-
-        w = df.tail(20).copy()
-        o = pd.to_numeric(w["open"], errors="coerce").astype(float)
-        h = pd.to_numeric(w["high"], errors="coerce").astype(float)
-        l = pd.to_numeric(w["low"], errors="coerce").astype(float)
-        c = pd.to_numeric(w["close"], errors="coerce").astype(float)
-        v = pd.to_numeric(w["volume"], errors="coerce").astype(float)
-
-        dollar_vol = float(np.nanmean(v * c))
-        spread_proxy = float(np.nanmedian((h - l).abs() / c.replace(0, np.nan)))
-
-        rng = (h - l).abs()
-        upper_wick = (h - np.maximum(o, c)).clip(lower=0)
-        lower_wick = (np.minimum(o, c) - l).clip(lower=0)
-        wick = (upper_wick + lower_wick)
-        wickiness = float(np.nanmean((wick / rng.replace(0, np.nan)).clip(0, 1)))
-
-        a = _atr(df, 14)
-        last_range = float(abs(float(df["high"].astype(float).iloc[-1]) - float(df["low"].astype(float).iloc[-1])))
-        range_atr = float(last_range / a) if a > 0 else 0.0
-
-        out.update(
-            {
-                "enabled": LIQ_FILTER_ENABLE,
-                "dollar_vol_20": dollar_vol,
-                "spread_proxy_20": spread_proxy,
-                "wickiness_20": wickiness,
-                "atr14": float(a),
-                "last_range": float(last_range),
-                "range_atr_mult": float(range_atr),
-            }
-        )
-
-        if not LIQ_FILTER_ENABLE:
-            out["ok"] = True
-            out["reason"] = "disabled"
-            return out
-
-        if np.isfinite(dollar_vol) and dollar_vol < MIN_DOLLAR_VOL_20:
-            out["ok"] = False
-            out["reason"] = "low_dollar_volume"
-            return out
-
-        if np.isfinite(spread_proxy) and spread_proxy > MAX_SPREAD_PROXY_20:
-            out["ok"] = False
-            out["reason"] = "wide_spread_proxy"
-            return out
-
-        if np.isfinite(wickiness) and wickiness > MAX_WICKINESS_20:
-            out["ok"] = False
-            out["reason"] = "wicky_noisy_market"
-            return out
-
-        if a > 0 and np.isfinite(range_atr) and range_atr > MAX_RANGE_ATR_MULT:
-            out["ok"] = False
-            out["reason"] = "range_spike_vs_atr"
-            return out
-
-        out["ok"] = True
-        out["reason"] = "OK"
-        return out
-    except Exception:
-        return {"ok": True, "reason": "metrics_error", "enabled": LIQ_FILTER_ENABLE}
-
-
-# =====================================================================
-# ✅ Institutional Micro-Filters (robust key extraction)
-# =====================================================================
-INST_MICRO_FILTER_ENABLE = _env_flag("INST_MICRO_FILTER_ENABLE", "1")
-INST_MICRO_FILTER_STRICT = _env_flag("INST_MICRO_FILTER_STRICT", "1")  # if 0 and desk -> soft only
-
-# Funding crowding extremes
-FUNDING_EXTREME_ABS = _env_float("FUNDING_EXTREME_ABS", "0.0015")  # absolute funding rate threshold (per interval)
-# OI delta thresholds
-OI_DELTA_MIN_ABS = _env_float("OI_DELTA_MIN_ABS", "0.03")  # interpret as pct if institutional_data provides pct-like
-# Orderbook imbalance
-OB_IMB_MIN_ABS = _env_float("OB_IMB_MIN_ABS", "0.15")  # imbalance in [-1..1], require sign align if above abs threshold
-# Alignment requirements
-INST_ALIGN_MIN_CONT = _env_int("INST_ALIGN_MIN_CONT", "2")  # BOS / continuation
-INST_ALIGN_MIN_REV = _env_int("INST_ALIGN_MIN_REV", "1")  # RAID / SWEEP
-
-
-def _pick_first(inst: Dict[str, Any], keys: List[str]) -> Any:
+@@ -606,67 +614,171 @@ def _pick_first(inst: Dict[str, Any], keys: List[str]) -> Any:
     for k in keys:
         if k in inst and inst.get(k) is not None:
             return inst.get(k)
@@ -628,6 +107,78 @@ def _sign_align(bias: str, v: float) -> bool:
     return False
 
 
+def _inst_liquidity_guard(inst: Dict[str, Any]) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "enabled": INST_LIQ_FILTER_ENABLE,
+        "strict": INST_LIQ_FILTER_STRICT,
+        "min_depth_usd_25bps": float(INST_LIQ_MIN_DEPTH_USD_25BPS),
+        "min_depth_bid_usd_25bps": float(INST_LIQ_MIN_DEPTH_BID_USD_25BPS),
+        "min_depth_ask_usd_25bps": float(INST_LIQ_MIN_DEPTH_ASK_USD_25BPS),
+        "max_spread_bps": float(INST_LIQ_MAX_SPREAD_BPS),
+    }
+
+    spread_bps = _as_float(_pick_first(inst, ["spread_bps", "spreadBps", "spread"]))
+    depth_usd = _as_float(_pick_first(inst, ["depth_usd_25bps", "depth_usd_25", "depth_25bps"]))
+    depth_bid = _as_float(_pick_first(inst, ["depth_bid_usd_25bps", "depth_bid_usd_25"]))
+    depth_ask = _as_float(_pick_first(inst, ["depth_ask_usd_25bps", "depth_ask_usd_25"]))
+
+    meta.update(
+        {
+            "spread_bps": spread_bps,
+            "depth_usd_25bps": depth_usd,
+            "depth_bid_usd_25bps": depth_bid,
+            "depth_ask_usd_25bps": depth_ask,
+        }
+    )
+
+    if not INST_LIQ_FILTER_ENABLE:
+        meta.update({"ok": True, "reason": "disabled", "risk_factor": 1.0, "hard_veto": False})
+        return meta
+
+    if spread_bps is None and depth_usd is None and depth_bid is None and depth_ask is None:
+        ok = not INST_LIQ_FILTER_STRICT
+        rf = float(INST_LIQ_RISK_FLOOR) if INST_LIQ_FILTER_STRICT else 1.0
+        meta.update({"ok": ok, "reason": "no_liquidity_data", "risk_factor": rf, "hard_veto": bool(INST_LIQ_FILTER_STRICT and not ok)})
+        return meta
+
+    risk_factor = 1.0
+    reasons: List[str] = []
+
+    min_depth = float(INST_LIQ_MIN_DEPTH_USD_25BPS)
+    if depth_usd is not None and min_depth > 0 and depth_usd < min_depth:
+        reasons.append("depth_low")
+        risk_factor *= max(float(depth_usd) / min_depth, float(INST_LIQ_RISK_FLOOR))
+
+    min_bid = float(INST_LIQ_MIN_DEPTH_BID_USD_25BPS)
+    if depth_bid is not None and min_bid > 0 and depth_bid < min_bid:
+        reasons.append("bid_depth_low")
+        risk_factor *= max(float(depth_bid) / min_bid, float(INST_LIQ_RISK_FLOOR))
+
+    min_ask = float(INST_LIQ_MIN_DEPTH_ASK_USD_25BPS)
+    if depth_ask is not None and min_ask > 0 and depth_ask < min_ask:
+        reasons.append("ask_depth_low")
+        risk_factor *= max(float(depth_ask) / min_ask, float(INST_LIQ_RISK_FLOOR))
+
+    max_spread = float(INST_LIQ_MAX_SPREAD_BPS)
+    if spread_bps is not None and max_spread > 0 and spread_bps > max_spread:
+        reasons.append("spread_wide")
+        risk_factor *= max(max_spread / float(spread_bps), float(INST_LIQ_RISK_FLOOR))
+
+    risk_factor = max(float(INST_LIQ_RISK_FLOOR), min(float(INST_LIQ_RISK_CAP), float(risk_factor)))
+
+    ok = len(reasons) == 0
+    meta.update(
+        {
+            "ok": ok,
+            "reason": "OK" if ok else ",".join(reasons),
+            "risk_factor": risk_factor,
+            "hard_veto": bool(INST_LIQ_FILTER_STRICT and not ok),
+            "reasons": reasons,
+        }
+    )
+    return meta
+
+
 def _inst_micro_filters(inst: Dict[str, Any], bias: str, setup_intent: str) -> Tuple[bool, List[str], Dict[str, Any]]:
     """
     Returns:
@@ -637,14 +188,46 @@ def _inst_micro_filters(inst: Dict[str, Any], bias: str, setup_intent: str) -> T
     """
     meta: Dict[str, Any] = {"enabled": INST_MICRO_FILTER_ENABLE, "setup_intent": setup_intent}
     vetoes: List[str] = []
+
+    liq_meta = _inst_liquidity_guard(inst)
+    meta["liquidity"] = liq_meta
+    meta["liquidity_risk_factor"] = float(liq_meta.get("risk_factor", 1.0))
+    if not liq_meta.get("ok", True):
+        vetoes.append(f"liquidity:{liq_meta.get('reason')}")
+
     if not INST_MICRO_FILTER_ENABLE:
-        return True, vetoes, meta
+        hard_ok = not bool(liq_meta.get("hard_veto"))
+        return hard_ok, vetoes, meta
 
     b = (bias or "").upper()
 
     funding = _as_float(_pick_first(inst, ["funding_rate", "fundingRate", "funding", "funding_rate_last"]))
-    oi_delta = _as_float(_pick_first(inst, ["oi_delta", "open_interest_delta", "oi_change", "oi_change_pct", "oi_pct_change"]))
-    ob_imb = _as_float(_pick_first(inst, ["orderbook_imbalance", "orderbook_imb", "ob_imbalance", "ob_imb"]))
+    oi_delta = _as_float(
+        _pick_first(
+            inst,
+            [
+                "oi_delta",
+                "open_interest_delta",
+                "oi_change",
+                "oi_change_pct",
+                "oi_pct_change",
+                "oi_change_1h_pct",
+                "oi_change_15m_pct",
+            ],
+        )
+    )
+    ob_imb = _as_float(
+        _pick_first(
+            inst,
+            [
+                "orderbook_imbalance",
+                "orderbook_imb",
+                "ob_imbalance",
+                "ob_imb",
+                "orderbook_imb_25bps",
+            ],
+        )
+    )
     cvd_slope = _as_float(_pick_first(inst, ["cvd_slope", "cvdSlope", "cvd_trend"]))
     flow = str(_pick_first(inst, ["flow_regime", "flowRegime", "flow"]) or "").lower()
     crowd = str(_pick_first(inst, ["crowding_regime", "crowdingRegime", "crowding"]) or "").lower()
@@ -670,41 +253,7 @@ def _inst_micro_filters(inst: Dict[str, Any], bias: str, setup_intent: str) -> T
         if _sign_align(b, funding):
             vetoes.append("funding_extreme_crowded")
         else:
-            # opposite funding can be "contrarian tailwind" -> no veto
-            pass
-
-    # Directional alignment counts
-    align_count = 0
-    align_tags: List[str] = []
-
-    # CVD alignment (continuation wants align)
-    if cvd_slope is not None and abs(cvd_slope) > 0:
-        if _sign_align(b, cvd_slope):
-            align_count += 1
-            align_tags.append("cvd_align")
-        else:
-            vetoes.append("cvd_misalign")
-
-    # OI alignment (only if meaningful magnitude)
-    if oi_delta is not None and abs(oi_delta) >= OI_DELTA_MIN_ABS:
-        if _sign_align(b, oi_delta):
-            align_count += 1
-            align_tags.append("oi_align")
-        else:
-            vetoes.append("oi_misalign")
-
-    # Orderbook imbalance alignment (only if meaningful)
-    if ob_imb is not None and abs(ob_imb) >= OB_IMB_MIN_ABS:
-        if _sign_align(b, ob_imb):
-            align_count += 1
-            align_tags.append("ob_align")
-        else:
-            vetoes.append("orderbook_misalign")
-
-    # Flow regime alignment
-    if flow:
-        if b == "LONG" and "buy" in flow:
-            align_count += 1
+@@ -708,50 +820,52 @@ def _inst_micro_filters(inst: Dict[str, Any], bias: str, setup_intent: str) -> T
             align_tags.append("flow_buy")
         if b == "SHORT" and "sell" in flow:
             align_count += 1
@@ -730,6 +279,8 @@ def _inst_micro_filters(inst: Dict[str, Any], bias: str, setup_intent: str) -> T
     # - continuation should be very strict
     # - reversal can accept some misalign but not "crowding_risky" + "funding_extreme_crowded" together
     hard_ok = True
+    if bool(liq_meta.get("hard_veto")):
+        hard_ok = False
     if intent == "CONTINUATION":
         if any(v in vetoes for v in ["crowding_risky", "funding_extreme_crowded", "inst_align_low(0<", "flow_strong_sell_vs_long", "flow_strong_buy_vs_short"]):
             hard_ok = False
