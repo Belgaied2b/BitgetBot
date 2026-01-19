@@ -705,6 +705,12 @@ def _series_slope_per_min(series: _Series, points: int = 12) -> Optional[float]:
 # Bitget confirmed endpoints
 # =====================================================================
 async def _fetch_merge_depth(symbol: str) -> Optional[Dict[str, Any]]:
+    """Fetch merge-depth with tolerant parsing.
+
+    Observed shapes:
+      - data: { bids: [...], asks: [...] }
+      - data: [ { bids: [...], asks: [...] } ]
+    """
     data = await _http_get(
         "/api/v2/mix/market/merge-depth",
         params={"productType": INST_BITGET_PRODUCT_TYPE, "symbol": symbol},
@@ -712,7 +718,14 @@ async def _fetch_merge_depth(symbol: str) -> Optional[Dict[str, Any]]:
     )
     if not isinstance(data, dict):
         return None
-    d = data.get("data")
+
+    raw = data.get("data")
+    d = None
+    if isinstance(raw, dict):
+        d = raw
+    elif isinstance(raw, list) and raw and isinstance(raw[0], dict):
+        d = raw[0]
+
     if not isinstance(d, dict):
         return None
 
@@ -749,6 +762,13 @@ def _parse_next_update_ms(d0: Dict[str, Any]) -> Optional[int]:
 
 
 async def _fetch_current_funding_rate(symbol: str) -> Tuple[Optional[float], Optional[int]]:
+    """Fetch current funding rate (Bitget v2) with tolerant parsing.
+
+    Observed shapes across deployments:
+      - data: [ { fundingRate: '...', nextFundingTime: '...' } ]
+      - data: { fundingRate: '...', nextFundingTime: '...' }
+      - data: [ { capitalRate: '...' } ]  (alias)
+    """
     now_s = time.time()
     c = _FUNDING_CACHE.get(symbol)
     if c is not None:
@@ -764,19 +784,24 @@ async def _fetch_current_funding_rate(symbol: str) -> Tuple[Optional[float], Opt
     if not isinstance(data, dict):
         return None, None
 
-    arr = data.get("data")
-    if not isinstance(arr, list) or not arr:
-        return None, None
+    raw = data.get("data")
+    d0 = None
+    if isinstance(raw, list) and raw:
+        d0 = raw[0]
+    elif isinstance(raw, dict):
+        d0 = raw
 
-    d0 = arr[0]
     if not isinstance(d0, dict):
         return None, None
 
-    fr: Optional[float]
-    try:
-        fr = float(d0.get("fundingRate"))
-    except Exception:
-        fr = None
+    fr = None
+    for k in ("fundingRate", "capitalRate", "funding_rate"):
+        if k in d0 and d0.get(k) is not None:
+            try:
+                fr = float(d0.get(k))
+                break
+            except Exception:
+                fr = None
 
     next_ms = _parse_next_update_ms(d0)
 
@@ -787,6 +812,13 @@ async def _fetch_current_funding_rate(symbol: str) -> Tuple[Optional[float], Opt
 
 
 async def _fetch_open_interest(symbol: str) -> Optional[float]:
+    """Fetch open interest (Bitget v2) with tolerant parsing.
+
+    Observed shapes:
+      - data: { openInterestList: [ { size: '...' } ] }
+      - data: [ { size: '...' } ]
+      - data: { size: '...' } or { openInterest: '...' }
+    """
     now_s = time.time()
     c = _OI_CACHE.get(symbol)
     if c is not None:
@@ -802,23 +834,40 @@ async def _fetch_open_interest(symbol: str) -> Optional[float]:
     if not isinstance(data, dict):
         return None
 
-    d = data.get("data")
-    if not isinstance(d, dict):
+    raw = data.get("data")
+
+    # Helper: extract a numeric OI from a dict
+    def _extract_from_dict(d: dict) -> Optional[float]:
+        if not isinstance(d, dict):
+            return None
+        # common keys
+        for k in ("size", "openInterest", "open_interest", "holdingAmount", "holding", "amount", "oi"):
+            if k in d and d.get(k) is not None:
+                try:
+                    v = float(d.get(k))
+                    return v
+                except Exception:
+                    pass
         return None
 
-    lst = d.get("openInterestList")
-    if not isinstance(lst, list) or not lst:
-        return None
+    oi = None
 
-    d0 = lst[0]
-    if not isinstance(d0, dict):
-        return None
+    if isinstance(raw, dict):
+        # official doc shape: openInterestList
+        lst = raw.get("openInterestList")
+        if isinstance(lst, list) and lst:
+            oi = _extract_from_dict(lst[0])
+        if oi is None:
+            oi = _extract_from_dict(raw)
 
-    oi: Optional[float]
-    try:
-        oi = float(d0.get("size"))
-    except Exception:
-        oi = None
+    elif isinstance(raw, list) and raw:
+        # sometimes directly a list of dicts
+        if isinstance(raw[0], dict) and "openInterestList" in raw[0]:
+            lst = raw[0].get("openInterestList")
+            if isinstance(lst, list) and lst:
+                oi = _extract_from_dict(lst[0])
+        if oi is None and isinstance(raw[0], dict):
+            oi = _extract_from_dict(raw[0])
 
     if oi is not None:
         _OI_CACHE[symbol] = (float(oi), now_s)
