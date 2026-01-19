@@ -1210,7 +1210,14 @@ async def analyze_symbol(
 
     async with analyze_sem:
         t0 = time.time()
-        df_h1, df_h4 = await _fetch_dfs(client, sym)
+        try:
+            df_h1, df_h4 = await _fetch_dfs(client, sym)
+        except Exception as e:
+            fetch_ms = int((time.time() - t0) * 1000)
+            logger.exception("[FETCH_EXC] %s tid=%s err=%s", sym, tid, e)
+            await stats.inc("skips", 1)
+            await stats.add_reason("fetch_exc")
+            return None
         fetch_ms = int((time.time() - t0) * 1000)
 
         if df_h1 is None or df_h4 is None or getattr(df_h1, "empty", True) or getattr(df_h4, "empty", True):
@@ -1232,6 +1239,9 @@ async def analyze_symbol(
             )
         except asyncio.TimeoutError:
             result = {"valid": False, "reject_reason": "analyze_timeout"}
+        except Exception as e:
+            logger.exception("[ANALYZE_EXC] %s tid=%s err=%s", sym, tid, e)
+            result = {"valid": False, "reject_reason": "analyze_exc"}
         analyze_ms = int((time.time() - t1) * 1000)
 
         if not result or not isinstance(result, dict) or not result.get("valid"):
@@ -2350,7 +2360,10 @@ async def scan_once(client, trader: BitgetTrader) -> None:
         if isinstance(r, dict):
             candidates.append(r)
         elif isinstance(r, Exception):
-            logger.debug("worker exception: %s", r)
+            # Make worker failures visible and count them (prevents silent "valids=0")
+            logger.warning("worker exception: %s", r)
+            await stats.inc("skips", 1)
+            await stats.add_reason("worker_exc")
 
     ranked = rank_candidates(candidates)
 
