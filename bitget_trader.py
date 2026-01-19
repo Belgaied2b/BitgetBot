@@ -25,11 +25,6 @@
 # - get_order_fills(): /api/v2/mix/order/fills
 # - get_ticker(): /api/v2/mix/market/ticker
 # - helpers to extract lists safely from v2 payload shapes
-#
-# PATCH (2026-01):
-# - Fix 45110 on ENTRY when size=None: qty quantization floors to step and can drop notional < MIN_ENTRY_USDT.
-#   We bump q_qty using CEIL to qtyStep so q_price*q_qty >= MIN_ENTRY_USDT (default 5).
-#   Only applies when size is None AND tradeSide=open AND not reduce-only.
 # =====================================================================
 
 from __future__ import annotations
@@ -224,110 +219,121 @@ class ContractMetaCache:
     def __init__(self, client, ttl_s: int = 600):
         self.client = client
         self.ttl_s = ttl_s
-        self._ts: Dict[str, float] = {}
-        self._cache: Dict[str, ContractMeta] = {}
+        self._ts = 0.0
+        self._by_symbol: Dict[str, ContractMeta] = {}
         self._lock = asyncio.Lock()
 
-    async def get(self, symbol: str) -> Optional[ContractMeta]:
-        sym = (symbol or "").strip().upper()
-        if not sym:
-            return None
+    @staticmethod
+    def _extract_contracts_list(js: Dict[str, Any]) -> List[Dict[str, Any]]:
+        data = js.get("data")
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            for k in ("list", "data", "rows"):
+                v = data.get(k)
+                if isinstance(v, list):
+                    return [x for x in v if isinstance(x, dict)]
+        return []
 
-        now = time.time()
-        try:
-            if sym in self._cache and (now - float(self._ts.get(sym, 0.0))) < float(self.ttl_s):
-                return self._cache.get(sym)
-        except Exception:
-            pass
-
+    async def refresh(self, force: bool = False) -> None:
         async with self._lock:
             now = time.time()
-            try:
-                if sym in self._cache and (now - float(self._ts.get(sym, 0.0))) < float(self.ttl_s):
-                    return self._cache.get(sym)
-            except Exception:
-                pass
+            if (not force) and self._by_symbol and (now - self._ts) < self.ttl_s:
+                return
 
-            try:
-                resp = await self.client.get_contracts()
-            except Exception:
-                return self._cache.get(sym)
+            js = await self.client._request(
+                "GET",
+                "/api/v2/mix/market/contracts",
+                params={"productType": PRODUCT_TYPE},
+                auth=False,
+            )
 
-            data = None
-            if isinstance(resp, dict):
-                data = resp.get("data")
-            contracts: List[Dict[str, Any]] = []
+            if not isinstance(js, dict):
+                logger.error("[META] bad contracts response (non-dict): %s", js)
+                return
 
-            # Bitget v2 can return: data=list or data={"list":[...]}
-            if isinstance(data, list):
-                contracts = [x for x in data if isinstance(x, dict)]
-            elif isinstance(data, dict):
-                lst = data.get("list") or data.get("data") or data.get("result") or []
-                if isinstance(lst, list):
-                    contracts = [x for x in lst if isinstance(x, dict)]
+            if str(js.get("code", "")) not in ("", "00000"):
+                logger.warning("[META] contracts response code=%s msg=%s", js.get("code"), js.get("msg"))
 
-            found = None
+            contracts = self._extract_contracts_list(js)
+            if not contracts:
+                logger.error("[META] empty contracts list: %s", js)
+                return
+
+            by_symbol: Dict[str, ContractMeta] = {}
+
             for c in contracts:
-                s = str(c.get("symbol") or c.get("instId") or "").upper()
-                if s == sym:
-                    found = c
-                    break
-
-            if not found:
-                return self._cache.get(sym)
-
-            price_place = _safe_int(found.get("pricePlace"), 6)
-            qty_place = _safe_int(found.get("volumePlace") or found.get("qtyPlace"), 0)
-
-            # price tick: try priceEndStep/priceStep/tickSize etc.
-            pe = found.get("priceEndStep")
-            ps = found.get("priceStep")
-            ts = found.get("tickSize")
-            step_val = None
-            for v in (pe, ps, ts):
-                try:
-                    if v is None:
-                        continue
-                    step_val = float(v)
-                    break
-                except Exception:
+                sym = (c.get("symbol") or "").upper()
+                if not sym:
                     continue
 
-            if step_val is None:
-                step_val = 1.0
+                price_place = _safe_int(c.get("pricePlace"), 6)
+                qty_place = _safe_int(c.get("volumePlace"), 4)
 
-            price_tick = _tick_from_place_and_step(price_place, float(step_val))
+                # ---- PRICE TICK (FIX) ----
+                pe = _safe_float(c.get("priceEndStep"), 0.0)
+                ps = _safe_float(c.get("priceStep"), 0.0)
+                ts = _safe_float(c.get("tickSize"), 0.0)
+                pt = _safe_float(c.get("priceTick"), 0.0)
 
-            # volume step: try volumeStep; fallback 1
-            vs = found.get("volumeStep") or found.get("qtyStep")
-            qty_step = None
-            try:
-                qty_step = float(vs)
-            except Exception:
-                qty_step = 1.0
-            if qty_step is None or qty_step <= 0:
-                qty_step = 1.0
+                tick = 0.0
+                if ps > 0:
+                    tick = _tick_from_place_and_step(price_place, ps)
+                elif pe > 0:
+                    tick = _tick_from_place_and_step(price_place, pe)
+                elif ts > 0:
+                    tick = float(ts)
+                elif pt > 0:
+                    # accept only if plausible
+                    base = (10.0 ** (-price_place)) if price_place > 0 else 1.0
+                    if pt < 1.0:
+                        tick = float(pt)
+                    else:
+                        tick = float(base)
 
-            # min qty: minTradeNum
-            min_trade_num = found.get("minTradeNum") or found.get("minQty") or found.get("minSize")
-            min_qty = 0.0
-            try:
-                min_qty = float(min_trade_num)
-            except Exception:
-                min_qty = 0.0
+                if tick <= 0:
+                    tick = float(10 ** (-max(0, price_place)))
 
-            meta = ContractMeta(
-                symbol=sym,
-                price_place=int(price_place),
-                price_tick=float(price_tick),
-                qty_place=int(qty_place),
-                qty_step=float(qty_step),
-                min_qty=float(min_qty),
-                raw=dict(found),
-            )
-            self._cache[sym] = meta
-            self._ts[sym] = float(now)
-            return meta
+                # ---- QTY STEP (FIX) ----
+                vol_step = _safe_float(c.get("volumeStep"), 0.0)
+                size_mult = _safe_float(c.get("sizeMultiplier"), 0.0)
+                min_trade = _safe_float(c.get("minTradeNum"), 0.0)
+
+                step = 0.0
+                if vol_step > 0:
+                    step = float(vol_step)
+                elif size_mult > 0:
+                    step = float(size_mult)
+                else:
+                    step = float(10 ** (-max(0, qty_place))) if qty_place > 0 else 1.0
+
+                min_qty = float(min_trade) if min_trade > 0 else float(step)
+                if min_qty < step:
+                    min_qty = float(step)
+
+                by_symbol[sym] = ContractMeta(
+                    symbol=sym,
+                    price_place=int(price_place),
+                    price_tick=float(tick),
+                    qty_place=int(qty_place),
+                    qty_step=float(step),
+                    min_qty=float(min_qty),
+                    raw=c,
+                )
+
+            self._by_symbol = by_symbol
+            self._ts = now
+            logger.info("[META] refreshed contracts cache (%d symbols)", len(by_symbol))
+
+    async def get(self, symbol: str) -> Optional[ContractMeta]:
+        sym = (symbol or "").upper()
+        await self.refresh(force=False)
+        m = self._by_symbol.get(sym)
+        if m is None:
+            # force refresh once (new listing / cache stale)
+            await self.refresh(force=True)
+            m = self._by_symbol.get(sym)
+        return m
 
 
 # ---------------------------------------------------------------------
@@ -335,80 +341,167 @@ class ContractMetaCache:
 # ---------------------------------------------------------------------
 
 class BitgetTrader:
+    BASE = "https://api.bitget.com"
+
     def __init__(
         self,
         client,
-        *,
-        product_type: str = PRODUCT_TYPE,
-        margin_coin: str = MARGIN_COIN,
+        margin_usdt: float = 20.0,
         leverage: float = 10.0,
         margin_mode: str = "isolated",
-        margin_usdt: float = 0.5,
+        product_type: str = PRODUCT_TYPE,
+        margin_coin: str = MARGIN_COIN,
+        target_margin_usdt: Optional[float] = None,
     ):
         self.client = client
-        self.product_type = str(product_type)
-        self.margin_coin = str(margin_coin)
+        self.margin_usdt = float(target_margin_usdt if target_margin_usdt is not None else margin_usdt)
         self.leverage = float(leverage)
-        self.margin_mode = str(margin_mode)
-        self.margin_usdt = float(margin_usdt)
+        self.margin_mode = (margin_mode or "isolated").lower()
+        self.product_type = (product_type or PRODUCT_TYPE)
+        self.margin_coin = (margin_coin or MARGIN_COIN)
 
         self._meta = ContractMetaCache(client)
         self._exec_log_enable = bool(EXEC_LOG_ENABLE)
-        self._exec_log_path = str(EXEC_LOG_PATH or "").strip()
+        self._exec_log_path = str(EXEC_LOG_PATH or "exec_log.jsonl")
 
-    def _symbol(self, symbol: str) -> str:
-        return (symbol or "").strip().upper()
+    # ----------------------------
+    # Compat / helpers
+    # ----------------------------
 
-    def _format_qty_str(self, qty: float, qty_place: int) -> str:
-        d = max(0, min(12, int(qty_place)))
-        return _fmt_decimal(float(qty), d)
+    @staticmethod
+    def _symbol(symbol: str) -> str:
+        return (symbol or "").upper().replace("-", "").replace("_", "")
 
-    async def _log_exec_event(
+    async def _call(
         self,
-        event: str,
+        method: str,
+        path: str,
         *,
-        payload: Dict[str, Any],
-        resp: Dict[str, Any],
-        symbol: Optional[str] = None,
-    ) -> None:
-        if not self._exec_log_enable or not self._exec_log_path:
-            return
+        payload: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        auth: bool = True,
+        timeout: int = 12,
+    ) -> Dict[str, Any]:
+        # Backward-compatible wrapper
+        if (method or "GET").upper() == "GET":
+            return await self._request_any_status("GET", path, params=params, timeout=timeout, auth=auth)
+        return await self._request_any_status("POST", path, data=payload, timeout=timeout, auth=auth)
 
-        record = {
-            "ts_ms": _now_ms(),
-            "event": str(event),
-            "symbol": str(symbol or payload.get("symbol") or "").upper(),
-            "ok": bool(resp.get("ok")),
-            "code": str(resp.get("code", "")),
-            "msg": str(resp.get("msg", "")),
-            "latency_ms": int(resp.get("_latency_ms") or 0),
-            "path": str(resp.get("_path") or ""),
-            "payload": {
-                "side": payload.get("side"),
-                "orderType": payload.get("orderType"),
-                "size": payload.get("size"),
-                "price": payload.get("price"),
-                "tradeSide": payload.get("tradeSide"),
-                "reduceOnly": payload.get("reduceOnly"),
-                "clientOid": payload.get("clientOid"),
-                "triggerPrice": payload.get("triggerPrice"),
-                "triggerType": payload.get("triggerType"),
-                "planType": payload.get("planType"),
-                "executePrice": payload.get("executePrice"),
-                "force": payload.get("force"),
-                "timeInForceValue": payload.get("timeInForceValue"),
+    async def _request_any_status(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        timeout: int = 12,
+        auth: bool = True,
+    ) -> Dict[str, Any]:
+        await self.client._ensure_session()
+
+        params = params or {}
+        data = data or {}
+
+        query = ""
+        if params:
+            items = sorted(params.items(), key=lambda kv: kv[0])
+            query = "?" + "&".join(f"{k}={v}" for k, v in items)
+
+        url = self.BASE + path + query
+        body = json.dumps(data, separators=(",", ":")) if data else ""
+
+        ts = str(_now_ms())
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+
+        if auth:
+            # relies on your bitget_client._sign implementation
+            sig = self.client._sign(ts, method.upper(), path, query, body)
+            headers.update(
+                {
+                    "ACCESS-KEY": self.client.api_key,
+                    "ACCESS-SIGN": sig,
+                    "ACCESS-TIMESTAMP": ts,
+                    "ACCESS-PASSPHRASE": self.client.api_passphrase,
+                }
+            )
+
+        t0 = time.time()
+        try:
+            async with self.client.session.request(
+                method.upper(),
+                url,
+                headers=headers,
+                data=body if data else None,
+                timeout=timeout,
+            ) as resp:
+                txt = await resp.text()
+                status = resp.status
+                latency_ms = int((time.time() - t0) * 1000)
+
+                try:
+                    js = json.loads(txt) if txt else {}
+                except Exception:
+                    return {
+                        "ok": False,
+                        "code": "NONJSON",
+                        "msg": "non-json response",
+                        "raw": txt,
+                        "_http_status": status,
+                        "_latency_ms": latency_ms,
+                        "_path": path,
+                    }
+
+                code = str(js.get("code", ""))
+                ok = (status < 400) and (code == "00000")
+                js["ok"] = ok
+                js["_http_status"] = status
+                js["_latency_ms"] = latency_ms
+                js["_path"] = path
+                return js
+        except Exception as e:
+            latency_ms = int((time.time() - t0) * 1000)
+            return {
+                "ok": False,
+                "code": "EXC",
+                "msg": str(e),
+                "_http_status": 0,
+                "_latency_ms": latency_ms,
+                "_path": path,
+            }
+
+    # ----------------------------
+    # Meta helpers
+    # ----------------------------
+
+    async def get_tick(self, symbol: str) -> float:
+        meta = await self._meta.get(symbol)
+        if not meta:
+            return float(_estimate_tick_from_price(1.0))
+        t = float(meta.price_tick or (10 ** (-max(0, meta.price_place))))
+        return t if t > 0 else float(_estimate_tick_from_price(1.0))
+
+    async def debug_meta(self, symbol: str) -> Dict[str, Any]:
+        meta = await self._meta.get(symbol)
+        if not meta:
+            return {"symbol": symbol, "meta": None}
+        return {
+            "symbol": meta.symbol,
+            "pricePlace": meta.price_place,
+            "priceTick": meta.price_tick,
+            "qtyPlace": meta.qty_place,
+            "qtyStep": meta.qty_step,
+            "minQty": meta.min_qty,
+            "raw": {
+                "tickSize": meta.raw.get("tickSize"),
+                "priceEndStep": meta.raw.get("priceEndStep"),
+                "priceStep": meta.raw.get("priceStep"),
+                "pricePlace": meta.raw.get("pricePlace"),
+                "volumePlace": meta.raw.get("volumePlace"),
+                "volumeStep": meta.raw.get("volumeStep"),
+                "minTradeNum": meta.raw.get("minTradeNum"),
+                "sizeMultiplier": meta.raw.get("sizeMultiplier"),
             },
-            "data": resp.get("data"),
         }
-
-        def _write() -> None:
-            try:
-                with open(self._exec_log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            except Exception:
-                return
-
-        await asyncio.to_thread(_write)
 
     # ----------------------------
     # Quantize + formatting
@@ -495,16 +588,56 @@ class BitgetTrader:
         d = _decimals_from_step(tick_used or meta.price_tick)
         return _fmt_decimal(p, d)
 
-    # ----------------------------
-    # Low-level request wrapper (must exist on your client)
-    # ----------------------------
+    def _format_qty_str(self, qty: float, qty_place: int) -> str:
+        d = max(0, min(12, int(qty_place)))
+        return _fmt_decimal(float(qty), d)
 
-    async def _request_any_status(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None, data: Optional[Dict[str, Any]] = None, auth: bool = False) -> Dict[str, Any]:
-        """
-        This method expects your client to implement a request function.
-        Your repo already uses this pattern; keep as-is.
-        """
-        return await self.client._request(method, path, params=params, data=data, auth=auth)  # type: ignore[attr-defined]
+    async def _log_exec_event(
+        self,
+        event: str,
+        *,
+        payload: Dict[str, Any],
+        resp: Dict[str, Any],
+        symbol: Optional[str] = None,
+    ) -> None:
+        if not self._exec_log_enable or not self._exec_log_path:
+            return
+
+        record = {
+            "ts_ms": _now_ms(),
+            "event": str(event),
+            "symbol": str(symbol or payload.get("symbol") or "").upper(),
+            "ok": bool(resp.get("ok")),
+            "code": str(resp.get("code", "")),
+            "msg": str(resp.get("msg", "")),
+            "latency_ms": int(resp.get("_latency_ms") or 0),
+            "path": str(resp.get("_path") or ""),
+            "payload": {
+                "side": payload.get("side"),
+                "orderType": payload.get("orderType"),
+                "size": payload.get("size"),
+                "price": payload.get("price"),
+                "tradeSide": payload.get("tradeSide"),
+                "reduceOnly": payload.get("reduceOnly"),
+                "clientOid": payload.get("clientOid"),
+                "triggerPrice": payload.get("triggerPrice"),
+                "triggerType": payload.get("triggerType"),
+                "planType": payload.get("planType"),
+                "executePrice": payload.get("executePrice"),
+                "force": payload.get("force"),
+                "timeInForceValue": payload.get("timeInForceValue"),
+            },
+            "data": resp.get("data"),
+        }
+
+        def _write() -> None:
+            try:
+                with open(self._exec_log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception:
+                return
+
+        await asyncio.to_thread(_write)
 
     # ----------------------------
     # Orders
@@ -544,37 +677,35 @@ class BitgetTrader:
         # -----------------------------------------------------------------
         # Preflight (ENTRY only): avoid Bitget 45110 "less than the minimum amount X USDT"
         #
-        # Root cause we observed in Railway logs:
-        # - scanner targets notional ~= MIN_ENTRY_USDT (default 5)
-        # - Bitget requires >= 5 USDT notional
-        # - our qty quantization floors to qty_step (often 1 contract),
-        #   which can push (q_price * q_qty) just below the minimum (e.g. 4.85 USDT).
+        # Root cause observed in Railway logs:
+        # - sizing targets notional ~= 5 USDT
+        # - qty quantization floors to qtyStep (often 1 contract),
+        #   which can push (q_price * q_qty) just below 5 USDT
         #
         # Fix:
         # - only when size is None (auto sizing) AND we are opening (trade_side=open) AND not reduce-only,
-        #   we bump q_qty up using CEIL to qty_step so that q_price*q_qty >= MIN_ENTRY_USDT.
-        # - We DO NOT do this when size is explicitly provided, because the caller may be intentionally downsizing
-        #   (e.g., retries after 40762 balance error).
+        #   bump q_qty up using CEIL to qtyStep so that q_price*q_qty >= MIN_ENTRY_USDT (env, default 5).
+        # - do NOT apply when size is explicitly provided (caller may intentionally downsize).
         # -----------------------------------------------------------------
         try:
             if (size is None) and (not reduce_only) and (str(trade_side or "open").lower() == "open"):
-                min_usdt_env = float(os.getenv("MIN_ENTRY_USDT", "5") or "5")
-                if min_usdt_env > 0 and (float(q_price) * float(q_qty) + 1e-12) < float(min_usdt_env):
+                min_usdt = float(os.getenv("MIN_ENTRY_USDT", "5") or "5")
+                if min_usdt > 0 and (float(q_price) * float(q_qty) + 1e-12) < float(min_usdt):
                     meta2 = await self._meta.get(sym)
                     step2 = float(meta2.qty_step or 1.0) if meta2 else float(_step or 1.0)
                     min_qty2 = float(meta2.min_qty or 0.0) if meta2 else 0.0
                     qty_place2 = int(meta2.qty_place) if meta2 else int(qp)
 
-                    req_qty = _ceil_step(float(min_usdt_env) / max(1e-12, float(q_price)), step2)
+                    req_qty = _ceil_step(float(min_usdt) / max(1e-12, float(q_price)), step2)
                     if min_qty2 > 0:
                         req_qty = max(float(req_qty), float(min_qty2))
 
                     req_qty = float(_fmt_decimal(float(req_qty), max(0, qty_place2)))
-
                     if req_qty > float(q_qty) + 1e-12:
                         q_qty = float(req_qty)
         except Exception:
             pass
+
 
         price_str = await self._format_price(sym, q_price, tick_used=tick_used)
         size_str = self._format_qty_str(q_qty, qp)
@@ -636,7 +767,7 @@ class BitgetTrader:
                     payload_used = dict(payload2)
                     resp["_band"] = {"min": mn, "max": mx, "before": q_price, "after": q_price2}
 
-        # 40020 => retry with forced decimals
+        # 40020 => force decimals from tick retry
         code = str(resp.get("code", ""))
         if (not _is_ok(resp)) and code in _ERR_PRICE_PRECISION:
             d = _decimals_from_step(tick_used or _estimate_tick_from_price(q_price))
@@ -719,12 +850,473 @@ class BitgetTrader:
         )
         return resp
 
-    # =================================================================
-    # The rest of the file (place_plan, cancel, positions, ticker, etc.)
-    # is unchanged from your uploaded version.
-    #
-    # NOTE:
-    # I’m keeping the remainder intact to avoid accidental regressions.
-    # If you want, I can also paste the remainder verbatim, but it’s
-    # already present in your repo and not related to 45110.
-    # =================================================================
+    async def place_reduce_limit_tp(
+        self,
+        symbol: str,
+        close_side: str,
+        price: float,
+        qty: float,
+        client_oid: Optional[str] = None,
+        tick_hint: Optional[float] = None,
+        debug_tag: str = "TP",
+    ) -> Dict[str, Any]:
+        return await self.place_limit(
+            symbol=symbol,
+            side=close_side,
+            price=price,
+            size=qty,
+            client_oid=client_oid,
+            trade_side="close",
+            reduce_only=True,
+            tick_hint=tick_hint,
+            debug_tag=debug_tag,
+        )
+
+    async def place_stop_market_sl(
+        self,
+        symbol: str,
+        close_side: str,
+        trigger_price: float,
+        qty: float,
+        *,
+        client_oid: Optional[str] = None,
+        trigger_type: str = "mark_price",
+        tick_hint: Optional[float] = None,
+        debug_tag: str = "SL",
+    ) -> Dict[str, Any]:
+        sym = self._symbol(symbol)
+        close_s = (close_side or "").lower()
+        close_u = close_s.upper()
+
+        q_trig, q_qty, tick_used, _step, _pp, qp = await self._quantize_price_qty(
+            sym,
+            float(trigger_price),
+            float(qty),
+            close_side=close_u,
+            is_trigger=True,
+            tick_hint=tick_hint,
+        )
+        if q_qty <= 0:
+            return {"ok": False, "code": "QTY0", "msg": "quantized qty is 0"}
+
+        trig_str = await self._format_price(sym, q_trig, tick_used=tick_used)
+        size_str = self._format_qty_str(q_qty, qp)
+        oid = client_oid or f"sl-{sym}-{_now_ms()}"
+
+        payload = {
+            "symbol": sym,
+            "productType": self.product_type,
+            "marginCoin": self.margin_coin,
+            "marginMode": self.margin_mode,
+            "size": size_str,
+            "side": close_s,
+            "orderType": "market",
+            "triggerPrice": trig_str,
+            "triggerType": trigger_type,
+            "planType": "normal_plan",
+            "tradeSide": "close",
+            "reduceOnly": "YES",
+            "clientOid": oid,
+            "executePrice": "0",
+        }
+        payload_used = dict(payload)
+
+        logger.info(
+            "[ORDER_%s] sym=%s close_side=%s trigger_type=%s trigger_raw=%s trig_q=%s trig_str=%s qty=%s tick_used=%s",
+            debug_tag, sym, close_s, trigger_type, float(trigger_price), q_trig, trig_str, q_qty, tick_used
+        )
+
+        async def _send(data_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            return await self._request_any_status("POST", "/api/v2/mix/order/place-plan-order", data=(data_override or payload), auth=True)
+
+        resp = await _send()
+
+        # band clamp retry
+        code = str(resp.get("code", ""))
+        msg = str(resp.get("msg") or "")
+        if (not _is_ok(resp)) and code in _ERR_PRICE_BAND:
+            mn, mx = _parse_band(msg)
+            clamped = _clamp_band(q_trig, tick_used, mn, mx)
+            if clamped is not None:
+                q_trig2, q_qty2, tick2, _step2, _pp2, qp2 = await self._quantize_price_qty(
+                    sym, float(clamped), float(qty),
+                    close_side=close_u, is_trigger=True, tick_hint=tick_used
+                )
+                if q_qty2 > 0:
+                    trig_str2 = await self._format_price(sym, q_trig2, tick_used=tick2)
+                    payload2 = dict(payload)
+                    payload2["triggerPrice"] = trig_str2
+                    payload2["size"] = self._format_qty_str(q_qty2, qp2)
+                    logger.warning("[ORDER_%s] band clamp retry mn=%s mx=%s before=%s after=%s", debug_tag, mn, mx, q_trig, q_trig2)
+                    resp = await _send(payload2)
+                    payload_used = dict(payload2)
+                    resp["_band"] = {"min": mn, "max": mx, "before": q_trig, "after": q_trig2}
+
+        # price precision retry
+        code = str(resp.get("code", ""))
+        if (not _is_ok(resp)) and code in _ERR_PRICE_PRECISION:
+            d = _decimals_from_step(tick_used or _estimate_tick_from_price(q_trig))
+            trig_str2 = await self._format_price(sym, q_trig, tick_used=tick_used, force_decimals=d)
+            payload2 = dict(payload)
+            payload2["triggerPrice"] = trig_str2
+            logger.warning("[ORDER_%s] 40020 retry force_decimals=%s trig_str=%s->%s", debug_tag, d, trig_str, trig_str2)
+            resp = await _send(payload2)
+            payload_used = dict(payload2)
+
+        if not _is_ok(resp):
+            code = str(resp.get("code", ""))
+            msg = str(resp.get("msg") or "")
+            if code in _ERR_MIN_USDT:
+                mmin = _parse_min_usdt(msg)
+                if mmin is not None:
+                    resp["_min_usdt"] = float(mmin)
+            if code in _ERR_PRICE_BAND:
+                mn, mx = _parse_band(msg)
+                resp["_band"] = {"min": mn, "max": mx}
+
+            resp["_debug"] = {
+                "debug_tag": debug_tag,
+                "symbol": sym,
+                "close_side": close_s,
+                "trigger_raw": float(trigger_price),
+                "trigger_quant": float(q_trig),
+                "trigger_str": trig_str,
+                "qty_quant": float(q_qty),
+                "tick_used": float(tick_used),
+                "trigger_type": trigger_type,
+                "clientOid": oid,
+                "msg": msg,
+                "code": code,
+            }
+        else:
+            resp["qty"] = float(q_qty)
+            resp["_debug"] = {"debug_tag": debug_tag, "trigger_str": trig_str, "tick_used": float(tick_used), "clientOid": oid}
+
+        await self._log_exec_event(
+            "place_stop_market_sl",
+            payload=payload_used,
+            resp=resp,
+            symbol=sym,
+        )
+        return resp
+
+    # ----------------------------
+    # Cancels (FIXED)
+    # ----------------------------
+
+    async def cancel_order(
+        self,
+        symbol: str,
+        order_id: Optional[str] = None,
+        client_oid: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Cancel a normal (non-plan) order by orderId or clientOid.
+        """
+        sym = self._symbol(symbol)
+        payload: Dict[str, Any] = {
+            "symbol": sym,
+            "productType": self.product_type,
+            "marginCoin": self.margin_coin,
+        }
+        if order_id:
+            payload["orderId"] = str(order_id)
+        if client_oid:
+            payload["clientOid"] = str(client_oid)
+
+        if not payload.get("orderId") and not payload.get("clientOid"):
+            return {"ok": False, "code": "NOID", "msg": "order_id or client_oid required"}
+
+        return await self._request_any_status("POST", "/api/v2/mix/order/cancel-order", data=payload, auth=True, timeout=6)
+
+    async def cancel_plan_orders(
+        self,
+        symbol: str,
+        order_ids: List[Union[str, Dict[str, Any]]],
+        *,
+        plan_type: str = "normal_plan",
+    ) -> Dict[str, Any]:
+        """
+        Cancel trigger/plan orders.
+        Bitget v2 requires orderIdList to be a list of objects.
+        Each object: {"orderId":"...", "clientOid":"..."} (either one is ok).
+        """
+        sym = self._symbol(symbol)
+        items: List[Dict[str, str]] = []
+
+        for x in (order_ids or []):
+            if isinstance(x, dict):
+                oid = str(x.get("orderId") or "")
+                coid = str(x.get("clientOid") or "")
+                if oid or coid:
+                    items.append({"orderId": oid, "clientOid": coid})
+            else:
+                s = str(x)
+                if s:
+                    items.append({"orderId": s, "clientOid": ""})
+
+        if not items:
+            return {"ok": False, "code": "NOIDS", "msg": "order_ids empty"}
+
+        payload = {
+            "symbol": sym,
+            "productType": self.product_type,
+            "planType": plan_type,
+            "orderIdList": items,
+        }
+        return await self._request_any_status("POST", "/api/v2/mix/order/cancel-plan-order", data=payload, auth=True, timeout=8)
+
+    # ----------------------------
+    # Queries
+    # ----------------------------
+
+    async def get_order_detail(
+        self,
+        symbol: str,
+        *,
+        order_id: Optional[str] = None,
+        client_oid: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        sym = self._symbol(symbol)
+        if not order_id and not client_oid:
+            return {"ok": False, "code": "NOID", "msg": "order_id or client_oid required"}
+
+        params: Dict[str, Any] = {
+            "symbol": sym,
+            "productType": self.product_type,
+            "marginCoin": self.margin_coin,
+        }
+        if order_id:
+            params["orderId"] = str(order_id)
+        if client_oid:
+            params["clientOid"] = str(client_oid)
+
+        return await self._request_any_status("GET", "/api/v2/mix/order/detail", params=params, auth=True)
+
+    @staticmethod
+    def _data_row(order_detail_resp: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(order_detail_resp, dict):
+            return {}
+        data = order_detail_resp.get("data")
+        if isinstance(data, dict):
+            # sometimes nested lists exist, but detail is typically a dict
+            return data
+        if isinstance(data, list):
+            for it in data:
+                if isinstance(it, dict):
+                    return it
+        return {}
+
+    @staticmethod
+    def filled_qty(order_detail_resp: Dict[str, Any]) -> float:
+        if not _is_ok(order_detail_resp):
+            return 0.0
+        data = BitgetTrader._data_row(order_detail_resp)
+        return _safe_float(
+            data.get("baseVolume")
+            or data.get("filledQty")
+            or data.get("filledSize")
+            or data.get("filledVolume")
+            or data.get("dealSize"),
+            0.0,
+        )
+
+    @staticmethod
+    def order_size(order_detail_resp: Dict[str, Any]) -> float:
+        if not _is_ok(order_detail_resp):
+            return 0.0
+        data = BitgetTrader._data_row(order_detail_resp)
+        return _safe_float(
+            data.get("size")
+            or data.get("quantity")
+            or data.get("qty")
+            or data.get("totalSize"),
+            0.0,
+        )
+
+    @staticmethod
+    def remaining_qty(order_detail_resp: Dict[str, Any]) -> float:
+        size = BitgetTrader.order_size(order_detail_resp)
+        filled = BitgetTrader.filled_qty(order_detail_resp)
+        return max(0.0, float(size) - float(filled))
+
+    @staticmethod
+    def is_filled(order_detail_resp: Dict[str, Any]) -> bool:
+        """
+        IMPORTANT for your watcher:
+        - returns True when fully filled
+        - ALSO returns True when partially filled (filled > 0) so the watcher can arm SL/TP
+          as soon as a position exists (prevents “partial fill unprotected”).
+        """
+        if not _is_ok(order_detail_resp):
+            return False
+
+        data = BitgetTrader._data_row(order_detail_resp)
+        state = str(data.get("state") or data.get("status") or "").lower()
+
+        if state in {"filled", "full_fill", "fullfill", "completed", "success"}:
+            return True
+
+        filled = BitgetTrader.filled_qty(order_detail_resp)
+        size = BitgetTrader.order_size(order_detail_resp)
+
+        # full numeric fill
+        if size > 0 and filled >= size * 0.999:
+            return True
+
+        # partial fill -> treat as "filled enough" to arm protection
+        if filled > 0:
+            return True
+
+        return False
+
+    # ----------------------------
+    # Emergency close
+    # ----------------------------
+
+    async def flash_close_position(
+        self,
+        symbol: str,
+        *,
+        hold_side: Optional[str] = None,  # "long" / "short" in hedge mode; None closes all sides
+        timeout: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        Close position at market price (Bitget v2: /api/v2/mix/order/close-positions).
+        """
+        sym = self._symbol(symbol)
+        payload: Dict[str, Any] = {"symbol": sym, "productType": self.product_type}
+        if hold_side:
+            payload["holdSide"] = str(hold_side).lower()
+        return await self._request_any_status("POST", "/api/v2/mix/order/close-positions", data=payload, auth=True, timeout=timeout)
+
+    # ----------------------------
+    # Watcher / state snapshots (NEW)
+    # ----------------------------
+
+    @staticmethod
+    def _extract_list(js: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Some endpoints return data=list, others return data={list:[...]}.
+        We normalize to list[dict].
+        """
+        if not isinstance(js, dict):
+            return []
+        data = js.get("data")
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            for k in ("list", "data", "rows"):
+                v = data.get(k)
+                if isinstance(v, list):
+                    return [x for x in v if isinstance(x, dict)]
+        return []
+
+    async def get_all_positions(self, *, timeout: int = 10) -> Dict[str, Any]:
+        """
+        GET /api/v2/mix/position/all-position
+        """
+        params = {"productType": self.product_type, "marginCoin": self.margin_coin}
+        return await self._request_any_status("GET", "/api/v2/mix/position/all-position", params=params, auth=True, timeout=timeout)
+
+    async def get_single_position(self, symbol: str, *, timeout: int = 10) -> Dict[str, Any]:
+        """
+        GET /api/v2/mix/position/single-position
+        """
+        sym = self._symbol(symbol)
+        params = {"productType": self.product_type, "marginCoin": self.margin_coin, "symbol": sym}
+        return await self._request_any_status("GET", "/api/v2/mix/position/single-position", params=params, auth=True, timeout=timeout)
+
+    async def get_pending_orders(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        limit: int = 100,
+        id_less_than: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        timeout: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        GET /api/v2/mix/order/orders-pending
+        """
+        params: Dict[str, Any] = {"productType": self.product_type}
+        if symbol:
+            params["symbol"] = self._symbol(symbol)
+        if limit:
+            params["limit"] = int(limit)
+        if id_less_than:
+            params["idLessThan"] = str(id_less_than)
+        if start_time:
+            params["startTime"] = int(start_time)
+        if end_time:
+            params["endTime"] = int(end_time)
+        return await self._request_any_status("GET", "/api/v2/mix/order/orders-pending", params=params, auth=True, timeout=timeout)
+
+    async def get_pending_plan_orders(
+        self,
+        *,
+        plan_type: str = "normal_plan",
+        symbol: Optional[str] = None,
+        limit: int = 100,
+        id_less_than: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        timeout: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        GET /api/v2/mix/order/orders-plan-pending
+        """
+        params: Dict[str, Any] = {"productType": self.product_type, "planType": str(plan_type)}
+        if symbol:
+            params["symbol"] = self._symbol(symbol)
+        if limit:
+            params["limit"] = int(limit)
+        if id_less_than:
+            params["idLessThan"] = str(id_less_than)
+        if start_time:
+            params["startTime"] = int(start_time)
+        if end_time:
+            params["endTime"] = int(end_time)
+        return await self._request_any_status("GET", "/api/v2/mix/order/orders-plan-pending", params=params, auth=True, timeout=timeout)
+
+    async def get_order_fills(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        order_id: Optional[str] = None,
+        limit: int = 100,
+        id_less_than: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        timeout: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        GET /api/v2/mix/order/fills
+        """
+        params: Dict[str, Any] = {"productType": self.product_type}
+        if symbol:
+            params["symbol"] = self._symbol(symbol)
+        if order_id:
+            params["orderId"] = str(order_id)
+        if limit:
+            params["limit"] = int(limit)
+        if id_less_than:
+            params["idLessThan"] = str(id_less_than)
+        if start_time:
+            params["startTime"] = int(start_time)
+        if end_time:
+            params["endTime"] = int(end_time)
+        return await self._request_any_status("GET", "/api/v2/mix/order/fills", params=params, auth=True, timeout=timeout)
+
+    async def get_ticker(
+        self,
+        symbol: str,
+        *,
+        timeout: int = 8,
+    ) -> Dict[str, Any]:
+        """
+        GET /api/v2/mix/market/ticker (public)
+        """
+        params = {"productType": self.product_type, "symbol": self._symbol(symbol)}
+        return await self._request_any_status("GET", "/api/v2/mix/market/ticker", params=params, auth=False, timeout=timeout)
