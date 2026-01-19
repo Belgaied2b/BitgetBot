@@ -114,18 +114,48 @@ def _env_float(name: str, default: str) -> float:
 
 
 # =====================================================================
-# ✅ INSTITUTIONAL MAX: Session / Killzones (UTC windows by default)
+# ✅ INSTITUTIONAL MAX: Session / Killzones (DST-aware)
 # =====================================================================
+# Goal (desk): avoid illiquid / chop windows by default.
+#
+# Design:
+# - Dual killzones (London + NY) with their *local* timezones by default (DST-safe)
+# - Optional legacy mode: single timezone windows (SESSION_TZ)
+#
+# Behavior:
+# - outside killzones -> reject in non-desk if strict
+# - outside killzones -> soft veto in desk
+#
+# Env knobs:
+#   SESSION_FILTER_ENABLE=1
+#   SESSION_FILTER_STRICT=1
+#   KZ_DUAL_TZ=1
+#   KZ_LONDON_TZ=Europe/London
+#   KZ_NY_TZ=America/New_York
+#   LONDON_START=07:00  LONDON_END=10:00  (in London TZ)
+#   NY_START=08:00      NY_END=11:00      (in NY TZ)
+#   SESSION_TZ=UTC      (legacy single-tz mode)
+# =====================================================================
+
 # If enabled: outside killzones -> reject in non-desk, soft veto in desk.
 SESSION_FILTER_ENABLE = _env_flag("SESSION_FILTER_ENABLE", "1")
 SESSION_FILTER_STRICT = _env_flag("SESSION_FILTER_STRICT", "1")  # if 0 and desk -> always soft veto only
-SESSION_TZ = _env_str("SESSION_TZ", "UTC")  # "UTC" recommended for stability
-# London killzone default (UTC)
+
+# Dual-TZ killzones (DST-aware) — recommended
+KZ_DUAL_TZ = _env_flag("KZ_DUAL_TZ", "1")
+KZ_LONDON_TZ = _env_str("KZ_LONDON_TZ", "Europe/London")
+KZ_NY_TZ = _env_str("KZ_NY_TZ", "America/New_York")
+
+# Legacy single TZ (kept for backward compatibility)
+SESSION_TZ = _env_str("SESSION_TZ", "UTC")
+
+# London killzone defaults (London local time)
 LONDON_START = _env_str("LONDON_START", "07:00")
 LONDON_END = _env_str("LONDON_END", "10:00")
-# NY killzone default (UTC)
-NY_START = _env_str("NY_START", "13:00")
-NY_END = _env_str("NY_END", "16:00")
+
+# NY killzone defaults (NY local time) — corresponds to ~13:00-16:00 UTC during standard time
+NY_START = _env_str("NY_START", "08:00")
+NY_END = _env_str("NY_END", "11:00")
 
 
 def _parse_hhmm(s: str) -> time:
@@ -149,40 +179,60 @@ def _in_time_window(now_t: time, start: time, end: time) -> bool:
     # Handles standard window same-day only (start < end)
     if start <= end:
         return (now_t >= start) and (now_t <= end)
-    # If someone configures wrap-around (rare), handle it
+    # Wrap-around support (rare)
     return (now_t >= start) or (now_t <= end)
 
 
 def _session_ok() -> Tuple[bool, str, Dict[str, Any]]:
-    meta: Dict[str, Any] = {}
+    """Killzone decision (DST-aware when KZ_DUAL_TZ=1)."""
     if not SESSION_FILTER_ENABLE:
         return True, "OK", {"enabled": False}
-
-    now_dt = _now_in_tz(SESSION_TZ)
-    now_t = now_dt.time()
 
     l_start = _parse_hhmm(LONDON_START)
     l_end = _parse_hhmm(LONDON_END)
     ny_start = _parse_hhmm(NY_START)
     ny_end = _parse_hhmm(NY_END)
 
+    meta: Dict[str, Any] = {
+        "enabled": True,
+        "dual_tz": bool(KZ_DUAL_TZ),
+        "london": f"{LONDON_START}-{LONDON_END}",
+        "ny": f"{NY_START}-{NY_END}",
+    }
+
+    if KZ_DUAL_TZ:
+        now_l = _now_in_tz(KZ_LONDON_TZ)
+        now_ny = _now_in_tz(KZ_NY_TZ)
+        in_london = _in_time_window(now_l.time(), l_start, l_end)
+        in_ny = _in_time_window(now_ny.time(), ny_start, ny_end)
+        ok = bool(in_london or in_ny)
+        meta.update(
+            {
+                "london_tz": KZ_LONDON_TZ,
+                "ny_tz": KZ_NY_TZ,
+                "now_london": now_l.isoformat(),
+                "now_ny": now_ny.isoformat(),
+                "in_london": bool(in_london),
+                "in_ny": bool(in_ny),
+            }
+        )
+        return ok, ("OK" if ok else "outside_killzones"), meta
+
+    # Legacy single-tz mode
+    now_dt = _now_in_tz(SESSION_TZ)
+    now_t = now_dt.time()
     in_london = _in_time_window(now_t, l_start, l_end)
     in_ny = _in_time_window(now_t, ny_start, ny_end)
     ok = bool(in_london or in_ny)
-
     meta.update(
         {
-            "enabled": True,
             "tz": SESSION_TZ,
             "now": now_dt.isoformat(),
             "in_london": bool(in_london),
             "in_ny": bool(in_ny),
-            "london": f"{LONDON_START}-{LONDON_END}",
-            "ny": f"{NY_START}-{NY_END}",
         }
     )
     return ok, ("OK" if ok else "outside_killzones"), meta
-
 
 # =====================================================================
 # ✅ TrendGuard (anti-contre-tendance / anti-chop MARKET)
@@ -208,6 +258,100 @@ def _ensure_ohlcv(df: pd.DataFrame) -> bool:
         if c not in df.columns:
             return False
     return True
+
+
+# =====================================================================
+# ✅ Bar-close safety (avoid using partially-formed last candle)
+# =====================================================================
+BAR_CLOSE_ONLY = _env_flag("BAR_CLOSE_ONLY", "1")
+BAR_CLOSE_MIN_HISTORY = _env_int("BAR_CLOSE_MIN_HISTORY", "80")
+BAR_CLOSE_GRACE_PCT = _env_float("BAR_CLOSE_GRACE_PCT", "0.85")  # if now-last_ts < grace*tf => drop last
+
+_TIME_COLS = ("time", "timestamp", "open_time", "openTime", "t")
+
+
+def _infer_bar_seconds(df: pd.DataFrame) -> Optional[float]:
+    """Infer bar size in seconds from median timestamp diff (best-effort)."""
+    try:
+        if df is None or df.empty or len(df) < 20:
+            return None
+        col = None
+        for c in _TIME_COLS:
+            if c in df.columns:
+                col = c
+                break
+        if col is None:
+            # allow DatetimeIndex
+            if isinstance(df.index, pd.DatetimeIndex):
+                ts = df.index.view('int64') // 10**9
+            else:
+                return None
+        else:
+            s = pd.to_numeric(df[col], errors='coerce')
+            if s.isna().all():
+                return None
+            # detect ms vs s
+            med = float(s.dropna().median())
+            ts = s.dropna().astype('int64')
+            if med > 1e12:
+                ts = (ts // 1000).astype('int64')
+        if len(ts) < 20:
+            return None
+        d = ts.diff().dropna()
+        d = d[d > 0]
+        if d.empty:
+            return None
+        sec = float(d.median())
+        if not np.isfinite(sec) or sec <= 0:
+            return None
+        # clamp unreasonable values
+        if sec < 30:
+            return None
+        if sec > 7 * 24 * 3600:
+            return None
+        return sec
+    except Exception:
+        return None
+
+
+def _drop_incomplete_last_bar(df: pd.DataFrame) -> pd.DataFrame:
+    """If last candle is likely still forming, drop it (non-destructive)."""
+    try:
+        if not BAR_CLOSE_ONLY:
+            return df
+        if df is None or df.empty or len(df) < BAR_CLOSE_MIN_HISTORY:
+            return df
+
+        tf_sec = _infer_bar_seconds(df)
+        if tf_sec is None:
+            return df
+
+        col = None
+        for c in _TIME_COLS:
+            if c in df.columns:
+                col = c
+                break
+
+        if col is None:
+            if isinstance(df.index, pd.DatetimeIndex):
+                last_ts = int(df.index[-1].timestamp())
+            else:
+                return df
+        else:
+            s = pd.to_numeric(df[col], errors='coerce')
+            if s.isna().all():
+                return df
+            last_raw = float(s.iloc[-1])
+            last_ts = int(last_raw // 1000) if last_raw > 1e12 else int(last_raw)
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        age = float(now_ts - last_ts)
+        if age < max(0.0, BAR_CLOSE_GRACE_PCT * float(tf_sec)):
+            return df.iloc[:-1].copy()
+        return df
+    except Exception:
+        return df
+
 
 
 def _last_close(df: pd.DataFrame) -> float:
@@ -897,7 +1041,7 @@ def _inst_micro_filters(inst: Dict[str, Any], bias: str, setup_intent: str) -> T
     if bool(liq_meta.get("hard_veto")):
         hard_ok = False
     if intent == "CONTINUATION":
-        if any(v in vetoes for v in ["crowding_risky", "funding_extreme_crowded", "inst_align_low(0<", "flow_strong_sell_vs_long", "flow_strong_buy_vs_short"]):
+        if any(v in vetoes for v in ["crowding_risky", "funding_extreme_crowded", "flow_strong_sell_vs_long", "flow_strong_buy_vs_short"]):
             hard_ok = False
         if any(v.startswith("inst_align_low") for v in vetoes):
             hard_ok = False
@@ -1647,9 +1791,21 @@ class SignalAnalyzer:
             return _reject("bad_df_h4")
 
         # =================================================================
+        # Bar-close safety (best-effort): drop potentially unclosed last bar
+        # =================================================================
+        if BAR_CLOSE_ONLY:
+            before1 = len(df_h1)
+            before4 = len(df_h4)
+            df_h1 = _drop_incomplete_last_bar(df_h1)
+            df_h4 = _drop_incomplete_last_bar(df_h4)
+            if len(df_h1) != before1 or len(df_h4) != before4:
+                LOGGER.info("[EVAL_PRE] %s bar_close_guard dropped_last h1:%s->%s h4:%s->%s", symbol, before1, len(df_h1), before4, len(df_h4))
+
+        # =================================================================
         # Session filter (institutional killzones)
         # =================================================================
         sess_ok, sess_why, sess_meta = _session_ok()
+        sess_meta["bar_close"] = {"h1": h1_bar_meta, "h4": h4_bar_meta}
         if not sess_ok:
             if (not DESK_EV_MODE) and SESSION_FILTER_STRICT:
                 LOGGER.info("[EVAL_REJECT] %s outside_killzones meta=%s", symbol, sess_meta)
