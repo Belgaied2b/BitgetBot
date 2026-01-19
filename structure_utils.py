@@ -40,6 +40,17 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return default
 
 
+# =====================================================================
+# Institutional MAX toggles (non-breaking defaults)
+# =====================================================================
+# If enabled, attempts to drop the last "live" (incomplete) bar when datetime index is present.
+# This prevents bias in BOS/CHOCH/ADX/squeeze computations from partially formed candles.
+STRUCT_DROP_LIVE_BAR = str(os.getenv("STRUCT_DROP_LIVE_BAR", "0")).strip() == "1"
+
+# If datetime index is naive but a timezone conversion is requested (STRUCT_SESS_TZ),
+# we can first localize using this assumed timezone (default UTC) before converting.
+STRUCT_ASSUME_TZ_FOR_NAIVE = str(os.getenv("STRUCT_ASSUME_TZ_FOR_NAIVE", "UTC")).strip() or "UTC"
+
 def _has_cols(df: pd.DataFrame, cols: Tuple[str, ...]) -> bool:
     try:
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
@@ -48,6 +59,43 @@ def _has_cols(df: pd.DataFrame, cols: Tuple[str, ...]) -> bool:
     except Exception:
         return False
 
+
+def _maybe_drop_live_bar(df: pd.DataFrame) -> pd.DataFrame:
+    """Best-effort drop last bar if it looks incomplete.
+
+    Heuristic:
+      - requires DateTimeIndex
+      - estimate typical bar interval from median of last 50 deltas
+      - if 'now' is earlier than last_ts + 0.8*interval -> last bar likely still forming
+    Non-breaking by default (guarded by STRUCT_DROP_LIVE_BAR).
+    """
+    try:
+        if not STRUCT_DROP_LIVE_BAR:
+            return df
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return df
+        dt = df.index
+        if len(dt) < 10:
+            return df
+        # work in index timezone if any
+        last_ts = pd.Timestamp(dt[-1])
+        # compute median interval
+        deltas = (dt[-50:].to_series().diff().dropna().dt.total_seconds().values)
+        if deltas is None or len(deltas) < 5:
+            return df
+        interval = float(np.nanmedian(deltas))
+        if not np.isfinite(interval) or interval <= 0:
+            return df
+        # get now in same tz
+        now = pd.Timestamp.now(tz=dt.tz) if dt.tz is not None else pd.Timestamp.utcnow()
+        # If last bar is too recent compared to expected close time, drop it
+        if now < (last_ts + pd.Timedelta(seconds=0.8 * interval)):
+            return df.iloc[:-1].copy()
+        return df
+    except Exception:
+        return df
 
 # Optional: reuse ATR from indicators if present
 _compute_atr_ext = None
@@ -228,10 +276,19 @@ def _coerce_to_tz(dt: pd.DatetimeIndex, tz: Optional[str]) -> Tuple[pd.DatetimeI
 
     try:
         if dt.tz is None:
-            # keep naive; we can't safely localize without knowing the source timezone
-            meta["tz_used"] = None
-            meta["note"] = f"naive_dt_no_localize_requested_tz={tz_req}"
-            return dt, meta
+            # Institutional MAX: if dt is naive but a tz was requested, localize first
+            # using STRUCT_ASSUME_TZ_FOR_NAIVE (default UTC), then convert to requested tz.
+            try:
+                base_tz = STRUCT_ASSUME_TZ_FOR_NAIVE
+                dt_loc = dt.tz_localize(base_tz)
+                out = dt_loc.tz_convert(tz_req)
+                meta["tz_used"] = tz_req
+                meta["note"] = f"naive_dt_localized:{base_tz}"
+                return out, meta
+            except Exception as e:
+                meta["tz_used"] = None
+                meta["note"] = f"naive_dt_no_localize_requested_tz={tz_req} err={e}"
+                return dt, meta
         out = dt.tz_convert(tz_req)
         meta["tz_used"] = tz_req
         return out, meta
@@ -527,6 +584,43 @@ def _cluster_levels(levels: List[float], tolerance: float) -> List[float]:
     return out
 
 
+def _cluster_levels_meta(levels: List[float], tolerance: float) -> List[Dict[str, Any]]:
+    """Cluster nearby levels and return metadata.
+
+    Returns list of dicts:
+      {"level": <cluster_mean>, "touches": <count>, "min": <min>, "max": <max>}
+    Only clusters with >=2 touches are returned (same behavior as _cluster_levels).
+    """
+    if not levels:
+        return []
+    tol = abs(float(tolerance))
+    if tol <= 0:
+        return []
+    lv = sorted([float(x) for x in levels if np.isfinite(float(x))])
+    if not lv:
+        return []
+
+    clusters: List[List[float]] = [[lv[0]]]
+    for x in lv[1:]:
+        if abs(x - float(np.mean(clusters[-1]))) <= tol:
+            clusters[-1].append(x)
+        else:
+            clusters.append([x])
+
+    out: List[Dict[str, Any]] = []
+    for c in clusters:
+        if len(c) >= 2:
+            out.append(
+                {
+                    "level": float(np.mean(c)),
+                    "touches": int(len(c)),
+                    "min": float(np.min(c)),
+                    "max": float(np.max(c)),
+                }
+            )
+    return out
+
+
 def detect_equal_levels(
     df: pd.DataFrame,
     left: int = 3,
@@ -544,6 +638,7 @@ def detect_equal_levels(
     Returns:
       {"eq_highs": [level...], "eq_lows": [level...]}
     """
+    df = _maybe_drop_live_bar(df)
     if df is None or len(df) < left + right + 10 or not _has_cols(df, ("high", "low", "close")):
         return {"eq_highs": [], "eq_lows": []}
 
@@ -570,9 +665,20 @@ def detect_equal_levels(
     if tol <= 0:
         tol = max(1e-12, abs(last_price) * float(tol_fallback_pct))
 
-    eq_highs = sorted(_cluster_levels(high_prices, tol))
-    eq_lows = sorted(_cluster_levels(low_prices, tol))
-    return {"eq_highs": eq_highs, "eq_lows": eq_lows}
+    eq_highs_meta = _cluster_levels_meta(high_prices, tol)
+    eq_lows_meta = _cluster_levels_meta(low_prices, tol)
+
+    eq_highs = sorted([float(x["level"]) for x in eq_highs_meta])
+    eq_lows = sorted([float(x["level"]) for x in eq_lows_meta])
+
+    # Backward compatible keys + richer metadata for institutional filters
+    return {
+        "eq_highs": eq_highs,
+        "eq_lows": eq_lows,
+        "eq_highs_meta": eq_highs_meta,
+        "eq_lows_meta": eq_lows_meta,
+        "tol_used": float(tol),
+    }
 
 
 def has_liquidity_zone(df: pd.DataFrame, direction: str, lookback: int = 200) -> bool:
@@ -1531,6 +1637,9 @@ def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
     # NEW: external HTF levels (best-effort)
     htf_levels = external_htf_levels(df)
 
+    # Institutional helper: equal highs/lows pools (non-breaking)
+    eq_levels = detect_equal_levels(df.tail(200))
+
     bos_block = _detect_bos_choch_cos(df, htf_levels=htf_levels)
     ob = _detect_order_blocks(df, lookback=120)
     fvg_zones = _detect_fvg(df, lookback=140, keep_last=8)
@@ -1565,6 +1674,7 @@ def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
         "raid_displacement": raid,
         "volume_profile": vp,
         "htf_levels": htf_levels,           # NEW
+        "eq_levels": eq_levels,            # NEW (non-breaking)
         # extra debug (non-breaking)
         "bos_external_ref": bos_block.get("external_ref"),
         "bos_external_ref_level": bos_block.get("external_ref_level"),
