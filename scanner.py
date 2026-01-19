@@ -160,6 +160,25 @@ _MIN_RE = re.compile(r"minimum price limit:\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
 ALERT_MODE = str(os.getenv("ALERT_MODE", "TOP_RANK")).strip().upper()  # TOP_RANK | ALL_VALID | EXEC_ONLY | NONE
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", str(max(5, int(MAX_ORDERS_PER_SCAN) * 2))))
 
+
+# =====================================================================
+# Institutional execution/ranking hardening (env-tunable)
+# =====================================================================
+# These toggles are SAFE by default (do not change behavior unless enabled).
+# Enable to push the scanner into "institutional max" discipline.
+
+# Ranking: include desk grades / microstructure flags if analyzer provides them
+RANK_USE_PRIORITY = str(os.getenv("RANK_USE_PRIORITY", "1")).strip() == "1"
+RANK_SOFT_VETO_PENALTY = float(os.getenv("RANK_SOFT_VETO_PENALTY", "12"))  # per soft-veto in analyzer output
+RANK_RISK_FACTOR_WEIGHT = float(os.getenv("RANK_RISK_FACTOR_WEIGHT", "8"))  # higher rf => better
+RANK_OPT_SCORE_WEIGHT = float(os.getenv("RANK_OPT_SCORE_WEIGHT", "0.15"))   # 0..100 options score
+RANK_COMP_WEIGHT = float(os.getenv("RANK_COMP_WEIGHT", "0.08"))             # composite momentum score
+RANK_RR_WEIGHT = float(os.getenv("RANK_RR_WEIGHT", "4"))                    # rr contribution
+
+# Execution: optional hard discipline gates (disabled by default)
+EXEC_MAX_SOFT_VETOES = int(os.getenv("EXEC_MAX_SOFT_VETOES", "-1"))  # -1 disables. 0 means none allowed.
+EXEC_REQUIRE_KILLZONE = str(os.getenv("EXEC_REQUIRE_KILLZONE", "0")).strip() == "1"
+
 # Pending persistence
 PENDING_STATE_FILE = os.getenv("PENDING_STATE_FILE", "pending_state.json")
 PENDING_SAVE_THROTTLE_S = 4.0
@@ -623,6 +642,55 @@ def _order_state(detail: Dict[str, Any]) -> str:
         return st or "unknown"
     except Exception:
         return "unknown"
+
+
+async def _get_order_detail_safe(
+    trader: BitgetTrader,
+    symbol: str,
+    *,
+    order_id: Optional[str] = None,
+    client_oid: Optional[str] = None,
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Robust order detail getter.
+
+    - Prefers BitgetTrader.get_order_detail if present.
+    - Falls back to raw REST call if the method is missing (prevents ARM freeze).
+    """
+    sym = str(symbol).upper()
+
+    # Preferred
+    if hasattr(trader, "get_order_detail"):
+        try:
+            return await asyncio.wait_for(
+                trader.get_order_detail(sym, order_id=order_id, client_oid=client_oid),
+                timeout=float(timeout),
+            )
+        except Exception as e:
+            return {"ok": False, "code": "EXC", "msg": str(e)}
+
+    # Fallback (older trader)
+    params: Dict[str, Any] = {
+        "productType": getattr(trader, "product_type", "usdt-futures"),
+        "symbol": sym,
+        "marginCoin": getattr(trader, "margin_coin", "USDT"),
+    }
+    if order_id:
+        params["orderId"] = str(order_id)
+    if client_oid and (not order_id):
+        params["clientOid"] = str(client_oid)
+
+    try:
+        resp = await asyncio.wait_for(
+            trader.client._request("GET", "/api/v2/mix/order/detail", params=params, auth=True),
+            timeout=float(timeout),
+        )
+        if isinstance(resp, dict):
+            if resp.get("ok") is None:
+                resp["ok"] = str(resp.get("code", "")) == "00000"
+        return resp if isinstance(resp, dict) else {"ok": False, "code": "BAD", "msg": "invalid_resp"}
+    except Exception as e:
+        return {"ok": False, "code": "EXC", "msg": str(e)}
 
 
 # =====================================================================
@@ -1204,6 +1272,11 @@ async def analyze_symbol(
         opt_score = int(opt_ctx.get("score") or 0)
 
         inst_micro = result.get("inst_micro") if isinstance(result.get("inst_micro"), dict) else {}
+        soft_vetoes = result.get("soft_vetoes") if isinstance(result.get("soft_vetoes"), list) else []
+        soft_veto_count = int(len(soft_vetoes))
+        priority = str(result.get("priority") or "").strip()
+        pre_priority = str(result.get("pre_priority") or "").strip()
+        session_meta = result.get("session") if isinstance(result.get("session"), dict) else {}
         inst_liq_rf = _sanitize_risk_factor(inst_micro.get("liquidity_risk_factor", 1.0))
         combined_rf = _sanitize_risk_factor(opt_rf * inst_liq_rf)
 
@@ -1290,15 +1363,78 @@ def _setup_priority(setup: str) -> int:
     return 0
 
 
+def _priority_score(p: Any) -> int:
+    """Map desk grade to numeric score (higher is better)."""
+    s = str(p or "").strip().upper()
+    # common: S > A > B > C > D > E > F
+    order = {"S": 6, "A": 5, "B": 4, "C": 3, "D": 2, "E": 1, "F": 0}
+    return int(order.get(s, 0))
+
+
 def rank_candidates(cands: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    def key(c: Dict[str, Any]):
-        return (
-            int(c.get("inst_score") or 0),
-            _setup_priority(c.get("setup") or ""),
-            float(c.get("rr") or 0.0),
-            float(c.get("comp_score") or 0.0),
-        )
-    return sorted(cands, key=key, reverse=True)
+    """Institutional ranking.
+
+    Uses analyzer outputs when present:
+      - priority/pre_priority (desk grading)
+      - soft_veto_count (penalize cluttered microstructure)
+      - risk_factor (options + inst liquidity rf)
+
+    Defaults are conservative and env-tunable.
+    """
+
+    def score(c: Dict[str, Any]) -> float:
+        inst = float(c.get("inst_score") or 0)
+        rr = float(c.get("rr") or 0.0)
+        comp = float(c.get("comp_score") or 0.0)
+        setup_pr = float(_setup_priority(c.get("setup") or ""))
+
+        opt = c.get("options") if isinstance(c.get("options"), dict) else {}
+        opt_score = float(opt.get("score") or c.get("opt_score") or 0.0)
+
+        rf = float(c.get("risk_factor") or 1.0)
+        if (not math.isfinite(rf)) or rf <= 0:
+            rf = 1.0
+
+        soft_veto_count = float(c.get("soft_veto_count") or 0.0)
+
+        pr = 0.0
+        if RANK_USE_PRIORITY:
+            pr = float(_priority_score(c.get("priority") or c.get("pre_priority")))
+
+        # Weighted score (tuned for stability under large scans)
+        s = 0.0
+        s += pr * 1000.0
+        s += inst * 80.0
+        s += setup_pr * 40.0
+        s += rr * float(RANK_RR_WEIGHT)
+        s += comp * float(RANK_COMP_WEIGHT)
+        s += opt_score * float(RANK_OPT_SCORE_WEIGHT)
+        s += rf * float(RANK_RISK_FACTOR_WEIGHT)
+        s -= soft_veto_count * float(RANK_SOFT_VETO_PENALTY)
+        return float(s)
+
+    out = []
+    for c in cands:
+        try:
+            c = dict(c)
+            c["rank_score"] = score(c)
+            out.append(c)
+        except Exception:
+            continue
+
+    return sorted(
+        out,
+        key=lambda x: (
+            float(x.get("rank_score") or 0.0),
+            int(x.get("inst_score") or 0),
+            float(x.get("rr") or 0.0),
+        ),
+        reverse=True,
+    )
+
+
+# =====================================================================
+# Execution
 
 
 # =====================================================================
@@ -1331,6 +1467,20 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     notional = float(margin_used) * float(lev)
 
     post_only_entry = str(entry_type).upper() != "MARKET"
+
+    # ---- optional institutional execution gates ----
+    soft_veto_count = int(candidate.get("soft_veto_count") or 0)
+    if EXEC_MAX_SOFT_VETOES >= 0 and soft_veto_count > EXEC_MAX_SOFT_VETOES:
+        await stats.add_reason("exec:soft_veto_block")
+        await send_telegram(_mk_exec_msg("EXEC_SKIPPED", sym, tid, reason=f"soft_vetoes>{EXEC_MAX_SOFT_VETOES}", soft_veto_count=soft_veto_count))
+        return
+
+    if EXEC_REQUIRE_KILLZONE:
+        sess = candidate.get("session") if isinstance(candidate.get("session"), dict) else {}
+        if sess.get("enabled") is True and (not (sess.get("in_london") or sess.get("in_ny"))):
+            await stats.add_reason("exec:outside_killzone")
+            await send_telegram(_mk_exec_msg("EXEC_SKIPPED", sym, tid, reason="outside_killzone"))
+            return
 
     # avoid stacking same symbol+direction while pending
     try:
@@ -1672,7 +1822,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                 if not bool(st.get("armed", False)):
                     try:
                         detail = await asyncio.wait_for(
-                            trader.get_order_detail(sym, order_id=st.get("entry_order_id"), client_oid=st.get("entry_client_oid")),
+                            _get_order_detail_safe(trader, sym, order_id=st.get("entry_order_id"), client_oid=st.get("entry_client_oid"), timeout=DETAIL_TIMEOUT_S),
                             timeout=DETAIL_TIMEOUT_S,
                         )
                     except Exception as e:
@@ -2050,7 +2200,7 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         continue
 
                     try:
-                        tp1_detail = await asyncio.wait_for(trader.get_order_detail(sym, order_id=tp1_order_id), timeout=DETAIL_TIMEOUT_S)
+                        tp1_detail = await asyncio.wait_for(_get_order_detail_safe(trader, sym, order_id=tp1_order_id, timeout=DETAIL_TIMEOUT_S), timeout=DETAIL_TIMEOUT_S)
                     except Exception as e:
                         st["last_arm_fail_ts"] = time.time()
                         dirty = True
