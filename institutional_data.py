@@ -40,6 +40,94 @@ except Exception:  # pragma: no cover
 
 LOGGER = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------
+# Robust numeric parsing (Bitget sometimes returns numeric fields as strings)
+# ---------------------------------------------------------------------
+
+def _to_float(x):
+    """Best-effort float conversion.
+
+    Handles ints/floats, numeric strings (including commas), and returns None on failure.
+    """
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            v = float(x)
+            return v
+        # numpy scalars
+        try:
+            import numpy as _np  # local import to avoid hard dependency
+            if isinstance(x, (_np.floating, _np.integer)):
+                return float(x)
+        except Exception:
+            pass
+        if isinstance(x, str):
+            s = x.strip()
+            if not s:
+                return None
+            # common formatting artifacts
+            s = s.replace(',', '')
+            return float(s)
+        return float(x)
+    except Exception:
+        return None
+
+
+def _maybe_json_load(v):
+    """If v is a JSON string, attempt to load it."""
+    try:
+        if isinstance(v, str):
+            s = v.strip()
+            if s and (s[0] in '{[') and (s[-1] in '}]'):
+                import json as _json
+                return _json.loads(s)
+        return v
+    except Exception:
+        return v
+
+
+def _norm_book_level(level):
+    """Normalize one orderbook level to (price, qty) floats."""
+    try:
+        if level is None:
+            return None
+        # Bitget v2 docs show levels as [price, qty]
+        if isinstance(level, (list, tuple)) and len(level) >= 2:
+            p = _to_float(level[0])
+            q = _to_float(level[1])
+            if p is None or q is None:
+                return None
+            if p <= 0 or q <= 0:
+                return None
+            return (float(p), float(q))
+        # Some clients may expose dict levels
+        if isinstance(level, dict):
+            p = _to_float(level.get('price') or level.get('p') or level.get('px') or level.get('bid') or level.get('ask'))
+            q = _to_float(level.get('size') or level.get('qty') or level.get('q') or level.get('amount') or level.get('volume'))
+            if p is None or q is None:
+                return None
+            if p <= 0 or q <= 0:
+                return None
+            return (float(p), float(q))
+        return None
+    except Exception:
+        return None
+
+
+def _normalize_book_side(side, *, is_bids: bool):
+    """Normalize and sort a depth side."""
+    if not isinstance(side, list) or not side:
+        return []
+    out = []
+    for lvl in side:
+        nl = _norm_book_level(lvl)
+        if nl is not None:
+            out.append(nl)
+    # sort
+    out.sort(key=lambda x: x[0], reverse=bool(is_bids))
+    return out
+
 INST_VERSION = "UltraDesk3.2-bitget-only+ws-hub-max+funding-fallback+oi-optin+derived-2026-01-19"
 
 BITGET_API_BASE = str(os.getenv("BITGET_API_BASE", "https://api.bitget.com")).strip()
@@ -323,6 +411,11 @@ async def _http_get(path: str, params: Optional[Dict[str, Any]] = None, *, symbo
                                 st.mark_err(base_ms=1600)
                             LOGGER.warning("[INST] BITGET code=%s msg=%s path=%s params=%s", code, data.get("msg"), path, params)
                             return None
+
+                    # Some proxies/clients may wrap Bitget's `data` field as a JSON string.
+                    # Normalize it here so downstream parsers see the expected structure.
+                    if isinstance(data, dict) and 'data' in data:
+                        data['data'] = _maybe_json_load(data.get('data'))
 
                     if st is not None:
                         st.mark_ok()
@@ -729,12 +822,17 @@ async def _fetch_merge_depth(symbol: str) -> Optional[Dict[str, Any]]:
     if not isinstance(d, dict):
         return None
 
-    bids = d.get("bids")
-    asks = d.get("asks")
+    bids = _maybe_json_load(d.get("bids"))
+    asks = _maybe_json_load(d.get("asks"))
     if not isinstance(bids, list) or not isinstance(asks, list):
         return None
 
-    return {"bids": bids, "asks": asks}
+    nbids = _normalize_book_side(bids, is_bids=True)
+    nasks = _normalize_book_side(asks, is_bids=False)
+    if not nbids or not nasks:
+        return None
+
+    return {"bids": nbids, "asks": nasks}
 
 
 async def _fetch_funding_history(symbol: str, limit: int = 30) -> Optional[List[Dict[str, Any]]]:
@@ -798,7 +896,7 @@ async def _fetch_current_funding_rate(symbol: str) -> Tuple[Optional[float], Opt
     for k in ("fundingRate", "capitalRate", "funding_rate"):
         if k in d0 and d0.get(k) is not None:
             try:
-                fr = float(d0.get(k))
+                fr = _to_float(d0.get(k))
                 break
             except Exception:
                 fr = None
@@ -844,8 +942,8 @@ async def _fetch_open_interest(symbol: str) -> Optional[float]:
         for k in ("size", "openInterest", "open_interest", "holdingAmount", "holding", "amount", "oi"):
             if k in d and d.get(k) is not None:
                 try:
-                    v = float(d.get(k))
-                    return v
+                    v = _to_float(d.get(k))
+                    return (float(v) if v is not None else None)
                 except Exception:
                     pass
         return None
@@ -1138,8 +1236,10 @@ async def compute_full_institutional_analysis(
     if ws_snap is not None:
         try:
             if ws_snap.get("funding_rate") is not None:
-                funding_rate = float(ws_snap.get("funding_rate"))
-                sources["funding_rate"] = "ws_hub"
+                frv = _to_float(ws_snap.get("funding_rate"))
+                if frv is not None:
+                    funding_rate = float(frv)
+                    sources["funding_rate"] = "ws_hub"
 
             if ws_snap.get("next_funding_time_ms") is not None:
                 next_funding_time_ms = int(float(ws_snap.get("next_funding_time_ms")))
