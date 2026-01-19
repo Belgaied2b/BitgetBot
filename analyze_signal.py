@@ -666,39 +666,77 @@ def _inst_liquidity_guard(inst: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     if not INST_LIQ_FILTER_ENABLE:
-        meta.update({"ok": True, "reason": "disabled", "risk_factor": 1.0, "hard_veto": False})
+        meta.update(
+            {
+                "ok": True,
+                "reason": "disabled",
+                "risk_factor": 1.0,
+                "hard_veto": False,
+                "liquidity_quality": 100.0,
+            }
+        )
         return meta
 
     if spread_bps is None and depth_usd is None and depth_bid is None and depth_ask is None:
         ok = not INST_LIQ_FILTER_STRICT
         rf = float(INST_LIQ_RISK_FLOOR) if INST_LIQ_FILTER_STRICT else 1.0
-        meta.update({"ok": ok, "reason": "no_liquidity_data", "risk_factor": rf, "hard_veto": bool(INST_LIQ_FILTER_STRICT and not ok)})
+        meta.update(
+            {
+                "ok": ok,
+                "reason": "no_liquidity_data",
+                "risk_factor": rf,
+                "hard_veto": bool(INST_LIQ_FILTER_STRICT and not ok),
+                "liquidity_quality": float(100.0 * rf),
+            }
+        )
         return meta
 
     risk_factor = 1.0
     reasons: List[str] = []
+    quality_parts: List[float] = []
 
     min_depth = float(INST_LIQ_MIN_DEPTH_USD_25BPS)
     if depth_usd is not None and min_depth > 0 and depth_usd < min_depth:
         reasons.append("depth_low")
-        risk_factor *= max(float(depth_usd) / min_depth, float(INST_LIQ_RISK_FLOOR))
+        ratio = max(float(depth_usd) / min_depth, float(INST_LIQ_RISK_FLOOR))
+        risk_factor *= ratio
+        quality_parts.append(ratio)
+    elif depth_usd is not None and min_depth > 0:
+        quality_parts.append(min(2.0, float(depth_usd) / min_depth))
 
     min_bid = float(INST_LIQ_MIN_DEPTH_BID_USD_25BPS)
     if depth_bid is not None and min_bid > 0 and depth_bid < min_bid:
         reasons.append("bid_depth_low")
-        risk_factor *= max(float(depth_bid) / min_bid, float(INST_LIQ_RISK_FLOOR))
+        ratio = max(float(depth_bid) / min_bid, float(INST_LIQ_RISK_FLOOR))
+        risk_factor *= ratio
+        quality_parts.append(ratio)
+    elif depth_bid is not None and min_bid > 0:
+        quality_parts.append(min(2.0, float(depth_bid) / min_bid))
 
     min_ask = float(INST_LIQ_MIN_DEPTH_ASK_USD_25BPS)
     if depth_ask is not None and min_ask > 0 and depth_ask < min_ask:
         reasons.append("ask_depth_low")
-        risk_factor *= max(float(depth_ask) / min_ask, float(INST_LIQ_RISK_FLOOR))
+        ratio = max(float(depth_ask) / min_ask, float(INST_LIQ_RISK_FLOOR))
+        risk_factor *= ratio
+        quality_parts.append(ratio)
+    elif depth_ask is not None and min_ask > 0:
+        quality_parts.append(min(2.0, float(depth_ask) / min_ask))
 
     max_spread = float(INST_LIQ_MAX_SPREAD_BPS)
     if spread_bps is not None and max_spread > 0 and spread_bps > max_spread:
         reasons.append("spread_wide")
-        risk_factor *= max(max_spread / float(spread_bps), float(INST_LIQ_RISK_FLOOR))
+        ratio = max(max_spread / float(spread_bps), float(INST_LIQ_RISK_FLOOR))
+        risk_factor *= ratio
+        quality_parts.append(ratio)
+    elif spread_bps is not None and max_spread > 0:
+        quality_parts.append(min(2.0, max_spread / float(spread_bps)))
 
     risk_factor = max(float(INST_LIQ_RISK_FLOOR), min(float(INST_LIQ_RISK_CAP), float(risk_factor)))
+    if quality_parts:
+        quality_avg = float(np.mean(quality_parts))
+    else:
+        quality_avg = 1.0
+    liquidity_quality = float(max(0.0, min(100.0, 50.0 * quality_avg)))
 
     ok = len(reasons) == 0
     meta.update(
@@ -706,6 +744,7 @@ def _inst_liquidity_guard(inst: Dict[str, Any]) -> Dict[str, Any]:
             "ok": ok,
             "reason": "OK" if ok else ",".join(reasons),
             "risk_factor": risk_factor,
+            "liquidity_quality": liquidity_quality,
             "hard_veto": bool(INST_LIQ_FILTER_STRICT and not ok),
             "reasons": reasons,
         }
@@ -798,12 +837,14 @@ def _inst_micro_filters(inst: Dict[str, Any], bias: str, setup_intent: str) -> T
     align_tags: List[str] = []
 
     # CVD alignment (continuation wants align)
+    cvd_misalign = False
     if cvd_slope is not None and abs(cvd_slope) > 0:
         if _sign_align(b, cvd_slope):
             align_count += 1
             align_tags.append("cvd_align")
         else:
             vetoes.append("cvd_misalign")
+            cvd_misalign = True
 
     # OI alignment (only if meaningful magnitude)
     if oi_delta is not None and abs(oi_delta) >= OI_DELTA_MIN_ABS:
@@ -845,6 +886,9 @@ def _inst_micro_filters(inst: Dict[str, Any], bias: str, setup_intent: str) -> T
 
     if align_count < min_align:
         vetoes.append(f"inst_align_low({align_count}<{min_align})")
+
+    if funding_extreme and cvd_misalign:
+        vetoes.append("funding_cvd_conflict")
 
     # Hard decision:
     # - continuation should be very strict
