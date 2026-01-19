@@ -1781,935 +1781,644 @@ class SignalAnalyzer:
     ) -> Dict[str, Any]:
 
         LOGGER.info("[EVAL] ▶ START %s", symbol)
+        try:
 
-        if not _ensure_ohlcv(df_h1) or len(df_h1) < 80:
-            LOGGER.info("[EVAL_REJECT] %s bad_df_h1", symbol)
-            return _reject("bad_df_h1")
+            if not _ensure_ohlcv(df_h1) or len(df_h1) < 80:
+                LOGGER.info("[EVAL_REJECT] %s bad_df_h1", symbol)
+                return _reject("bad_df_h1")
 
-        if not _ensure_ohlcv(df_h4) or len(df_h4) < 80:
-            LOGGER.info("[EVAL_REJECT] %s bad_df_h4", symbol)
-            return _reject("bad_df_h4")
+            if not _ensure_ohlcv(df_h4) or len(df_h4) < 80:
+                LOGGER.info("[EVAL_REJECT] %s bad_df_h4", symbol)
+                return _reject("bad_df_h4")
 
-        # =================================================================
-        # Bar-close safety (best-effort): drop potentially unclosed last bar
-        # =================================================================
-        if BAR_CLOSE_ONLY:
-            before1 = len(df_h1)
-            before4 = len(df_h4)
-            df_h1 = _drop_incomplete_last_bar(df_h1)
-            df_h4 = _drop_incomplete_last_bar(df_h4)
-            if len(df_h1) != before1 or len(df_h4) != before4:
-                LOGGER.info("[EVAL_PRE] %s bar_close_guard dropped_last h1:%s->%s h4:%s->%s", symbol, before1, len(df_h1), before4, len(df_h4))
+            # =================================================================
+            # Bar-close safety (best-effort): drop potentially unclosed last bar
+            # =================================================================
+            if BAR_CLOSE_ONLY:
+                before1 = len(df_h1)
+                before4 = len(df_h4)
+                df_h1 = _drop_incomplete_last_bar(df_h1)
+                df_h4 = _drop_incomplete_last_bar(df_h4)
+                if len(df_h1) != before1 or len(df_h4) != before4:
+                    LOGGER.info("[EVAL_PRE] %s bar_close_guard dropped_last h1:%s->%s h4:%s->%s", symbol, before1, len(df_h1), before4, len(df_h4))
 
-        # =================================================================
-        # Session filter (institutional killzones)
-        # =================================================================
-        sess_ok, sess_why, sess_meta = _session_ok()
-        sess_meta["bar_close"] = {"h1": h1_bar_meta, "h4": h4_bar_meta}
-        if not sess_ok:
-            if (not DESK_EV_MODE) and SESSION_FILTER_STRICT:
-                LOGGER.info("[EVAL_REJECT] %s outside_killzones meta=%s", symbol, sess_meta)
-                return _reject("outside_killzones", session=sess_meta)
-        # desk soft veto
-        soft_vetoes: List[str] = []
-        if (not sess_ok) and DESK_EV_MODE:
-            soft_vetoes.append("outside_killzones")
+            # =================================================================
+            # Session filter (institutional killzones)
+            # =================================================================
+            sess_ok, sess_why, sess_meta = _session_ok()
+            sess_meta["bar_close"] = {"h1": h1_bar_meta, "h4": h4_bar_meta}
+            if not sess_ok:
+                if (not DESK_EV_MODE) and SESSION_FILTER_STRICT:
+                    LOGGER.info("[EVAL_REJECT] %s outside_killzones meta=%s", symbol, sess_meta)
+                    return _reject("outside_killzones", session=sess_meta)
+            # desk soft veto
+            soft_vetoes: List[str] = []
+            if (not sess_ok) and DESK_EV_MODE:
+                soft_vetoes.append("outside_killzones")
 
-        # =================================================================
-        # Tradability filter (liquidity/market quality)
-        # =================================================================
-        trad = _tradability_metrics(df_h1)
-        trad_ok = bool(trad.get("ok", True))
-        if LIQ_FILTER_ENABLE and (not trad_ok):
-            if (not DESK_EV_MODE) and LIQ_FILTER_STRICT:
-                LOGGER.info("[EVAL_REJECT] %s tradability_veto reason=%s metrics=%s", symbol, trad.get("reason"), trad)
-                return _reject("tradability_veto", tradability=trad)
-            if DESK_EV_MODE:
-                soft_vetoes.append(f"tradability:{trad.get('reason')}")
-
-        # ---- cheap direction hints first ----
-        mom = institutional_momentum(df_h1)
-        comp = composite_momentum(df_h1)
-        vol_reg = volatility_regime(df_h1)
-        ext_sig = extension_signal(df_h1)
-
-        comp_score = float(comp.get("score", 50.0)) if isinstance(comp, dict) else 50.0
-        comp_label = str(comp.get("label", "NEUTRAL")) if isinstance(comp, dict) else "NEUTRAL"
-
-        # ---- structure ----
-        struct = analyze_structure(df_h1)
-        struct_trend = str(struct.get("trend", "")).upper()
-        bias = str(struct_trend).upper()
-
-        # Fallback bias if range
-        used_bias_fallback = False
-        if bias not in ("LONG", "SHORT"):
-            fb = _composite_bias_fallback(comp_score, comp_label, mom)
-            if fb is not None:
-                bias = fb
-                used_bias_fallback = True
-                LOGGER.info("[EVAL_PRE] %s bias_fallback_for_inst=%s", symbol, bias)
-            else:
-                LOGGER.info("[EVAL_REJECT] %s no_bias_fallback_for_inst", symbol)
-                return _reject("no_bias_fallback_for_inst", structure=struct, momentum=mom, composite=comp)
-
-        LOGGER.info(
-            "[EVAL_PRE] %s STRUCT trend=%s bos=%s choch=%s cos=%s",
-            symbol, struct_trend, struct.get("bos"), struct.get("choch"), struct.get("cos")
-        )
-        LOGGER.info("[EVAL_PRE] %s MOMENTUM=%s", symbol, mom)
-        LOGGER.info("[EVAL_PRE] %s MOMENTUM_COMPOSITE score=%.2f label=%s", symbol, comp_score, comp_label)
-        LOGGER.info("[EVAL_PRE] %s VOL_REGIME=%s EXTENSION=%s", symbol, vol_reg, ext_sig)
-
-        # ---------------------------------------------------------------
-        # SMT divergence (optional)
-        # ---------------------------------------------------------------
-        smt: Dict[str, Any] = {"available": False}
-        smt_veto = False
-        ref_df = _get_macro_ref_df(macro)
-
-        if compute_smt_divergence is not None and ref_df is not None:
-            try:
-                smt = compute_smt_divergence(df_h1, ref_df, lookback=160)
-            except Exception:
-                smt = {"available": False}
-
-            if bool(smt.get("available")):
-                if bias == "LONG" and bool(smt.get("bearish_smt")):
-                    smt_veto = True
-                if bias == "SHORT" and bool(smt.get("bullish_smt")):
-                    smt_veto = True
-
-        if smt_veto and (not DESK_EV_MODE):
-            LOGGER.info("[EVAL_REJECT] %s smt_divergence_veto bias=%s smt=%s", symbol, bias, smt)
-            return _reject("smt_divergence_veto", smt=smt, smt_veto=True, structure=struct, momentum=mom, composite=comp)
-
-        if smt_veto and DESK_EV_MODE:
-            soft_vetoes.append("smt_veto")
-
-        # ---------------------------------------------------------------
-        # options_data regime + IV hint (soft context)
-        # ---------------------------------------------------------------
-        options_filter: Optional[Dict[str, Any]] = None
-        opt_obj = _get_options_obj(macro)
-        iv_hint = _get_macro_implied_vol(macro, symbol)
-
-        # setup guess (cheap)
-        bos_flag = bool(struct.get("bos", False))
-        raid_ok = bool(isinstance(struct.get("raid_displacement"), dict) and struct["raid_displacement"].get("ok"))
-        liq_sweep_pre = liquidity_sweep_details(df_h1, bias, lookback=180)
-        sweep_ok = bool(isinstance(liq_sweep_pre, dict) and liq_sweep_pre.get("ok"))
-
-        if score_options_context is not None:
-            if bos_flag:
-                setup_guess = "BOS_STRICT"
-            elif raid_ok:
-                setup_guess = "RAID_DISPLACEMENT"
-            elif sweep_ok:
-                setup_guess = "LIQ_SWEEP"
-            else:
-                setup_guess = "OTHER"
-            options_filter = _score_options_context_safe(opt_obj, bias=bias, setup_type=setup_guess)
-
-            try:
-                reg = str((options_filter or {}).get("regime") or "").lower()
-                if DESK_EV_MODE and reg in ("high_vol", "crisis", "event"):
-                    soft_vetoes.append(f"options_regime:{reg}")
-            except Exception:
-                pass
-
-        if iv_hint is not None and np.isfinite(iv_hint) and float(iv_hint) >= IV_HIGH_THRESHOLD:
-            if DESK_EV_MODE:
-                soft_vetoes.append("iv_high")
-            else:
-                # non-desk: keep it as veto only if strict session filter already enabled
-                # (institutional max still allows, because RR/SL already adapts)
-                pass
-
-        # ---------------------------------------------------------------
-        # STRICT HTF mismatch (anti-contre-tendance)
-        # ---------------------------------------------------------------
-        htf_bias_now = _htf_bias_from_df(df_h4)
-        if htf_bias_now in ("LONG", "SHORT") and bias in ("LONG", "SHORT") and (htf_bias_now != bias):
-            if TG_STRICT_HTF_BIAS or (not DESK_EV_MODE):
-                LOGGER.info("[EVAL_REJECT] %s htf_bias_mismatch bias=%s htf_bias=%s", symbol, bias, htf_bias_now)
-                return _reject(
-                    "htf_bias_mismatch",
-                    structure=struct,
-                    momentum=mom,
-                    composite=comp,
-                    htf_bias=htf_bias_now,
-                    smt=smt,
-                    smt_veto=bool(smt_veto),
-                    options_filter=options_filter,
-                    session=sess_meta,
-                    tradability=trad,
-                    iv=iv_hint,
-                )
-            soft_vetoes.append("htf_bias_mismatch")
-
-        if REQUIRE_STRUCTURE and used_bias_fallback and (not DESK_EV_MODE):
-            LOGGER.info("[EVAL_REJECT] %s no_clear_trend_range", symbol)
-            return _reject("no_clear_trend_range", structure=struct, momentum=mom, composite=comp, smt=smt, smt_veto=bool(smt_veto))
-
-        if REQUIRE_HTF_ALIGN and bias in ("LONG", "SHORT"):
-            if not htf_trend_ok(df_h4, bias):
+            # =================================================================
+            # Tradability filter (liquidity/market quality)
+            # =================================================================
+            trad = _tradability_metrics(df_h1)
+            trad_ok = bool(trad.get("ok", True))
+            if LIQ_FILTER_ENABLE and (not trad_ok):
+                if (not DESK_EV_MODE) and LIQ_FILTER_STRICT:
+                    LOGGER.info("[EVAL_REJECT] %s tradability_veto reason=%s metrics=%s", symbol, trad.get("reason"), trad)
+                    return _reject("tradability_veto", tradability=trad)
                 if DESK_EV_MODE:
-                    soft_vetoes.append("htf_veto")
-                    LOGGER.info("[EVAL_PRE] %s HTF_VETO (soft, desk_mode)", symbol)
+                    soft_vetoes.append(f"tradability:{trad.get('reason')}")
+
+            # ---- cheap direction hints first ----
+            mom = institutional_momentum(df_h1)
+            comp = composite_momentum(df_h1)
+            vol_reg = volatility_regime(df_h1)
+            ext_sig = extension_signal(df_h1)
+
+            comp_score = float(comp.get("score", 50.0)) if isinstance(comp, dict) else 50.0
+            comp_label = str(comp.get("label", "NEUTRAL")) if isinstance(comp, dict) else "NEUTRAL"
+
+            # ---- structure ----
+            struct = analyze_structure(df_h1)
+            struct_trend = str(struct.get("trend", "")).upper()
+            bias = str(struct_trend).upper()
+
+            # Fallback bias if range
+            used_bias_fallback = False
+            if bias not in ("LONG", "SHORT"):
+                fb = _composite_bias_fallback(comp_score, comp_label, mom)
+                if fb is not None:
+                    bias = fb
+                    used_bias_fallback = True
+                    LOGGER.info("[EVAL_PRE] %s bias_fallback_for_inst=%s", symbol, bias)
                 else:
-                    LOGGER.info("[EVAL_REJECT] %s htf_veto", symbol)
-                    return _reject("htf_veto", structure=struct, smt=smt, smt_veto=bool(smt_veto), options_filter=options_filter)
-
-        if (not DESK_EV_MODE) and (not (bos_flag or raid_ok or sweep_ok)):
-            LOGGER.info("[EVAL_REJECT] %s no_structure_trigger", symbol)
-            return _reject("no_structure_trigger", structure=struct, sweep=liq_sweep_pre, smt=smt, smt_veto=bool(smt_veto), options_filter=options_filter)
-
-        if REQUIRE_MOMENTUM:
-            if bias == "LONG" and mom not in ("BULLISH", "STRONG_BULLISH"):
-                if DESK_EV_MODE:
-                    soft_vetoes.append("momentum_not_bullish")
-                else:
-                    return _reject("momentum_not_bullish", structure=struct, smt=smt, smt_veto=bool(smt_veto), options_filter=options_filter)
-            if bias == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
-                if DESK_EV_MODE:
-                    soft_vetoes.append("momentum_not_bearish")
-                else:
-                    return _reject("momentum_not_bearish", structure=struct, smt=smt, smt_veto=bool(smt_veto), options_filter=options_filter)
-
-        # ===============================================================
-        # PRE-PRIORITY (cheap) → controls PASS2
-        # ===============================================================
-        pre_priority, pre_priority_reasons = _pre_grade_candidate(
-            bos_flag=bos_flag,
-            raid_ok=raid_ok,
-            sweep_ok=sweep_ok,
-            mom=mom,
-            comp_score=comp_score,
-            used_bias_fallback=used_bias_fallback,
-            ext_sig=ext_sig,
-        )
-        pass2_allowed_by_priority = priority_at_least(pre_priority, PASS2_ONLY_FOR_PRIORITY)
-
-        LOGGER.info(
-            "[EVAL_PRE] %s PRE_PRIORITY=%s pass2_allowed=%s reasons=%s soft_vetoes=%s smt_veto=%s options_filter=%s session=%s trad=%s iv=%s",
-            symbol,
-            pre_priority,
-            pass2_allowed_by_priority,
-            pre_priority_reasons,
-            soft_vetoes,
-            smt_veto,
-            options_filter,
-            sess_meta,
-            trad,
-            iv_hint,
-        )
-
-        # ===============================================================
-        # 1) INSTITUTIONAL — 2-PASS (anti-ban) + Liquidations
-        # ===============================================================
-        inst: Dict[str, Any]
-
-        pass1_liq = bool(INST_ENABLE_LIQUIDATIONS and (not INST_LIQ_PASS2_ONLY))
-        try:
-            inst = await compute_full_institutional_analysis(
-                symbol,
-                bias,
-                mode=INST_PASS1_MODE,
-                include_liquidations=pass1_liq,
-            )
-        except Exception as e:
-            inst = {
-                "institutional_score": 0,
-                "bitget_symbol": None,
-                "available": False,
-                "warnings": [f"inst_exception:{e}"],
-                "score_components": {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0},
-                "score_meta": {"raw_components_sum": 0, "ok_count": 0, "mode": INST_PASS1_MODE},
-            }
-
-        available = bool(inst.get("available", False))
-        bitget_symbol = (inst.get("bitget_symbol") or inst.get("symbol") or symbol)
-
-        gate, ok_count = _inst_gate_value(inst)
-        gate, override = _desk_inst_gate_override(inst, bias, int(gate))
-        inst_score_norm = _inst_score_normalized_0_100(inst, int(gate))
-
-        LOGGER.info(
-            "[INST_RAW] %s pass=1 mode=%s liq_req=%s inst_score=%s ok_count=%s gate=%s inst_score_norm=%s override=%s available=%s bitget_symbol=%s bias=%s comps=%s",
-            symbol,
-            (inst.get("score_meta") or {}).get("mode") or INST_PASS1_MODE,
-            pass1_liq,
-            inst.get("institutional_score"),
-            ok_count,
-            gate,
-            inst_score_norm,
-            override,
-            available,
-            bitget_symbol,
-            bias,
-            inst.get("available_components") or [],
-        )
-
-        if (not available) or (bitget_symbol is None):
-            if not ALLOW_TECH_FALLBACK_WHEN_INST_DOWN:
-                return _reject(
-                    "inst_unavailable",
-                    institutional=inst,
-                    structure=struct,
-                    momentum=mom,
-                    composite=comp,
-                    pre_priority=pre_priority,
-                    pre_priority_reasons=pre_priority_reasons,
-                    soft_vetoes=soft_vetoes,
-                    smt=smt,
-                    smt_veto=bool(smt_veto),
-                    options_filter=options_filter,
-                    session=sess_meta,
-                    tradability=trad,
-                    iv=iv_hint,
-                    inst_gate=int(gate),
-                    inst_ok_count=int(ok_count),
-                    inst_score_norm=int(inst_score_norm),
-                )
-            LOGGER.warning("[INST_DOWN] %s tech_fallback_enabled", symbol)
-
-        do_pass2 = bool(
-            INST_PASS2_ENABLED
-            and pass2_allowed_by_priority
-            and available
-            and (bitget_symbol is not None)
-            and (int(gate) >= int(INST_PASS2_MIN_GATE) or bool(DESK_EV_MODE))
-        )
-
-        if do_pass2:
-            pass2_liq = bool(INST_ENABLE_LIQUIDATIONS)
-            try:
-                inst2 = await compute_full_institutional_analysis(
-                    symbol,
-                    bias,
-                    mode=INST_PASS2_MODE,
-                    include_liquidations=pass2_liq,
-                )
-            except Exception as e:
-                inst2 = {
-                    "institutional_score": 0,
-                    "bitget_symbol": bitget_symbol,
-                    "available": False,
-                    "warnings": [f"inst_pass2_exception:{e}"],
-                    "score_components": {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0},
-                    "score_meta": {"raw_components_sum": 0, "ok_count": 0, "mode": INST_PASS2_MODE},
-                }
-
-            if isinstance(inst2, dict) and bool(inst2.get("available")) :
-                inst = inst2
-                available = bool(inst.get("available", False))
-                bitget_symbol = (inst.get("bitget_symbol") or inst.get("symbol") or symbol)
-                gate, ok_count = _inst_gate_value(inst)
-                gate, override = _desk_inst_gate_override(inst, bias, int(gate))
-                inst_score_norm = _inst_score_normalized_0_100(inst, int(gate))
-
-                LOGGER.info(
-                    "[INST_RAW] %s pass=2 mode=%s liq_req=%s inst_score=%s ok_count=%s gate=%s inst_score_norm=%s override=%s available=%s bitget_symbol=%s bias=%s comps=%s",
-                    symbol,
-                    (inst.get("score_meta") or {}).get("mode") or INST_PASS2_MODE,
-                    pass2_liq,
-                    inst.get("institutional_score"),
-                    ok_count,
-                    gate,
-                    inst_score_norm,
-                    override,
-                    available,
-                    bitget_symbol,
-                    bias,
-                    inst.get("available_components") or [],
-                )
-
-        if (not ALLOW_TECH_FALLBACK_WHEN_INST_DOWN) and int(gate) < int(MIN_INST_SCORE):
-            return _reject(
-                "inst_gate_low",
-                institutional=inst,
-                structure=struct,
-                inst_gate=int(gate),
-                ok_count=int(ok_count),
-                inst_score_norm=int(inst_score_norm),
-                pre_priority=pre_priority,
-                pre_priority_reasons=pre_priority_reasons,
-                soft_vetoes=soft_vetoes,
-                smt=smt,
-                smt_veto=bool(smt_veto),
-                options_filter=options_filter,
-                session=sess_meta,
-                tradability=trad,
-                iv=iv_hint,
-            )
-
-        # ===============================================================
-        # 2) STRUCTURE / QUALITY / ENTRY / EXITS
-        # ===============================================================
-        entry_mkt = _last_close(df_h1)
-
-        bos_dir = struct.get("bos_direction", None)
-        bos_q = bos_quality_details(
-            df_h1,
-            oi_series=struct.get("oi_series", None),
-            df_liq=df_h1,
-            price=entry_mkt,
-            direction=bos_dir,
-        )
-        bos_quality_ok = bool(bos_q.get("ok", True))
-
-        if REQUIRE_BOS_QUALITY and not bos_quality_ok:
-            return _reject(
-                "bos_quality_low",
-                institutional=inst,
-                structure=struct,
-                bos_quality=bos_q,
-                pre_priority=pre_priority,
-                pre_priority_reasons=pre_priority_reasons,
-                soft_vetoes=soft_vetoes,
-                smt=smt,
-                smt_veto=bool(smt_veto),
-                options_filter=options_filter,
-                session=sess_meta,
-                tradability=trad,
-                iv=iv_hint,
-                inst_gate=int(gate),
-                inst_ok_count=int(ok_count),
-                inst_score_norm=int(inst_score_norm),
-            )
-
-        premium, discount = compute_premium_discount(df_h1)
-        liq_sweep = liq_sweep_pre
-
-        entry_pick = _pick_entry(df_h1, struct, bias)
-        entry = float(entry_pick["entry_used"])
-        entry_type = str(entry_pick["entry_type"])
-        atr14 = float(entry_pick.get("atr") or _atr(df_h1, 14))
-
-        # ---------------------------------------------------------------
-        # TrendGuard
-        # ---------------------------------------------------------------
-        tg_ok, tg_why, tg_meta = _trend_guard(
-            df_h1=df_h1,
-            df_h4=df_h4,
-            bias=bias,
-            entry=float(entry) if entry > 0 else None,
-            entry_type=entry_type,
-        )
-        if not tg_ok:
-            if DESK_EV_MODE and (not TG_STRICT_REGIME_MARKET) and (tg_why != "reject:htf_bias_mismatch"):
-                soft_vetoes.append(tg_why.replace("reject:", "tg:"))
-            else:
-                return _reject(
-                    tg_why.replace("reject:", ""),
-                    institutional=inst,
-                    structure=struct,
-                    entry_pick=entry_pick,
-                    trend_guard=tg_meta,
-                    pre_priority=pre_priority,
-                    pre_priority_reasons=pre_priority_reasons,
-                    soft_vetoes=soft_vetoes,
-                    smt=smt,
-                    smt_veto=bool(smt_veto),
-                    options_filter=options_filter,
-                    session=sess_meta,
-                    tradability=trad,
-                    iv=iv_hint,
-                    inst_gate=int(gate),
-                    inst_ok_count=int(ok_count),
-                    inst_score_norm=int(inst_score_norm),
-                )
-
-        # Extension hygiene
-        if ext_sig == "OVEREXTENDED_LONG" and bias == "LONG":
-            if entry_type == "MARKET":
-                return _reject("overextended_long_market", institutional=inst, structure=struct, entry_pick=entry_pick)
-            if not _entry_pullback_ok(entry, entry_mkt, bias, atr14):
-                return _reject("overextended_long_no_pullback", institutional=inst, structure=struct, entry_pick=entry_pick)
-
-        if ext_sig == "OVEREXTENDED_SHORT" and bias == "SHORT":
-            if entry_type == "MARKET":
-                return _reject("overextended_short_market", institutional=inst, structure=struct, entry_pick=entry_pick)
-            if not _entry_pullback_ok(entry, entry_mkt, bias, atr14):
-                return _reject("overextended_short_no_pullback", institutional=inst, structure=struct, entry_pick=entry_pick)
-
-        unfavorable_market = bool(entry_type == "MARKET" and ((bias == "LONG" and premium) or (bias == "SHORT" and discount)))
-        if unfavorable_market and (not DESK_EV_MODE):
-            if bias == "LONG" and premium:
-                return _reject("long_in_premium_market", institutional=inst, structure=struct, entry_pick=entry_pick)
-            if bias == "SHORT" and discount:
-                return _reject("short_in_discount_market", institutional=inst, structure=struct, entry_pick=entry_pick)
-
-        # --------------------------
-        # Exits (policy-aware SL v3)
-        # --------------------------
-        setup_hint: Optional[str] = None
-        if bos_flag:
-            setup_hint = "BOS_STRICT"
-        elif DESK_EV_MODE and raid_ok:
-            setup_hint = "RAID_DISPLACEMENT"
-        elif DESK_EV_MODE and sweep_ok:
-            setup_hint = "LIQ_SWEEP"
-        elif DESK_EV_MODE:
-            setup_hint = "INST_CONTINUATION"
-
-        tick = estimate_tick_from_price(entry)
-        exits = _compute_exits(
-            df_h1,
-            entry,
-            bias,
-            tick=tick,
-            setup=setup_hint,
-            entry_type=entry_type,
-            htf_df=df_h4,
-        )
-
-        sl = float(exits["sl"])
-        tp1 = float(exits["tp1"])
-        rr = _safe_rr(entry, sl, tp1, bias)
-
-        # SL hygiene beyond sweep / eq levels
-        atr_last = _atr(df_h1, 14)
-        buf = max((atr_last * 0.08) if atr_last > 0 else 0.0, float(tick) * 2.0, entry * 0.0004)
-
-        sl_pre = float(sl)
-        sl_adj: Dict[str, Any] = {
-            "setup_hint": setup_hint,
-            "entry_type": entry_type,
-            "sl_pre": sl_pre,
-            "buf": float(buf),
-            "did_sweep": False,
-            "did_eq": False,
-            "sweep_extreme": None,
-            "eq_level": None,
-            "sl_post_round": None,
-        }
-
-        try:
-            if isinstance(liq_sweep, dict) and liq_sweep.get("ok"):
-                ext = float(liq_sweep.get("sweep_extreme") or 0.0)
-                if ext > 0 and buf > 0:
-                    if bias == "LONG":
-                        new_sl = min(sl, ext - buf)
-                    else:
-                        new_sl = max(sl, ext + buf)
-                    if np.isfinite(new_sl) and float(new_sl) != float(sl):
-                        sl = float(new_sl)
-                        sl_adj["did_sweep"] = True
-                        sl_adj["sweep_extreme"] = float(ext)
-        except Exception:
-            pass
-
-        try:
-            lv = detect_equal_levels(df_h1.tail(200), max_window=200, tol_mult_atr=0.10)
-            eq_highs = lv.get("eq_highs", []) or []
-            eq_lows = lv.get("eq_lows", []) or []
-
-            if bias == "LONG" and eq_lows:
-                lvl = min(eq_lows, key=lambda x: abs(entry - float(x)))
-                lvl = float(lvl)
-                if lvl > 0 and lvl < entry and sl > (lvl - buf):
-                    new_sl = min(sl, lvl - buf)
-                    if np.isfinite(new_sl) and float(new_sl) != float(sl):
-                        sl = float(new_sl)
-                        sl_adj["did_eq"] = True
-                        sl_adj["eq_level"] = float(lvl)
-
-            if bias == "SHORT" and eq_highs:
-                lvl = min(eq_highs, key=lambda x: abs(entry - float(x)))
-                lvl = float(lvl)
-                if lvl > 0 and lvl > entry and sl < (lvl + buf):
-                    new_sl = max(sl, lvl + buf)
-                    if np.isfinite(new_sl) and float(new_sl) != float(sl):
-                        sl = float(new_sl)
-                        sl_adj["did_eq"] = True
-                        sl_adj["eq_level"] = float(lvl)
-        except Exception:
-            pass
-
-        sl = _round_sl_for_side(sl, entry, bias, tick)
-        sl_adj["sl_post_round"] = float(sl)
-
-        if sl <= 0:
-            return _reject("sl_invalid_after_liq_adj", institutional=inst, structure=struct, sl_meta=sl_adj)
-
-        # recalc TP1 after SL adjustments
-        try:
-            tp1, _rr_used2 = compute_tp1(entry, sl, bias, df=df_h1, tick=tick)
-            tp1 = float(tp1)
-        except Exception:
-            tp1 = float(tp1)
-
-        rr = _safe_rr(entry, sl, tp1, bias)
-        if rr is None or rr <= 0:
-            return _reject("rr_invalid", institutional=inst, structure=struct, entry_pick=entry_pick)
-
-        base_sl_meta = exits.get("sl_meta") if isinstance(exits.get("sl_meta"), dict) else {}
-        sl_meta_out = dict(base_sl_meta)
-        sl_meta_out["post_adjust"] = sl_adj
-
-        # ===============================================================
-        # Institutional micro filters (intent-aware)
-        # ===============================================================
-        setup_intent = "CONTINUATION" if bos_flag else ("REVERSAL" if (raid_ok or sweep_ok) else "OTHER")
-        hard_ok_micro, micro_vetoes, micro_meta = _inst_micro_filters(inst, bias, setup_intent=setup_intent)
-
-        if not hard_ok_micro:
-            if (not DESK_EV_MODE) and INST_MICRO_FILTER_STRICT:
-                return _reject(
-                    "inst_micro_veto",
-                    institutional=inst,
-                    inst_micro=micro_meta,
-                    inst_micro_vetoes=micro_vetoes,
-                    structure=struct,
-                    entry_pick=entry_pick,
-                    rr=float(rr),
-                    soft_vetoes=soft_vetoes,
-                    session=sess_meta,
-                    tradability=trad,
-                    iv=iv_hint,
-                )
-            if DESK_EV_MODE:
-                soft_vetoes.extend([f"inst_micro:{v}" for v in micro_vetoes])
-
-        # ===============================================================
-        # Confidence score
-        # ===============================================================
-        confidence = _confidence_score(
-            inst_score_norm=int(inst_score_norm),
-            bos_q=bos_q,
-            comp_score=float(comp_score),
-            bias=bias,
-            used_bias_fallback=bool(used_bias_fallback),
-            soft_vetoes=list(soft_vetoes),
-            micro_vetoes=list(micro_vetoes),
-            options_filter=options_filter,
-            session_ok=bool(sess_ok),
-            tradability_ok=bool(trad_ok),
-            iv_hint=iv_hint,
-        )
-
-        # ===============================================================
-        # SETUPS
-        # ===============================================================
-        can_bos = bool(bos_flag and ((not REQUIRE_BOS_QUALITY) or bos_quality_ok))
-        can_raid = bool(isinstance(struct.get("raid_displacement"), dict) and struct["raid_displacement"].get("ok"))
-        can_sweep = bool(isinstance(liq_sweep, dict) and liq_sweep.get("ok"))
-
-        # BOS_STRICT — now requires micro alignment if enabled (true institutional continuation)
-        bos_ok = False
-        bos_variant = "NO"
-        if can_bos:
-            # enforce continuation cleanliness (confidence and micro alignment)
-            if INST_MICRO_FILTER_ENABLE and (not hard_ok_micro) and (not DESK_EV_MODE):
-                bos_ok = False
-            else:
-                if rr >= RR_MIN_STRICT:
-                    bos_ok = True
-                    bos_variant = "RR_STRICT"
-                elif rr >= RR_MIN_TOLERATED_WITH_INST and confidence >= 70:
-                    bos_ok = True
-                    bos_variant = "RR_RELAX_WITH_INST"
-
-        if bos_ok:
-            setup_core = "BOS_STRICT"
-            setup_ttl = _setup_ttl_compatible(setup_core, entry_type)
-            priority, priority_reasons = _final_grade(
-                setup_type=setup_core,
-                setup_variant=bos_variant,
-                rr=float(rr),
-                gate=int(gate),
-                ok_count=int(ok_count),
-                inst_available=bool(available),
-                bos_quality_ok=bool(bos_quality_ok),
-                used_bias_fallback=bool(used_bias_fallback),
-                entry_type=str(entry_type),
-                ext_sig=str(ext_sig),
-                unfavorable_market=bool(unfavorable_market),
-                mom=str(mom),
-                soft_vetoes=soft_vetoes,
-                inst_micro_vetoes=micro_vetoes,
-                confidence=int(confidence),
-            )
-
-            # recompute options context with final setup type (if module exists)
-            if score_options_context is not None:
-                options_filter = _score_options_context_safe(opt_obj, bias=bias, setup_type=setup_core)
-
-            return {
-                "valid": True,
-                "symbol": symbol,
-                "side": "BUY" if bias == "LONG" else "SELL",
-                "bias": bias,
-                "entry": entry,
-                "entry_type": entry_type,
-                "sl": float(sl),
-                "tp1": float(tp1),
-                "tp2": None,
-                "rr": float(rr),
-                "qty": 1,
-                "setup_type": setup_ttl,
-                "setup_type_core": setup_core,
-                "setup_variant": bos_variant,
-                "priority": priority,
-                "priority_reasons": priority_reasons,
-                "pre_priority": pre_priority,
-                "pre_priority_reasons": pre_priority_reasons,
-                "pass2_done": bool(do_pass2),
-                "soft_vetoes": soft_vetoes,
-                "session": sess_meta,
-                "tradability": trad,
-                "trend_guard": tg_meta,
-                "structure": struct,
-                "bos_quality": bos_q,
-                "institutional": inst,
-                "inst_micro": micro_meta,
-                "inst_micro_vetoes": micro_vetoes,
-                "inst_gate": int(gate),
-                "inst_ok_count": int(ok_count),
-                "inst_score_eff": int(gate),
-                "inst_score_norm": int(inst_score_norm),
-                "confidence": int(confidence),
-                "momentum": mom,
-                "composite": comp,
-                "composite_score": comp_score,
-                "composite_label": comp_label,
-                "premium": premium,
-                "discount": discount,
-                "entry_pick": entry_pick,
-                "sl_meta": sl_meta_out,
-                "smt": smt,
-                "smt_veto": bool(smt_veto),
-                "options_filter": options_filter,
-                "iv": iv_hint,
-            }
-
-        # RAID_DISPLACEMENT (desk)
-        if DESK_EV_MODE and can_raid and float(rr) >= float(RR_MIN_DESK_PRIORITY):
-            setup_core = "RAID_DISPLACEMENT"
-            setup_ttl = _setup_ttl_compatible(setup_core, entry_type)
-            variant = str((struct.get("raid_displacement") or {}).get("note") or "raid_ok")
-            priority, priority_reasons = _final_grade(
-                setup_type=setup_core,
-                setup_variant=variant,
-                rr=float(rr),
-                gate=int(gate),
-                ok_count=int(ok_count),
-                inst_available=bool(available),
-                bos_quality_ok=bool(bos_quality_ok),
-                used_bias_fallback=bool(used_bias_fallback),
-                entry_type=str(entry_type),
-                ext_sig=str(ext_sig),
-                unfavorable_market=bool(unfavorable_market),
-                mom=str(mom),
-                soft_vetoes=soft_vetoes,
-                inst_micro_vetoes=micro_vetoes,
-                confidence=int(confidence),
-            )
-
-            if score_options_context is not None:
-                options_filter = _score_options_context_safe(opt_obj, bias=bias, setup_type=setup_core)
-
-            return {
-                "valid": True,
-                "symbol": symbol,
-                "side": "BUY" if bias == "LONG" else "SELL",
-                "bias": bias,
-                "entry": entry,
-                "entry_type": entry_type,
-                "sl": float(sl),
-                "tp1": float(tp1),
-                "tp2": None,
-                "rr": float(rr),
-                "qty": 1,
-                "setup_type": setup_ttl,
-                "setup_type_core": setup_core,
-                "setup_variant": variant,
-                "priority": priority,
-                "priority_reasons": priority_reasons,
-                "pre_priority": pre_priority,
-                "pre_priority_reasons": pre_priority_reasons,
-                "pass2_done": bool(do_pass2),
-                "soft_vetoes": soft_vetoes,
-                "session": sess_meta,
-                "tradability": trad,
-                "trend_guard": tg_meta,
-                "structure": struct,
-                "bos_quality": bos_q,
-                "institutional": inst,
-                "inst_micro": micro_meta,
-                "inst_micro_vetoes": micro_vetoes,
-                "inst_gate": int(gate),
-                "inst_ok_count": int(ok_count),
-                "inst_score_eff": int(gate),
-                "inst_score_norm": int(inst_score_norm),
-                "confidence": int(confidence),
-                "momentum": mom,
-                "composite": comp,
-                "composite_score": comp_score,
-                "composite_label": comp_label,
-                "premium": premium,
-                "discount": discount,
-                "entry_pick": entry_pick,
-                "liquidity_sweep": liq_sweep,
-                "sl_meta": sl_meta_out,
-                "smt": smt,
-                "smt_veto": bool(smt_veto),
-                "options_filter": options_filter,
-                "iv": iv_hint,
-            }
-
-        # LIQ_SWEEP (desk)
-        if DESK_EV_MODE and can_sweep and float(rr) >= float(RR_MIN_DESK_PRIORITY):
-            setup_core = "LIQ_SWEEP"
-            setup_ttl = _setup_ttl_compatible(setup_core, entry_type)
-            variant = str(liq_sweep.get("kind") if isinstance(liq_sweep, dict) else "liq_ok")
-            priority, priority_reasons = _final_grade(
-                setup_type=setup_core,
-                setup_variant=variant,
-                rr=float(rr),
-                gate=int(gate),
-                ok_count=int(ok_count),
-                inst_available=bool(available),
-                bos_quality_ok=bool(bos_quality_ok),
-                used_bias_fallback=bool(used_bias_fallback),
-                entry_type=str(entry_type),
-                ext_sig=str(ext_sig),
-                unfavorable_market=bool(unfavorable_market),
-                mom=str(mom),
-                soft_vetoes=soft_vetoes,
-                inst_micro_vetoes=micro_vetoes,
-                confidence=int(confidence),
-            )
-
-            if score_options_context is not None:
-                options_filter = _score_options_context_safe(opt_obj, bias=bias, setup_type=setup_core)
-
-            return {
-                "valid": True,
-                "symbol": symbol,
-                "side": "BUY" if bias == "LONG" else "SELL",
-                "bias": bias,
-                "entry": entry,
-                "entry_type": entry_type,
-                "sl": float(sl),
-                "tp1": float(tp1),
-                "tp2": None,
-                "rr": float(rr),
-                "qty": 1,
-                "setup_type": setup_ttl,
-                "setup_type_core": setup_core,
-                "setup_variant": variant,
-                "priority": priority,
-                "priority_reasons": priority_reasons,
-                "pre_priority": pre_priority,
-                "pre_priority_reasons": pre_priority_reasons,
-                "pass2_done": bool(do_pass2),
-                "soft_vetoes": soft_vetoes,
-                "session": sess_meta,
-                "tradability": trad,
-                "trend_guard": tg_meta,
-                "structure": struct,
-                "bos_quality": bos_q,
-                "institutional": inst,
-                "inst_micro": micro_meta,
-                "inst_micro_vetoes": micro_vetoes,
-                "inst_gate": int(gate),
-                "inst_ok_count": int(ok_count),
-                "inst_score_eff": int(gate),
-                "inst_score_norm": int(inst_score_norm),
-                "confidence": int(confidence),
-                "momentum": mom,
-                "composite": comp,
-                "composite_score": comp_score,
-                "composite_label": comp_label,
-                "premium": premium,
-                "discount": discount,
-                "entry_pick": entry_pick,
-                "liquidity_sweep": liq_sweep,
-                "sl_meta": sl_meta_out,
-                "smt": smt,
-                "smt_veto": bool(smt_veto),
-                "options_filter": options_filter,
-                "iv": iv_hint,
-            }
-
-        # INST_CONTINUATION (desk) — ULTRA STRICT + micro + confidence
-        if DESK_EV_MODE and bias in ("LONG", "SHORT"):
-            inst_cont_trigger_ok = (can_bos or can_raid or can_sweep)
-            inst_cont_pass2_ok = bool(do_pass2)
-            inst_cont_entry_ok = (not _is_market_entry(entry_type))
-            inst_cont_gate_ok = int(gate) >= int(max(MIN_INST_SCORE, INST_CONT_MIN_GATE))
-            inst_cont_rr_ok = float(rr) >= float(INST_CONT_RR_MIN)
-            inst_cont_comp_ok = _composite_bias_ok(bias, comp_score, comp_label, thr=float(INST_CONT_MIN_COMPOSITE_THR))
-            inst_cont_soft_ok = (len(soft_vetoes) == 0)
-            inst_cont_bias_ok = (not used_bias_fallback)
-
-            # Institutional MAX: require micro alignment success + confidence high
-            inst_cont_micro_ok = bool(hard_ok_micro) and (len([v for v in micro_vetoes if v.startswith("inst_align_low")]) == 0)
-            inst_cont_conf_ok = bool(int(confidence) >= 80)
-
-            m = str(mom or "").upper()
-            if INST_CONT_REQUIRE_STRONG_MOM:
-                inst_cont_mom_ok = (m == "STRONG_BULLISH") if bias == "LONG" else (m == "STRONG_BEARISH")
-            else:
-                inst_cont_mom_ok = True
-
-            if not INST_CONT_REQUIRE_TRIGGER:
-                inst_cont_trigger_ok = True
-            if not INST_CONT_REQUIRE_PASS2:
-                inst_cont_pass2_ok = True
-            if not INST_CONT_DISALLOW_MARKET:
-                inst_cont_entry_ok = True
-            if not INST_CONT_REQUIRE_NO_SOFT_VETO:
-                inst_cont_soft_ok = True
-            if not INST_CONT_REQUIRE_CLEAR_BIAS:
-                inst_cont_bias_ok = True
-
-            inst_cont_ok = bool(
-                inst_cont_gate_ok
-                and inst_cont_rr_ok
-                and inst_cont_comp_ok
-                and inst_cont_mom_ok
-                and inst_cont_trigger_ok
-                and inst_cont_pass2_ok
-                and inst_cont_entry_ok
-                and inst_cont_soft_ok
-                and inst_cont_bias_ok
-                and inst_cont_micro_ok
-                and inst_cont_conf_ok
-            )
+                    LOGGER.info("[EVAL_REJECT] %s no_bias_fallback_for_inst", symbol)
+                    return _reject("no_bias_fallback_for_inst", structure=struct, momentum=mom, composite=comp)
 
             LOGGER.info(
-                "[EVAL_PRE] %s INST_CONT_MAX ok=%s gate_ok=%s rr_ok=%s comp_ok=%s mom_ok=%s trigger_ok=%s pass2_ok=%s entry_ok=%s soft_ok=%s bias_ok=%s micro_ok=%s conf_ok=%s "
-                "(gate=%s rr=%.4f conf=%s micro=%s soft_vetoes=%s)",
+                "[EVAL_PRE] %s STRUCT trend=%s bos=%s choch=%s cos=%s",
+                symbol, struct_trend, struct.get("bos"), struct.get("choch"), struct.get("cos")
+            )
+            LOGGER.info("[EVAL_PRE] %s MOMENTUM=%s", symbol, mom)
+            LOGGER.info("[EVAL_PRE] %s MOMENTUM_COMPOSITE score=%.2f label=%s", symbol, comp_score, comp_label)
+            LOGGER.info("[EVAL_PRE] %s VOL_REGIME=%s EXTENSION=%s", symbol, vol_reg, ext_sig)
+
+            # ---------------------------------------------------------------
+            # SMT divergence (optional)
+            # ---------------------------------------------------------------
+            smt: Dict[str, Any] = {"available": False}
+            smt_veto = False
+            ref_df = _get_macro_ref_df(macro)
+
+            if compute_smt_divergence is not None and ref_df is not None:
+                try:
+                    smt = compute_smt_divergence(df_h1, ref_df, lookback=160)
+                except Exception:
+                    smt = {"available": False}
+
+                if bool(smt.get("available")):
+                    if bias == "LONG" and bool(smt.get("bearish_smt")):
+                        smt_veto = True
+                    if bias == "SHORT" and bool(smt.get("bullish_smt")):
+                        smt_veto = True
+
+            if smt_veto and (not DESK_EV_MODE):
+                LOGGER.info("[EVAL_REJECT] %s smt_divergence_veto bias=%s smt=%s", symbol, bias, smt)
+                return _reject("smt_divergence_veto", smt=smt, smt_veto=True, structure=struct, momentum=mom, composite=comp)
+
+            if smt_veto and DESK_EV_MODE:
+                soft_vetoes.append("smt_veto")
+
+            # ---------------------------------------------------------------
+            # options_data regime + IV hint (soft context)
+            # ---------------------------------------------------------------
+            options_filter: Optional[Dict[str, Any]] = None
+            opt_obj = _get_options_obj(macro)
+            iv_hint = _get_macro_implied_vol(macro, symbol)
+
+            # setup guess (cheap)
+            bos_flag = bool(struct.get("bos", False))
+            raid_ok = bool(isinstance(struct.get("raid_displacement"), dict) and struct["raid_displacement"].get("ok"))
+            liq_sweep_pre = liquidity_sweep_details(df_h1, bias, lookback=180)
+            sweep_ok = bool(isinstance(liq_sweep_pre, dict) and liq_sweep_pre.get("ok"))
+
+            if score_options_context is not None:
+                if bos_flag:
+                    setup_guess = "BOS_STRICT"
+                elif raid_ok:
+                    setup_guess = "RAID_DISPLACEMENT"
+                elif sweep_ok:
+                    setup_guess = "LIQ_SWEEP"
+                else:
+                    setup_guess = "OTHER"
+                options_filter = _score_options_context_safe(opt_obj, bias=bias, setup_type=setup_guess)
+
+                try:
+                    reg = str((options_filter or {}).get("regime") or "").lower()
+                    if DESK_EV_MODE and reg in ("high_vol", "crisis", "event"):
+                        soft_vetoes.append(f"options_regime:{reg}")
+                except Exception:
+                    pass
+
+            if iv_hint is not None and np.isfinite(iv_hint) and float(iv_hint) >= IV_HIGH_THRESHOLD:
+                if DESK_EV_MODE:
+                    soft_vetoes.append("iv_high")
+                else:
+                    # non-desk: keep it as veto only if strict session filter already enabled
+                    # (institutional max still allows, because RR/SL already adapts)
+                    pass
+
+            # ---------------------------------------------------------------
+            # STRICT HTF mismatch (anti-contre-tendance)
+            # ---------------------------------------------------------------
+            htf_bias_now = _htf_bias_from_df(df_h4)
+            if htf_bias_now in ("LONG", "SHORT") and bias in ("LONG", "SHORT") and (htf_bias_now != bias):
+                if TG_STRICT_HTF_BIAS or (not DESK_EV_MODE):
+                    LOGGER.info("[EVAL_REJECT] %s htf_bias_mismatch bias=%s htf_bias=%s", symbol, bias, htf_bias_now)
+                    return _reject(
+                        "htf_bias_mismatch",
+                        structure=struct,
+                        momentum=mom,
+                        composite=comp,
+                        htf_bias=htf_bias_now,
+                        smt=smt,
+                        smt_veto=bool(smt_veto),
+                        options_filter=options_filter,
+                        session=sess_meta,
+                        tradability=trad,
+                        iv=iv_hint,
+                    )
+                soft_vetoes.append("htf_bias_mismatch")
+
+            if REQUIRE_STRUCTURE and used_bias_fallback and (not DESK_EV_MODE):
+                LOGGER.info("[EVAL_REJECT] %s no_clear_trend_range", symbol)
+                return _reject("no_clear_trend_range", structure=struct, momentum=mom, composite=comp, smt=smt, smt_veto=bool(smt_veto))
+
+            if REQUIRE_HTF_ALIGN and bias in ("LONG", "SHORT"):
+                if not htf_trend_ok(df_h4, bias):
+                    if DESK_EV_MODE:
+                        soft_vetoes.append("htf_veto")
+                        LOGGER.info("[EVAL_PRE] %s HTF_VETO (soft, desk_mode)", symbol)
+                    else:
+                        LOGGER.info("[EVAL_REJECT] %s htf_veto", symbol)
+                        return _reject("htf_veto", structure=struct, smt=smt, smt_veto=bool(smt_veto), options_filter=options_filter)
+
+            if (not DESK_EV_MODE) and (not (bos_flag or raid_ok or sweep_ok)):
+                LOGGER.info("[EVAL_REJECT] %s no_structure_trigger", symbol)
+                return _reject("no_structure_trigger", structure=struct, sweep=liq_sweep_pre, smt=smt, smt_veto=bool(smt_veto), options_filter=options_filter)
+
+            if REQUIRE_MOMENTUM:
+                if bias == "LONG" and mom not in ("BULLISH", "STRONG_BULLISH"):
+                    if DESK_EV_MODE:
+                        soft_vetoes.append("momentum_not_bullish")
+                    else:
+                        return _reject("momentum_not_bullish", structure=struct, smt=smt, smt_veto=bool(smt_veto), options_filter=options_filter)
+                if bias == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
+                    if DESK_EV_MODE:
+                        soft_vetoes.append("momentum_not_bearish")
+                    else:
+                        return _reject("momentum_not_bearish", structure=struct, smt=smt, smt_veto=bool(smt_veto), options_filter=options_filter)
+
+            # ===============================================================
+            # PRE-PRIORITY (cheap) → controls PASS2
+            # ===============================================================
+            pre_priority, pre_priority_reasons = _pre_grade_candidate(
+                bos_flag=bos_flag,
+                raid_ok=raid_ok,
+                sweep_ok=sweep_ok,
+                mom=mom,
+                comp_score=comp_score,
+                used_bias_fallback=used_bias_fallback,
+                ext_sig=ext_sig,
+            )
+            pass2_allowed_by_priority = priority_at_least(pre_priority, PASS2_ONLY_FOR_PRIORITY)
+
+            LOGGER.info(
+                "[EVAL_PRE] %s PRE_PRIORITY=%s pass2_allowed=%s reasons=%s soft_vetoes=%s smt_veto=%s options_filter=%s session=%s trad=%s iv=%s",
                 symbol,
-                inst_cont_ok,
-                inst_cont_gate_ok,
-                inst_cont_rr_ok,
-                inst_cont_comp_ok,
-                inst_cont_mom_ok,
-                inst_cont_trigger_ok,
-                inst_cont_pass2_ok,
-                inst_cont_entry_ok,
-                inst_cont_soft_ok,
-                inst_cont_bias_ok,
-                inst_cont_micro_ok,
-                inst_cont_conf_ok,
-                gate,
-                float(rr),
-                confidence,
-                micro_vetoes,
+                pre_priority,
+                pass2_allowed_by_priority,
+                pre_priority_reasons,
                 soft_vetoes,
+                smt_veto,
+                options_filter,
+                sess_meta,
+                trad,
+                iv_hint,
             )
 
-            if inst_cont_ok:
-                setup_core = "INST_CONTINUATION"
+            # ===============================================================
+            # 1) INSTITUTIONAL — 2-PASS (anti-ban) + Liquidations
+            # ===============================================================
+            inst: Dict[str, Any]
+
+            pass1_liq = bool(INST_ENABLE_LIQUIDATIONS and (not INST_LIQ_PASS2_ONLY))
+            try:
+                inst = await compute_full_institutional_analysis(
+                    symbol,
+                    bias,
+                    mode=INST_PASS1_MODE,
+                    include_liquidations=pass1_liq,
+                )
+            except Exception as e:
+                inst = {
+                    "institutional_score": 0,
+                    "bitget_symbol": None,
+                    "available": False,
+                    "warnings": [f"inst_exception:{e}"],
+                    "score_components": {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0},
+                    "score_meta": {"raw_components_sum": 0, "ok_count": 0, "mode": INST_PASS1_MODE},
+                }
+
+            available = bool(inst.get("available", False))
+            bitget_symbol = (inst.get("bitget_symbol") or inst.get("symbol") or symbol)
+
+            gate, ok_count = _inst_gate_value(inst)
+            gate, override = _desk_inst_gate_override(inst, bias, int(gate))
+            inst_score_norm = _inst_score_normalized_0_100(inst, int(gate))
+
+            LOGGER.info(
+                "[INST_RAW] %s pass=1 mode=%s liq_req=%s inst_score=%s ok_count=%s gate=%s inst_score_norm=%s override=%s available=%s bitget_symbol=%s bias=%s comps=%s",
+                symbol,
+                (inst.get("score_meta") or {}).get("mode") or INST_PASS1_MODE,
+                pass1_liq,
+                inst.get("institutional_score"),
+                ok_count,
+                gate,
+                inst_score_norm,
+                override,
+                available,
+                bitget_symbol,
+                bias,
+                inst.get("available_components") or [],
+            )
+
+            if (not available) or (bitget_symbol is None):
+                if not ALLOW_TECH_FALLBACK_WHEN_INST_DOWN:
+                    return _reject(
+                        "inst_unavailable",
+                        institutional=inst,
+                        structure=struct,
+                        momentum=mom,
+                        composite=comp,
+                        pre_priority=pre_priority,
+                        pre_priority_reasons=pre_priority_reasons,
+                        soft_vetoes=soft_vetoes,
+                        smt=smt,
+                        smt_veto=bool(smt_veto),
+                        options_filter=options_filter,
+                        session=sess_meta,
+                        tradability=trad,
+                        iv=iv_hint,
+                        inst_gate=int(gate),
+                        inst_ok_count=int(ok_count),
+                        inst_score_norm=int(inst_score_norm),
+                    )
+                LOGGER.warning("[INST_DOWN] %s tech_fallback_enabled", symbol)
+
+            do_pass2 = bool(
+                INST_PASS2_ENABLED
+                and pass2_allowed_by_priority
+                and available
+                and (bitget_symbol is not None)
+                and (int(gate) >= int(INST_PASS2_MIN_GATE) or bool(DESK_EV_MODE))
+            )
+
+            if do_pass2:
+                pass2_liq = bool(INST_ENABLE_LIQUIDATIONS)
+                try:
+                    inst2 = await compute_full_institutional_analysis(
+                        symbol,
+                        bias,
+                        mode=INST_PASS2_MODE,
+                        include_liquidations=pass2_liq,
+                    )
+                except Exception as e:
+                    inst2 = {
+                        "institutional_score": 0,
+                        "bitget_symbol": bitget_symbol,
+                        "available": False,
+                        "warnings": [f"inst_pass2_exception:{e}"],
+                        "score_components": {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0},
+                        "score_meta": {"raw_components_sum": 0, "ok_count": 0, "mode": INST_PASS2_MODE},
+                    }
+
+                if isinstance(inst2, dict) and bool(inst2.get("available")) :
+                    inst = inst2
+                    available = bool(inst.get("available", False))
+                    bitget_symbol = (inst.get("bitget_symbol") or inst.get("symbol") or symbol)
+                    gate, ok_count = _inst_gate_value(inst)
+                    gate, override = _desk_inst_gate_override(inst, bias, int(gate))
+                    inst_score_norm = _inst_score_normalized_0_100(inst, int(gate))
+
+                    LOGGER.info(
+                        "[INST_RAW] %s pass=2 mode=%s liq_req=%s inst_score=%s ok_count=%s gate=%s inst_score_norm=%s override=%s available=%s bitget_symbol=%s bias=%s comps=%s",
+                        symbol,
+                        (inst.get("score_meta") or {}).get("mode") or INST_PASS2_MODE,
+                        pass2_liq,
+                        inst.get("institutional_score"),
+                        ok_count,
+                        gate,
+                        inst_score_norm,
+                        override,
+                        available,
+                        bitget_symbol,
+                        bias,
+                        inst.get("available_components") or [],
+                    )
+
+            if (not ALLOW_TECH_FALLBACK_WHEN_INST_DOWN) and int(gate) < int(MIN_INST_SCORE):
+                return _reject(
+                    "inst_gate_low",
+                    institutional=inst,
+                    structure=struct,
+                    inst_gate=int(gate),
+                    ok_count=int(ok_count),
+                    inst_score_norm=int(inst_score_norm),
+                    pre_priority=pre_priority,
+                    pre_priority_reasons=pre_priority_reasons,
+                    soft_vetoes=soft_vetoes,
+                    smt=smt,
+                    smt_veto=bool(smt_veto),
+                    options_filter=options_filter,
+                    session=sess_meta,
+                    tradability=trad,
+                    iv=iv_hint,
+                )
+
+            # ===============================================================
+            # 2) STRUCTURE / QUALITY / ENTRY / EXITS
+            # ===============================================================
+            entry_mkt = _last_close(df_h1)
+
+            bos_dir = struct.get("bos_direction", None)
+            bos_q = bos_quality_details(
+                df_h1,
+                oi_series=struct.get("oi_series", None),
+                df_liq=df_h1,
+                price=entry_mkt,
+                direction=bos_dir,
+            )
+            bos_quality_ok = bool(bos_q.get("ok", True))
+
+            if REQUIRE_BOS_QUALITY and not bos_quality_ok:
+                return _reject(
+                    "bos_quality_low",
+                    institutional=inst,
+                    structure=struct,
+                    bos_quality=bos_q,
+                    pre_priority=pre_priority,
+                    pre_priority_reasons=pre_priority_reasons,
+                    soft_vetoes=soft_vetoes,
+                    smt=smt,
+                    smt_veto=bool(smt_veto),
+                    options_filter=options_filter,
+                    session=sess_meta,
+                    tradability=trad,
+                    iv=iv_hint,
+                    inst_gate=int(gate),
+                    inst_ok_count=int(ok_count),
+                    inst_score_norm=int(inst_score_norm),
+                )
+
+            premium, discount = compute_premium_discount(df_h1)
+            liq_sweep = liq_sweep_pre
+
+            entry_pick = _pick_entry(df_h1, struct, bias)
+            entry = float(entry_pick["entry_used"])
+            entry_type = str(entry_pick["entry_type"])
+            atr14 = float(entry_pick.get("atr") or _atr(df_h1, 14))
+
+            # ---------------------------------------------------------------
+            # TrendGuard
+            # ---------------------------------------------------------------
+            tg_ok, tg_why, tg_meta = _trend_guard(
+                df_h1=df_h1,
+                df_h4=df_h4,
+                bias=bias,
+                entry=float(entry) if entry > 0 else None,
+                entry_type=entry_type,
+            )
+            if not tg_ok:
+                if DESK_EV_MODE and (not TG_STRICT_REGIME_MARKET) and (tg_why != "reject:htf_bias_mismatch"):
+                    soft_vetoes.append(tg_why.replace("reject:", "tg:"))
+                else:
+                    return _reject(
+                        tg_why.replace("reject:", ""),
+                        institutional=inst,
+                        structure=struct,
+                        entry_pick=entry_pick,
+                        trend_guard=tg_meta,
+                        pre_priority=pre_priority,
+                        pre_priority_reasons=pre_priority_reasons,
+                        soft_vetoes=soft_vetoes,
+                        smt=smt,
+                        smt_veto=bool(smt_veto),
+                        options_filter=options_filter,
+                        session=sess_meta,
+                        tradability=trad,
+                        iv=iv_hint,
+                        inst_gate=int(gate),
+                        inst_ok_count=int(ok_count),
+                        inst_score_norm=int(inst_score_norm),
+                    )
+
+            # Extension hygiene
+            if ext_sig == "OVEREXTENDED_LONG" and bias == "LONG":
+                if entry_type == "MARKET":
+                    return _reject("overextended_long_market", institutional=inst, structure=struct, entry_pick=entry_pick)
+                if not _entry_pullback_ok(entry, entry_mkt, bias, atr14):
+                    return _reject("overextended_long_no_pullback", institutional=inst, structure=struct, entry_pick=entry_pick)
+
+            if ext_sig == "OVEREXTENDED_SHORT" and bias == "SHORT":
+                if entry_type == "MARKET":
+                    return _reject("overextended_short_market", institutional=inst, structure=struct, entry_pick=entry_pick)
+                if not _entry_pullback_ok(entry, entry_mkt, bias, atr14):
+                    return _reject("overextended_short_no_pullback", institutional=inst, structure=struct, entry_pick=entry_pick)
+
+            unfavorable_market = bool(entry_type == "MARKET" and ((bias == "LONG" and premium) or (bias == "SHORT" and discount)))
+            if unfavorable_market and (not DESK_EV_MODE):
+                if bias == "LONG" and premium:
+                    return _reject("long_in_premium_market", institutional=inst, structure=struct, entry_pick=entry_pick)
+                if bias == "SHORT" and discount:
+                    return _reject("short_in_discount_market", institutional=inst, structure=struct, entry_pick=entry_pick)
+
+            # --------------------------
+            # Exits (policy-aware SL v3)
+            # --------------------------
+            setup_hint: Optional[str] = None
+            if bos_flag:
+                setup_hint = "BOS_STRICT"
+            elif DESK_EV_MODE and raid_ok:
+                setup_hint = "RAID_DISPLACEMENT"
+            elif DESK_EV_MODE and sweep_ok:
+                setup_hint = "LIQ_SWEEP"
+            elif DESK_EV_MODE:
+                setup_hint = "INST_CONTINUATION"
+
+            tick = estimate_tick_from_price(entry)
+            exits = _compute_exits(
+                df_h1,
+                entry,
+                bias,
+                tick=tick,
+                setup=setup_hint,
+                entry_type=entry_type,
+                htf_df=df_h4,
+            )
+
+            sl = float(exits["sl"])
+            tp1 = float(exits["tp1"])
+            rr = _safe_rr(entry, sl, tp1, bias)
+
+            # SL hygiene beyond sweep / eq levels
+            atr_last = _atr(df_h1, 14)
+            buf = max((atr_last * 0.08) if atr_last > 0 else 0.0, float(tick) * 2.0, entry * 0.0004)
+
+            sl_pre = float(sl)
+            sl_adj: Dict[str, Any] = {
+                "setup_hint": setup_hint,
+                "entry_type": entry_type,
+                "sl_pre": sl_pre,
+                "buf": float(buf),
+                "did_sweep": False,
+                "did_eq": False,
+                "sweep_extreme": None,
+                "eq_level": None,
+                "sl_post_round": None,
+            }
+
+            try:
+                if isinstance(liq_sweep, dict) and liq_sweep.get("ok"):
+                    ext = float(liq_sweep.get("sweep_extreme") or 0.0)
+                    if ext > 0 and buf > 0:
+                        if bias == "LONG":
+                            new_sl = min(sl, ext - buf)
+                        else:
+                            new_sl = max(sl, ext + buf)
+                        if np.isfinite(new_sl) and float(new_sl) != float(sl):
+                            sl = float(new_sl)
+                            sl_adj["did_sweep"] = True
+                            sl_adj["sweep_extreme"] = float(ext)
+            except Exception:
+                pass
+
+            try:
+                lv = detect_equal_levels(df_h1.tail(200), max_window=200, tol_mult_atr=0.10)
+                eq_highs = lv.get("eq_highs", []) or []
+                eq_lows = lv.get("eq_lows", []) or []
+
+                if bias == "LONG" and eq_lows:
+                    lvl = min(eq_lows, key=lambda x: abs(entry - float(x)))
+                    lvl = float(lvl)
+                    if lvl > 0 and lvl < entry and sl > (lvl - buf):
+                        new_sl = min(sl, lvl - buf)
+                        if np.isfinite(new_sl) and float(new_sl) != float(sl):
+                            sl = float(new_sl)
+                            sl_adj["did_eq"] = True
+                            sl_adj["eq_level"] = float(lvl)
+
+                if bias == "SHORT" and eq_highs:
+                    lvl = min(eq_highs, key=lambda x: abs(entry - float(x)))
+                    lvl = float(lvl)
+                    if lvl > 0 and lvl > entry and sl < (lvl + buf):
+                        new_sl = max(sl, lvl + buf)
+                        if np.isfinite(new_sl) and float(new_sl) != float(sl):
+                            sl = float(new_sl)
+                            sl_adj["did_eq"] = True
+                            sl_adj["eq_level"] = float(lvl)
+            except Exception:
+                pass
+
+            sl = _round_sl_for_side(sl, entry, bias, tick)
+            sl_adj["sl_post_round"] = float(sl)
+
+            if sl <= 0:
+                return _reject("sl_invalid_after_liq_adj", institutional=inst, structure=struct, sl_meta=sl_adj)
+
+            # recalc TP1 after SL adjustments
+            try:
+                tp1, _rr_used2 = compute_tp1(entry, sl, bias, df=df_h1, tick=tick)
+                tp1 = float(tp1)
+            except Exception:
+                tp1 = float(tp1)
+
+            rr = _safe_rr(entry, sl, tp1, bias)
+            if rr is None or rr <= 0:
+                return _reject("rr_invalid", institutional=inst, structure=struct, entry_pick=entry_pick)
+
+            base_sl_meta = exits.get("sl_meta") if isinstance(exits.get("sl_meta"), dict) else {}
+            sl_meta_out = dict(base_sl_meta)
+            sl_meta_out["post_adjust"] = sl_adj
+
+            # ===============================================================
+            # Institutional micro filters (intent-aware)
+            # ===============================================================
+            setup_intent = "CONTINUATION" if bos_flag else ("REVERSAL" if (raid_ok or sweep_ok) else "OTHER")
+            hard_ok_micro, micro_vetoes, micro_meta = _inst_micro_filters(inst, bias, setup_intent=setup_intent)
+
+            if not hard_ok_micro:
+                if (not DESK_EV_MODE) and INST_MICRO_FILTER_STRICT:
+                    return _reject(
+                        "inst_micro_veto",
+                        institutional=inst,
+                        inst_micro=micro_meta,
+                        inst_micro_vetoes=micro_vetoes,
+                        structure=struct,
+                        entry_pick=entry_pick,
+                        rr=float(rr),
+                        soft_vetoes=soft_vetoes,
+                        session=sess_meta,
+                        tradability=trad,
+                        iv=iv_hint,
+                    )
+                if DESK_EV_MODE:
+                    soft_vetoes.extend([f"inst_micro:{v}" for v in micro_vetoes])
+
+            # ===============================================================
+            # Confidence score
+            # ===============================================================
+            confidence = _confidence_score(
+                inst_score_norm=int(inst_score_norm),
+                bos_q=bos_q,
+                comp_score=float(comp_score),
+                bias=bias,
+                used_bias_fallback=bool(used_bias_fallback),
+                soft_vetoes=list(soft_vetoes),
+                micro_vetoes=list(micro_vetoes),
+                options_filter=options_filter,
+                session_ok=bool(sess_ok),
+                tradability_ok=bool(trad_ok),
+                iv_hint=iv_hint,
+            )
+
+            # ===============================================================
+            # SETUPS
+            # ===============================================================
+            can_bos = bool(bos_flag and ((not REQUIRE_BOS_QUALITY) or bos_quality_ok))
+            can_raid = bool(isinstance(struct.get("raid_displacement"), dict) and struct["raid_displacement"].get("ok"))
+            can_sweep = bool(isinstance(liq_sweep, dict) and liq_sweep.get("ok"))
+
+            # BOS_STRICT — now requires micro alignment if enabled (true institutional continuation)
+            bos_ok = False
+            bos_variant = "NO"
+            if can_bos:
+                # enforce continuation cleanliness (confidence and micro alignment)
+                if INST_MICRO_FILTER_ENABLE and (not hard_ok_micro) and (not DESK_EV_MODE):
+                    bos_ok = False
+                else:
+                    if rr >= RR_MIN_STRICT:
+                        bos_ok = True
+                        bos_variant = "RR_STRICT"
+                    elif rr >= RR_MIN_TOLERATED_WITH_INST and confidence >= 70:
+                        bos_ok = True
+                        bos_variant = "RR_RELAX_WITH_INST"
+
+            if bos_ok:
+                setup_core = "BOS_STRICT"
                 setup_ttl = _setup_ttl_compatible(setup_core, entry_type)
                 priority, priority_reasons = _final_grade(
                     setup_type=setup_core,
-                    setup_variant="INST_CONTINUATION_MAX",
+                    setup_variant=bos_variant,
                     rr=float(rr),
                     gate=int(gate),
                     ok_count=int(ok_count),
@@ -2725,6 +2434,7 @@ class SignalAnalyzer:
                     confidence=int(confidence),
                 )
 
+                # recompute options context with final setup type (if module exists)
                 if score_options_context is not None:
                     options_filter = _score_options_context_safe(opt_obj, bias=bias, setup_type=setup_core)
 
@@ -2742,7 +2452,7 @@ class SignalAnalyzer:
                     "qty": 1,
                     "setup_type": setup_ttl,
                     "setup_type_core": setup_core,
-                    "setup_variant": "INST_CONTINUATION_MAX",
+                    "setup_variant": bos_variant,
                     "priority": priority,
                     "priority_reasons": priority_reasons,
                     "pre_priority": pre_priority,
@@ -2776,33 +2486,327 @@ class SignalAnalyzer:
                     "iv": iv_hint,
                 }
 
-        LOGGER.info("[EVAL_REJECT] %s no_setup_validated (DESK_EV_MODE=%s)", symbol, DESK_EV_MODE)
-        return {
-            "valid": False,
-            "reject_reason": "no_setup_validated",
-            "structure": struct,
-            "institutional": inst,
-            "inst_micro": micro_meta,
-            "inst_micro_vetoes": micro_vetoes,
-            "bos_quality": bos_q,
-            "entry_pick": entry_pick,
-            "rr": float(rr) if rr is not None else None,
-            "inst_gate": int(gate),
-            "inst_ok_count": int(ok_count),
-            "inst_score_eff": int(gate),
-            "inst_score_norm": int(inst_score_norm),
-            "confidence": int(confidence),
-            "composite_score": comp_score,
-            "composite_label": comp_label,
-            "sl_meta": sl_meta_out,
-            "pre_priority": pre_priority,
-            "pre_priority_reasons": pre_priority_reasons,
-            "soft_vetoes": soft_vetoes,
-            "session": sess_meta,
-            "tradability": trad,
-            "trend_guard": tg_meta,
-            "smt": smt,
-            "smt_veto": bool(smt_veto),
-            "options_filter": options_filter,
-            "iv": iv_hint,
-        }
+            # RAID_DISPLACEMENT (desk)
+            if DESK_EV_MODE and can_raid and float(rr) >= float(RR_MIN_DESK_PRIORITY):
+                setup_core = "RAID_DISPLACEMENT"
+                setup_ttl = _setup_ttl_compatible(setup_core, entry_type)
+                variant = str((struct.get("raid_displacement") or {}).get("note") or "raid_ok")
+                priority, priority_reasons = _final_grade(
+                    setup_type=setup_core,
+                    setup_variant=variant,
+                    rr=float(rr),
+                    gate=int(gate),
+                    ok_count=int(ok_count),
+                    inst_available=bool(available),
+                    bos_quality_ok=bool(bos_quality_ok),
+                    used_bias_fallback=bool(used_bias_fallback),
+                    entry_type=str(entry_type),
+                    ext_sig=str(ext_sig),
+                    unfavorable_market=bool(unfavorable_market),
+                    mom=str(mom),
+                    soft_vetoes=soft_vetoes,
+                    inst_micro_vetoes=micro_vetoes,
+                    confidence=int(confidence),
+                )
+
+                if score_options_context is not None:
+                    options_filter = _score_options_context_safe(opt_obj, bias=bias, setup_type=setup_core)
+
+                return {
+                    "valid": True,
+                    "symbol": symbol,
+                    "side": "BUY" if bias == "LONG" else "SELL",
+                    "bias": bias,
+                    "entry": entry,
+                    "entry_type": entry_type,
+                    "sl": float(sl),
+                    "tp1": float(tp1),
+                    "tp2": None,
+                    "rr": float(rr),
+                    "qty": 1,
+                    "setup_type": setup_ttl,
+                    "setup_type_core": setup_core,
+                    "setup_variant": variant,
+                    "priority": priority,
+                    "priority_reasons": priority_reasons,
+                    "pre_priority": pre_priority,
+                    "pre_priority_reasons": pre_priority_reasons,
+                    "pass2_done": bool(do_pass2),
+                    "soft_vetoes": soft_vetoes,
+                    "session": sess_meta,
+                    "tradability": trad,
+                    "trend_guard": tg_meta,
+                    "structure": struct,
+                    "bos_quality": bos_q,
+                    "institutional": inst,
+                    "inst_micro": micro_meta,
+                    "inst_micro_vetoes": micro_vetoes,
+                    "inst_gate": int(gate),
+                    "inst_ok_count": int(ok_count),
+                    "inst_score_eff": int(gate),
+                    "inst_score_norm": int(inst_score_norm),
+                    "confidence": int(confidence),
+                    "momentum": mom,
+                    "composite": comp,
+                    "composite_score": comp_score,
+                    "composite_label": comp_label,
+                    "premium": premium,
+                    "discount": discount,
+                    "entry_pick": entry_pick,
+                    "liquidity_sweep": liq_sweep,
+                    "sl_meta": sl_meta_out,
+                    "smt": smt,
+                    "smt_veto": bool(smt_veto),
+                    "options_filter": options_filter,
+                    "iv": iv_hint,
+                }
+
+            # LIQ_SWEEP (desk)
+            if DESK_EV_MODE and can_sweep and float(rr) >= float(RR_MIN_DESK_PRIORITY):
+                setup_core = "LIQ_SWEEP"
+                setup_ttl = _setup_ttl_compatible(setup_core, entry_type)
+                variant = str(liq_sweep.get("kind") if isinstance(liq_sweep, dict) else "liq_ok")
+                priority, priority_reasons = _final_grade(
+                    setup_type=setup_core,
+                    setup_variant=variant,
+                    rr=float(rr),
+                    gate=int(gate),
+                    ok_count=int(ok_count),
+                    inst_available=bool(available),
+                    bos_quality_ok=bool(bos_quality_ok),
+                    used_bias_fallback=bool(used_bias_fallback),
+                    entry_type=str(entry_type),
+                    ext_sig=str(ext_sig),
+                    unfavorable_market=bool(unfavorable_market),
+                    mom=str(mom),
+                    soft_vetoes=soft_vetoes,
+                    inst_micro_vetoes=micro_vetoes,
+                    confidence=int(confidence),
+                )
+
+                if score_options_context is not None:
+                    options_filter = _score_options_context_safe(opt_obj, bias=bias, setup_type=setup_core)
+
+                return {
+                    "valid": True,
+                    "symbol": symbol,
+                    "side": "BUY" if bias == "LONG" else "SELL",
+                    "bias": bias,
+                    "entry": entry,
+                    "entry_type": entry_type,
+                    "sl": float(sl),
+                    "tp1": float(tp1),
+                    "tp2": None,
+                    "rr": float(rr),
+                    "qty": 1,
+                    "setup_type": setup_ttl,
+                    "setup_type_core": setup_core,
+                    "setup_variant": variant,
+                    "priority": priority,
+                    "priority_reasons": priority_reasons,
+                    "pre_priority": pre_priority,
+                    "pre_priority_reasons": pre_priority_reasons,
+                    "pass2_done": bool(do_pass2),
+                    "soft_vetoes": soft_vetoes,
+                    "session": sess_meta,
+                    "tradability": trad,
+                    "trend_guard": tg_meta,
+                    "structure": struct,
+                    "bos_quality": bos_q,
+                    "institutional": inst,
+                    "inst_micro": micro_meta,
+                    "inst_micro_vetoes": micro_vetoes,
+                    "inst_gate": int(gate),
+                    "inst_ok_count": int(ok_count),
+                    "inst_score_eff": int(gate),
+                    "inst_score_norm": int(inst_score_norm),
+                    "confidence": int(confidence),
+                    "momentum": mom,
+                    "composite": comp,
+                    "composite_score": comp_score,
+                    "composite_label": comp_label,
+                    "premium": premium,
+                    "discount": discount,
+                    "entry_pick": entry_pick,
+                    "liquidity_sweep": liq_sweep,
+                    "sl_meta": sl_meta_out,
+                    "smt": smt,
+                    "smt_veto": bool(smt_veto),
+                    "options_filter": options_filter,
+                    "iv": iv_hint,
+                }
+
+            # INST_CONTINUATION (desk) — ULTRA STRICT + micro + confidence
+            if DESK_EV_MODE and bias in ("LONG", "SHORT"):
+                inst_cont_trigger_ok = (can_bos or can_raid or can_sweep)
+                inst_cont_pass2_ok = bool(do_pass2)
+                inst_cont_entry_ok = (not _is_market_entry(entry_type))
+                inst_cont_gate_ok = int(gate) >= int(max(MIN_INST_SCORE, INST_CONT_MIN_GATE))
+                inst_cont_rr_ok = float(rr) >= float(INST_CONT_RR_MIN)
+                inst_cont_comp_ok = _composite_bias_ok(bias, comp_score, comp_label, thr=float(INST_CONT_MIN_COMPOSITE_THR))
+                inst_cont_soft_ok = (len(soft_vetoes) == 0)
+                inst_cont_bias_ok = (not used_bias_fallback)
+
+                # Institutional MAX: require micro alignment success + confidence high
+                inst_cont_micro_ok = bool(hard_ok_micro) and (len([v for v in micro_vetoes if v.startswith("inst_align_low")]) == 0)
+                inst_cont_conf_ok = bool(int(confidence) >= 80)
+
+                m = str(mom or "").upper()
+                if INST_CONT_REQUIRE_STRONG_MOM:
+                    inst_cont_mom_ok = (m == "STRONG_BULLISH") if bias == "LONG" else (m == "STRONG_BEARISH")
+                else:
+                    inst_cont_mom_ok = True
+
+                if not INST_CONT_REQUIRE_TRIGGER:
+                    inst_cont_trigger_ok = True
+                if not INST_CONT_REQUIRE_PASS2:
+                    inst_cont_pass2_ok = True
+                if not INST_CONT_DISALLOW_MARKET:
+                    inst_cont_entry_ok = True
+                if not INST_CONT_REQUIRE_NO_SOFT_VETO:
+                    inst_cont_soft_ok = True
+                if not INST_CONT_REQUIRE_CLEAR_BIAS:
+                    inst_cont_bias_ok = True
+
+                inst_cont_ok = bool(
+                    inst_cont_gate_ok
+                    and inst_cont_rr_ok
+                    and inst_cont_comp_ok
+                    and inst_cont_mom_ok
+                    and inst_cont_trigger_ok
+                    and inst_cont_pass2_ok
+                    and inst_cont_entry_ok
+                    and inst_cont_soft_ok
+                    and inst_cont_bias_ok
+                    and inst_cont_micro_ok
+                    and inst_cont_conf_ok
+                )
+
+                LOGGER.info(
+                    "[EVAL_PRE] %s INST_CONT_MAX ok=%s gate_ok=%s rr_ok=%s comp_ok=%s mom_ok=%s trigger_ok=%s pass2_ok=%s entry_ok=%s soft_ok=%s bias_ok=%s micro_ok=%s conf_ok=%s "
+                    "(gate=%s rr=%.4f conf=%s micro=%s soft_vetoes=%s)",
+                    symbol,
+                    inst_cont_ok,
+                    inst_cont_gate_ok,
+                    inst_cont_rr_ok,
+                    inst_cont_comp_ok,
+                    inst_cont_mom_ok,
+                    inst_cont_trigger_ok,
+                    inst_cont_pass2_ok,
+                    inst_cont_entry_ok,
+                    inst_cont_soft_ok,
+                    inst_cont_bias_ok,
+                    inst_cont_micro_ok,
+                    inst_cont_conf_ok,
+                    gate,
+                    float(rr),
+                    confidence,
+                    micro_vetoes,
+                    soft_vetoes,
+                )
+
+                if inst_cont_ok:
+                    setup_core = "INST_CONTINUATION"
+                    setup_ttl = _setup_ttl_compatible(setup_core, entry_type)
+                    priority, priority_reasons = _final_grade(
+                        setup_type=setup_core,
+                        setup_variant="INST_CONTINUATION_MAX",
+                        rr=float(rr),
+                        gate=int(gate),
+                        ok_count=int(ok_count),
+                        inst_available=bool(available),
+                        bos_quality_ok=bool(bos_quality_ok),
+                        used_bias_fallback=bool(used_bias_fallback),
+                        entry_type=str(entry_type),
+                        ext_sig=str(ext_sig),
+                        unfavorable_market=bool(unfavorable_market),
+                        mom=str(mom),
+                        soft_vetoes=soft_vetoes,
+                        inst_micro_vetoes=micro_vetoes,
+                        confidence=int(confidence),
+                    )
+
+                    if score_options_context is not None:
+                        options_filter = _score_options_context_safe(opt_obj, bias=bias, setup_type=setup_core)
+
+                    return {
+                        "valid": True,
+                        "symbol": symbol,
+                        "side": "BUY" if bias == "LONG" else "SELL",
+                        "bias": bias,
+                        "entry": entry,
+                        "entry_type": entry_type,
+                        "sl": float(sl),
+                        "tp1": float(tp1),
+                        "tp2": None,
+                        "rr": float(rr),
+                        "qty": 1,
+                        "setup_type": setup_ttl,
+                        "setup_type_core": setup_core,
+                        "setup_variant": "INST_CONTINUATION_MAX",
+                        "priority": priority,
+                        "priority_reasons": priority_reasons,
+                        "pre_priority": pre_priority,
+                        "pre_priority_reasons": pre_priority_reasons,
+                        "pass2_done": bool(do_pass2),
+                        "soft_vetoes": soft_vetoes,
+                        "session": sess_meta,
+                        "tradability": trad,
+                        "trend_guard": tg_meta,
+                        "structure": struct,
+                        "bos_quality": bos_q,
+                        "institutional": inst,
+                        "inst_micro": micro_meta,
+                        "inst_micro_vetoes": micro_vetoes,
+                        "inst_gate": int(gate),
+                        "inst_ok_count": int(ok_count),
+                        "inst_score_eff": int(gate),
+                        "inst_score_norm": int(inst_score_norm),
+                        "confidence": int(confidence),
+                        "momentum": mom,
+                        "composite": comp,
+                        "composite_score": comp_score,
+                        "composite_label": comp_label,
+                        "premium": premium,
+                        "discount": discount,
+                        "entry_pick": entry_pick,
+                        "sl_meta": sl_meta_out,
+                        "smt": smt,
+                        "smt_veto": bool(smt_veto),
+                        "options_filter": options_filter,
+                        "iv": iv_hint,
+                    }
+
+            LOGGER.info("[EVAL_REJECT] %s no_setup_validated (DESK_EV_MODE=%s)", symbol, DESK_EV_MODE)
+            return {
+                "valid": False,
+                "reject_reason": "no_setup_validated",
+                "structure": struct,
+                "institutional": inst,
+                "inst_micro": micro_meta,
+                "inst_micro_vetoes": micro_vetoes,
+                "bos_quality": bos_q,
+                "entry_pick": entry_pick,
+                "rr": float(rr) if rr is not None else None,
+                "inst_gate": int(gate),
+                "inst_ok_count": int(ok_count),
+                "inst_score_eff": int(gate),
+                "inst_score_norm": int(inst_score_norm),
+                "confidence": int(confidence),
+                "composite_score": comp_score,
+                "composite_label": comp_label,
+                "sl_meta": sl_meta_out,
+                "pre_priority": pre_priority,
+                "pre_priority_reasons": pre_priority_reasons,
+                "soft_vetoes": soft_vetoes,
+                "session": sess_meta,
+                "tradability": trad,
+                "trend_guard": tg_meta,
+                "smt": smt,
+                "smt_veto": bool(smt_veto),
+                "options_filter": options_filter,
+                "iv": iv_hint,
+            }
+        except Exception as e:
+            LOGGER.exception("[EVAL_EXC] %s err=%s", symbol, e)
+            return _reject("eval_exc")
