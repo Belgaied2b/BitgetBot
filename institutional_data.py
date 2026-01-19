@@ -40,7 +40,7 @@ except Exception:  # pragma: no cover
 
 LOGGER = logging.getLogger(__name__)
 
-INST_VERSION = "UltraDesk3.1-bitget-only+funding-fallback+oi-optin+derived-2026-01-13"
+INST_VERSION = "UltraDesk3.2-bitget-only+ws-hub-max+funding-fallback+oi-optin+derived-2026-01-19"
 
 BITGET_API_BASE = str(os.getenv("BITGET_API_BASE", "https://api.bitget.com")).strip()
 
@@ -82,6 +82,28 @@ except Exception:
 
 INST_USE_WS_HUB = bool(_cfg("INST_USE_WS_HUB", str(os.getenv("INST_USE_WS_HUB", "1")).strip() == "1"))
 WS_STALE_SEC = float(_cfg("WS_STALE_SEC", float(os.getenv("INST_WS_STALE_SEC", "15"))))
+
+# ---------------------------------------------------------------------
+# Institutional MAX additions
+# - Prefer WS hub for depth/spread when available (reduces REST load + improves freshness).
+# - Compute flow/microstructure regimes from WS tape + derived series.
+# ---------------------------------------------------------------------
+INST_DEPTH_USE_WS_IF_AVAILABLE = bool(_cfg("INST_DEPTH_USE_WS_IF_AVAILABLE", str(os.getenv("INST_DEPTH_USE_WS_IF_AVAILABLE", "1")).strip() == "1"))
+# In FULL mode you may want REST depth always (true orderbook imbalance at band); keep enabled by default.
+INST_DEPTH_REST_REQUIRED_IN_FULL = bool(_cfg("INST_DEPTH_REST_REQUIRED_IN_FULL", str(os.getenv("INST_DEPTH_REST_REQUIRED_IN_FULL", "1")).strip() == "1"))
+
+# Flow regime thresholds (z-score on tape_delta_5m and/or absolute USDT notional)
+INST_FLOW_Z_STRONG = float(os.getenv("INST_FLOW_Z_STRONG", "1.0"))
+INST_FLOW_Z_EXTREME = float(os.getenv("INST_FLOW_Z_EXTREME", "2.0"))
+INST_FLOW_ABS_STRONG_USDT = float(os.getenv("INST_FLOW_ABS_STRONG_USDT", "50000"))
+INST_FLOW_ABS_EXTREME_USDT = float(os.getenv("INST_FLOW_ABS_EXTREME_USDT", "150000"))
+
+# Crowding thresholds (funding z-score, realtime)
+INST_CROWD_Z_STRONG = float(os.getenv("INST_CROWD_Z_STRONG", "1.5"))
+INST_CROWD_Z_EXTREME = float(os.getenv("INST_CROWD_Z_EXTREME", "2.5"))
+
+# Derived slope configuration
+INST_TAPE_SLOPE_POINTS = int(float(os.getenv("INST_TAPE_SLOPE_POINTS", "12")))  # number of samples
 
 # ---------------------------------------------------------------------
 # Product type (Bitget v2 uses lower-case values in request examples)
@@ -560,8 +582,8 @@ class _Series:
 class _DerivedState:
     oi: _Series = field(default_factory=_Series)
     funding: _Series = field(default_factory=_Series)
-
-
+    tape_5m: _Series = field(default_factory=_Series)
+    spread_bps: _Series = field(default_factory=_Series)
 _DERIVED: Dict[str, _DerivedState] = {}
 
 
@@ -573,7 +595,7 @@ def _derived_state(sym: str) -> _DerivedState:
     return st
 
 
-def _update_derived(sym: str, ts_ms: int, *, oi: Optional[float], funding: Optional[float]) -> None:
+def _update_derived(sym: str, ts_ms: int, *, oi: Optional[float], funding: Optional[float], tape_5m: Optional[float] = None, spread_bps: Optional[float] = None) -> None:
     if not INST_DERIVED_ENABLED:
         return
     if not sym:
@@ -583,6 +605,8 @@ def _update_derived(sym: str, ts_ms: int, *, oi: Optional[float], funding: Optio
     try:
         st.oi.purge_older_than(cutoff)
         st.funding.purge_older_than(cutoff)
+        st.tape_5m.purge_older_than(cutoff)
+        st.spread_bps.purge_older_than(cutoff)
     except Exception:
         pass
 
@@ -595,6 +619,18 @@ def _update_derived(sym: str, ts_ms: int, *, oi: Optional[float], funding: Optio
     try:
         if funding is not None:
             st.funding.append(ts_ms, float(funding))
+    except Exception:
+        pass
+
+    try:
+        if tape_5m is not None:
+            st.tape_5m.append(ts_ms, float(tape_5m))
+    except Exception:
+        pass
+
+    try:
+        if spread_bps is not None:
+            st.spread_bps.append(ts_ms, float(spread_bps))
     except Exception:
         pass
 
@@ -634,6 +670,33 @@ def _delta(series: _Series, now_ms: int, horizon_s: float) -> Optional[float]:
             return None
         _, v0 = old
         return float(float(v1) - float(v0))
+    except Exception:
+        return None
+
+
+def _series_slope_per_min(series: _Series, points: int = 12) -> Optional[float]:
+    """Return slope (units per minute) for the last `points` samples of a derived series.
+    Uses numpy when available; falls back to simple delta/time.
+    """
+    try:
+        pts = list(series.pts)[-max(2, int(points)):]
+        if len(pts) < 2:
+            return None
+        # convert to minutes relative to first
+        t0 = float(pts[0][0])
+        xs = [(float(ts) - t0) / 60000.0 for ts, _ in pts]
+        ys = [float(v) for _, v in pts]
+        if np is not None and len(xs) >= 3:
+            x = np.asarray(xs, dtype=float)
+            y = np.asarray(ys, dtype=float)
+            # slope of y = a*x + b
+            a = float(np.polyfit(x, y, 1)[0])
+            return a
+        # fallback: delta / minutes
+        dt = float(xs[-1] - xs[0])
+        if dt <= 1e-9:
+            return None
+        return float((ys[-1] - ys[0]) / dt)
     except Exception:
         return None
 
@@ -916,7 +979,7 @@ async def compute_full_institutional_analysis(
     *,
     include_liquidations: bool = False,  # kept for signature compatibility
     mode: Optional[str] = None,
-) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
     _ = include_liquidations  # not used in bitget-only build
 
     bias = (bias or "").upper().strip()
@@ -943,6 +1006,12 @@ async def compute_full_institutional_analysis(
     ws_snap = _ws_snapshot(sym)
     ws_used = bool(ws_snap is not None)
 
+    # WS hub extras (institutional): depth/spread/mid diagnostics
+    ws_spread_bps: Optional[float] = None
+    ws_bid_depth_usd: Optional[float] = None
+    ws_ask_depth_usd: Optional[float] = None
+    ws_mid: Optional[float] = None
+
     now_ms = _now_ms()
     snap_ts_ms = now_ms
     if isinstance(ws_snap, dict) and ws_snap.get("ts") is not None:
@@ -951,12 +1020,25 @@ async def compute_full_institutional_analysis(
         except Exception:
             snap_ts_ms = now_ms
 
-    depth = await _fetch_merge_depth(sym)
-    if depth is None:
-        warnings.append("no_depth")
-        sources["depth"] = "none"
+    # Depth source selection (institutional):
+    # - If WS hub is available and enabled, we can skip REST depth in LIGHT/NORMAL to reduce load and improve freshness.
+    # - In FULL mode, REST depth is still preferred to compute true band metrics unless disabled.
+    depth: Optional[Dict[str, Any]] = None
+    if not (INST_DEPTH_USE_WS_IF_AVAILABLE and ws_used and (eff_mode != "FULL" or (not INST_DEPTH_REST_REQUIRED_IN_FULL))):
+        depth = await _fetch_merge_depth(sym)
+        if depth is None:
+            sources["depth"] = "none"
+        else:
+            sources["depth"] = "bitget_rest"
     else:
-        sources["depth"] = "bitget_rest"
+        # WS proxy mode (depth fields may still be available via hub snapshot)
+        sources["depth"] = "ws_hub_proxy"
+
+    if depth is None:
+        if ws_used:
+            warnings.append("depth_proxy_ws")
+        else:
+            warnings.append("no_depth")
 
     ob_25 = None
     spread_bps = None
@@ -970,7 +1052,25 @@ async def compute_full_institutional_analysis(
             depth_usd_25 = float(b25 + a25)
         spread_bps = _compute_spread_bps_from_depth(depth)
         microprice = _compute_microprice_from_depth(depth)
+    elif ws_used and (ws_bid_depth_usd is not None or ws_ask_depth_usd is not None or ws_spread_bps is not None):
+        # WS proxy metrics: use top-of-book depth + spread if REST depth is skipped/unavailable.
+        # These are not exact "25bps band" metrics, but they are directionally useful and much fresher.
+        b25 = ws_bid_depth_usd
+        a25 = ws_ask_depth_usd
+        depth_bid_usd_25, depth_ask_usd_25 = b25, a25
+        if b25 is not None and a25 is not None:
+            depth_usd_25 = float(b25 + a25)
 
+        if ws_spread_bps is not None:
+            spread_bps = ws_spread_bps
+        if ws_mid is not None:
+            microprice = ws_mid
+
+        # Proxy orderbook imbalance from depth asymmetry
+        if b25 is not None and a25 is not None and (b25 + a25) > 0:
+            ob_25 = float((b25 - a25) / (b25 + a25))
+        else:
+            ob_25 = None
     funding_mean = funding_std = funding_z = None
     if eff_mode == "FULL":
         hist = await _fetch_funding_history(sym, limit=30)
@@ -1003,6 +1103,30 @@ async def compute_full_institutional_analysis(
             if ws_snap.get("open_interest") is not None:
                 oi_value = float(ws_snap.get("open_interest"))
                 sources["oi"] = "ws_hub"
+
+            # WS depth/spread (if hub provides it)
+            if ws_snap.get("spread_bps") is not None:
+                ws_spread_bps = float(ws_snap.get("spread_bps"))
+                sources["spread"] = "ws_hub"
+
+            if ws_snap.get("bid_depth_usd") is not None:
+                ws_bid_depth_usd = float(ws_snap.get("bid_depth_usd"))
+                sources["depth_bid"] = "ws_hub"
+            if ws_snap.get("ask_depth_usd") is not None:
+                ws_ask_depth_usd = float(ws_snap.get("ask_depth_usd"))
+                sources["depth_ask"] = "ws_hub"
+            if ws_snap.get("mid") is not None:
+                ws_mid = float(ws_snap.get("mid"))
+                sources["mid"] = "ws_hub"
+
+            qf = ws_snap.get("quality_flags")
+            if isinstance(qf, list) and qf:
+                # Keep as warnings for observability (not necessarily a veto)
+                for x in qf[:6]:
+                    try:
+                        warnings.append(f"ws_{str(x)}")
+                    except Exception:
+                        pass
         except Exception:
             warnings.append("ws_parse_error")
 
@@ -1035,7 +1159,7 @@ async def compute_full_institutional_analysis(
         warnings.append("candles_flag_on_but_not_implemented_here")
 
     if INST_DERIVED_ENABLED:
-        _update_derived(sym, snap_ts_ms, oi=oi_value, funding=funding_rate)
+        _update_derived(sym, snap_ts_ms, oi=oi_value, funding=funding_rate, tape_5m=tape_5m, spread_bps=spread_bps)
 
     oi_change_15m_pct = None
     oi_change_1h_pct = None
@@ -1070,9 +1194,21 @@ async def compute_full_institutional_analysis(
     depth_25_z = _norm_update(sym, "depth_25", depth_usd_25)
     oi_z = _norm_update(sym, "oi", oi_value) if oi_value is not None else None
     funding_z2 = _norm_update(sym, "funding", funding_rate) if funding_rate is not None else None
+    tape_z = _norm_update(sym, "tape_5m", tape_5m) if tape_5m is not None else None
 
     funding_regime = _classify_funding(funding_rate, z=funding_z if funding_z is not None else funding_z2)
     ob_regime = _classify_orderbook(ob_25)
+
+    flow_regime = _classify_flow(tape_5m, tape_z)
+    crowding_regime = _classify_crowding(funding_rate, funding_z2 if funding_z2 is not None else funding_z)
+
+    cvd_slope = None
+    if INST_DERIVED_ENABLED:
+        try:
+            st_d = _derived_state(sym)
+            cvd_slope = _series_slope_per_min(st_d.tape_5m, points=int(INST_TAPE_SLOPE_POINTS))
+        except Exception:
+            cvd_slope = None
 
     components = {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0}
     score = 0
@@ -1118,8 +1254,8 @@ async def compute_full_institutional_analysis(
         "oi": oi_value,
         "oi_slope": oi_change_1h_pct,
 
-        "cvd_slope": None,
-        "cvd_notional_5m": None,
+        "cvd_slope": cvd_slope,
+        "cvd_notional_5m": tape_5m,
 
         "funding_rate": funding_rate,
         "funding_regime": funding_regime,
@@ -1133,7 +1269,7 @@ async def compute_full_institutional_analysis(
 
         "tape_delta_1m": None,
         "tape_delta_5m": tape_5m,
-        "tape_regime": "unknown",
+        "tape_regime": flow_regime,
 
         "orderbook_imb_25bps": ob_25,
         "orderbook_imb_25bps_z": ob_imb_z,
@@ -1148,8 +1284,8 @@ async def compute_full_institutional_analysis(
         "depth_usd_25bps": depth_usd_25,
         "depth_25bps_z": depth_25_z,
 
-        "crowding_regime": "unknown",
-        "flow_regime": "unknown",
+        "crowding_regime": crowding_regime,
+        "flow_regime": flow_regime,
 
         "oi_change_15m_pct": oi_change_15m_pct,
         "oi_change_1h_pct": oi_change_1h_pct,
@@ -1192,7 +1328,7 @@ async def compute_full_institutional_analysis(
         "basisPct": None,
         "tapeDelta5m": tape_5m,
         "orderbookImb25bps": ob_25,
-        "cvdSlope": None,
+        "cvdSlope": cvd_slope,
     }
 
     comps = _available_components_list(payload)
