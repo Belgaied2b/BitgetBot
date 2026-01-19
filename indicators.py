@@ -142,6 +142,116 @@ def _linreg_slope(y: pd.Series, n: int = 12) -> float:
 
 
 # =====================================================================
+# Institutional MAX++ hardening (optional, backward-compatible)
+# =====================================================================
+# These features are OFF by default to preserve legacy behavior.
+# Enable via env vars when you want “desk/institutional” strictness.
+import os
+import time
+from datetime import datetime, timezone
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    try:
+        return str(os.getenv(name, default)).strip() == "1"
+    except Exception:
+        return default == "1"
+
+def _env_float(name: str, default: str) -> float:
+    try:
+        return float(str(os.getenv(name, default)).strip())
+    except Exception:
+        return float(default)
+
+# If enabled, we drop the last candle when it looks like an “incomplete/live” bar.
+# This reduces false ADX/squeeze/ATR% signals on streaming data.
+IND_DROP_LIVE_BAR = _env_flag("IND_DROP_LIVE_BAR", "0")
+IND_LIVE_BAR_GRACE = _env_float("IND_LIVE_BAR_GRACE", "0.55")  # fraction of bar duration
+
+def _to_utc_ts_seconds(ts) -> Optional[float]:
+    try:
+        if ts is None:
+            return None
+        if hasattr(ts, "to_pydatetime"):
+            ts = ts.to_pydatetime()
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts.timestamp()
+        return None
+    except Exception:
+        return None
+
+def _infer_bar_seconds(idx: pd.Index) -> Optional[float]:
+    try:
+        if idx is None or len(idx) < 10:
+            return None
+        if not isinstance(idx, (pd.DatetimeIndex,)):
+            return None
+        # Use median of last deltas for robustness
+        deltas = (idx[-10:].to_series().diff().dropna()).dt.total_seconds().values
+        if deltas is None or len(deltas) < 3:
+            return None
+        med = float(np.nanmedian(deltas))
+        return med if np.isfinite(med) and med > 0 else None
+    except Exception:
+        return None
+
+def _maybe_drop_live_bar_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    try:
+        if not IND_DROP_LIVE_BAR:
+            return df
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty or len(df) < 5:
+            return df
+        idx = df.index
+        if not isinstance(idx, pd.DatetimeIndex):
+            return df
+        bar_s = _infer_bar_seconds(idx)
+        if bar_s is None or bar_s <= 0:
+            return df
+        last_ts = _to_utc_ts_seconds(idx[-1])
+        if last_ts is None:
+            return df
+        now_s = time.time()
+        age_s = max(0.0, now_s - float(last_ts))
+        # If last bar timestamp is “too recent” relative to bar duration, treat it as live.
+        if age_s < float(IND_LIVE_BAR_GRACE) * float(bar_s):
+            return df.iloc[:-1].copy()
+        return df
+    except Exception:
+        return df
+
+def _efficiency_ratio(close: pd.Series, n: int = 20) -> float:
+    """Kaufman Efficiency Ratio: trendiness vs chop. 0..1."""
+    try:
+        c = pd.to_numeric(close, errors="coerce").astype(float)
+        if c is None or len(c) < n + 2:
+            return 0.0
+        win = c.tail(n + 1)
+        net = abs(float(win.iloc[-1] - win.iloc[0]))
+        den = float(win.diff().abs().sum())
+        if den <= 0:
+            return 0.0
+        v = net / den
+        return float(v) if np.isfinite(v) else 0.0
+    except Exception:
+        return 0.0
+
+def _realized_vol_ewma(close: pd.Series, span: int = 32) -> float:
+    """EWMA of log returns std, expressed as a fraction (e.g., 0.02 = 2%)."""
+    try:
+        c = pd.to_numeric(close, errors="coerce").astype(float)
+        if c is None or len(c) < span + 5:
+            return 0.0
+        r = np.log(c / c.shift(1)).replace([np.inf, -np.inf], np.nan).dropna()
+        if r.empty:
+            return 0.0
+        var = r.ewm(span=int(span), adjust=False).var(bias=False)
+        v = float(np.sqrt(max(0.0, float(var.iloc[-1]))))
+        return float(v) if np.isfinite(v) else 0.0
+    except Exception:
+        return 0.0
+
+# =====================================================================
 # MA / EMA
 # =====================================================================
 
@@ -172,6 +282,7 @@ def ema_trend_bias(
     Desk-style: requires EMA stack + slope + min spread percent.
     """
     try:
+        df = _maybe_drop_live_bar_df(df)
         if df is None or df.empty or "close" not in df.columns or len(df) < slow + 8:
             return "RANGE"
         c = df["close"].astype(float)
@@ -238,6 +349,7 @@ def macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> p
 # =====================================================================
 
 def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    df = _maybe_drop_live_bar_df(df)
     if df is None or df.empty:
         return _shape_series(df, 0.0, name="atr")
 
@@ -263,14 +375,17 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
 
 
 def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    df = _maybe_drop_live_bar_df(df)
     return atr(df, length=length)
 
 
 def true_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    df = _maybe_drop_live_bar_df(df)
     return atr(df, length=length)
 
 
 def atr_pct(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    df = _maybe_drop_live_bar_df(df)
     if df is None or df.empty:
         return _shape_series(df, np.nan, name="atr_pct")
     if not _has_cols(df, ("close", "high", "low")):
@@ -287,6 +402,7 @@ def atr_pct(df: pd.DataFrame, length: int = 14) -> pd.Series:
 # =====================================================================
 
 def adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    df = _maybe_drop_live_bar_df(df)
     """
     ADX (Average Directional Index) — trend strength [0..100]
     Uses Wilder smoothing (EMA alpha=1/length).
@@ -325,6 +441,7 @@ def adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
 # =====================================================================
 
 def rel_volume(df: pd.DataFrame, lookback: int = 40) -> float:
+    df = _maybe_drop_live_bar_df(df)
     if not _has_cols(df, ("volume",)):
         return 1.0
     v = df["volume"].astype(float)
@@ -337,6 +454,7 @@ def rel_volume(df: pd.DataFrame, lookback: int = 40) -> float:
 
 
 def obv(df: pd.DataFrame) -> pd.Series:
+    df = _maybe_drop_live_bar_df(df)
     if df is None or df.empty:
         return _shape_series(df, 0.0, name="obv")
     if not _has_cols(df, ("close", "volume")):
@@ -355,6 +473,7 @@ def obv(df: pd.DataFrame) -> pd.Series:
 # =====================================================================
 
 def bollinger(df: pd.DataFrame, length: int = 20, n_std: float = 2.0) -> Dict[str, pd.Series]:
+    df = _maybe_drop_live_bar_df(df)
     if df is None or df.empty or "close" not in df.columns:
         z = _shape_series(df, np.nan)
         return {"mid": z, "upper": z, "lower": z, "width": z}
@@ -370,30 +489,44 @@ def bollinger(df: pd.DataFrame, length: int = 20, n_std: float = 2.0) -> Dict[st
 
 
 def is_choppy_market(df: pd.DataFrame, *, bb_len: int = 20, adx_len: int = 14) -> bool:
-    """
-    Desk chop filter:
-      - BB width too small AND ADX weak => range/chop
+    df = _maybe_drop_live_bar_df(df)
+    """Desk chop filter (Institutional MAX++).
+
+    Signals “chop/range” when:
+    - BB bandwidth is tight AND ADX is weak, OR
+    - Efficiency Ratio (Kaufman) indicates low directional efficiency.
     """
     try:
-        if df is None or df.empty or len(df) < 60:
+        if df is None or df.empty or len(df) < 80 or not _has_cols(df, ("close", "high", "low")):
             return True
+
         bb = bollinger(df, bb_len, 2.0)
-        bb_width = _nan_to(_safe_last(bb["width"], np.nan), 0.06)
+        bb_width = _nan_to(_safe_last(bb.get("width"), np.nan), 0.06)
         a = _nan_to(_safe_last(adx(df, adx_len), np.nan), 18.0)
 
-        # desk thresholds
-        if (bb_width < 0.028 and a < 16.0) or (bb_width < 0.020):
+        er = _efficiency_ratio(df["close"].astype(float), n=20)
+
+        # Institutional thresholds (conservative):
+        tight = (bb_width < 0.028)
+        very_tight = (bb_width < 0.020)
+        weak_trend = (a < 16.0)
+
+        # ER: <0.22 tends to be “mean-reverting / noisy” on many intraday series
+        er_chop = (er > 0 and er < 0.22)
+
+        if very_tight:
             return True
+        if tight and weak_trend:
+            return True
+        if er_chop and (weak_trend or tight):
+            return True
+
         return False
     except Exception:
         return False
 
-
-# =====================================================================
-# OTE (Optimal Trade Entry) — Desk-grade
-# =====================================================================
-
 def compute_ote(df: pd.DataFrame, bias: str, lookback: int = 60) -> Dict[str, Any]:
+    df = _maybe_drop_live_bar_df(df)
     """
     Desk-grade OTE approximation for LIMIT entries.
 
@@ -458,29 +591,64 @@ def compute_ote(df: pd.DataFrame, bias: str, lookback: int = 60) -> Dict[str, An
 # =====================================================================
 
 def volatility_regime(df: pd.DataFrame, atr_length: int = 14) -> str:
-    if df is None or df.empty or len(df) < int(atr_length) + 10:
+    df = _maybe_drop_live_bar_df(df)
+    """Volatility regime classifier (LOW/MEDIUM/HIGH).
+
+    Institutional MAX++:
+    - Uses ATR% (robust median) as primary signal
+    - Adds EWMA realized vol (log-returns) as a cross-check
+    - Blends static thresholds (settings) with adaptive quantiles for symbol-specific behavior
+    """
+    try:
+        if df is None or df.empty or len(df) < int(atr_length) + 40 or not _has_cols(df, ("high", "low", "close")):
+            return "UNKNOWN"
+
+        ap = atr_pct(df, length=int(atr_length))
+        if ap is None or len(ap) < 20:
+            return "UNKNOWN"
+
+        ap_tail = pd.to_numeric(ap.tail(10), errors="coerce").astype(float)
+        last_atr = float(np.nanmedian(ap_tail.values)) if len(ap_tail) else np.nan
+        if not np.isfinite(last_atr) or last_atr <= 0:
+            return "UNKNOWN"
+
+        close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+        rv = float(_realized_vol_ewma(close, span=32))
+        # rv is log-return std (fraction). Convert to a comparable “pct move” proxy.
+        rv_proxy = float(max(0.0, rv))
+
+        # Adaptive thresholds (quantile-based), fallback to settings
+        q_low = q_high = None
+        try:
+            if len(ap) >= 220:
+                base = pd.to_numeric(ap.tail(220), errors="coerce").astype(float).dropna()
+                if len(base) >= 120:
+                    q_low = float(base.quantile(0.25))
+                    q_high = float(base.quantile(0.75))
+        except Exception:
+            q_low = q_high = None
+
+        low_thr = float(VOL_REGIME_ATR_PCT_LOW)
+        high_thr = float(VOL_REGIME_ATR_PCT_HIGH)
+
+        if q_low is not None and np.isfinite(q_low) and q_low > 0:
+            low_thr = max(low_thr, 0.85 * float(q_low))
+        if q_high is not None and np.isfinite(q_high) and q_high > 0:
+            high_thr = max(high_thr, 1.10 * float(q_high))
+
+        # Combine: ATR% dominates, RV nudges classification upward if consistently elevated
+        combo = max(float(last_atr), float(rv_proxy) * 1.25)
+
+        if combo < low_thr:
+            return "LOW"
+        if combo > high_thr:
+            return "HIGH"
+        return "MEDIUM"
+    except Exception:
         return "UNKNOWN"
-
-    ap = atr_pct(df, length=int(atr_length))
-    if ap is None or len(ap) < 5:
-        return "UNKNOWN"
-
-    last = float(ap.tail(5).mean())
-    if not np.isfinite(last):
-        return "UNKNOWN"
-
-    if last < float(VOL_REGIME_ATR_PCT_LOW):
-        return "LOW"
-    if last > float(VOL_REGIME_ATR_PCT_HIGH):
-        return "HIGH"
-    return "MEDIUM"
-
-
-# =====================================================================
-# Extension signal (dynamic thresholds vs ATR%)
-# =====================================================================
 
 def extension_signal(df: pd.DataFrame, ema_fast_len: int = 20, ema_slow_len: int = 50) -> Optional[str]:
+    df = _maybe_drop_live_bar_df(df)
     """
     Overextension detection:
       - distance vs EMA slow (dynamic threshold)
@@ -517,6 +685,7 @@ def extension_signal(df: pd.DataFrame, ema_fast_len: int = 20, ema_slow_len: int
 # =====================================================================
 
 def institutional_momentum(df: pd.DataFrame) -> str:
+    df = _maybe_drop_live_bar_df(df)
     """
     Returns:
       STRONG_BULLISH / BULLISH / NEUTRAL / BEARISH / STRONG_BEARISH
@@ -577,6 +746,7 @@ def institutional_momentum(df: pd.DataFrame) -> str:
 # =====================================================================
 
 def composite_momentum(df: pd.DataFrame) -> Dict[str, Any]:
+    df = _maybe_drop_live_bar_df(df)
     """
     Desk composite score in [0,100] with richer components.
 
@@ -683,6 +853,7 @@ def composite_momentum(df: pd.DataFrame) -> Dict[str, Any]:
 # =====================================================================
 
 def desk_momentum_gate(df: pd.DataFrame, direction: str) -> Dict[str, Any]:
+    df = _maybe_drop_live_bar_df(df)
     """
     Returns:
       {"ok": bool, "reason": str, "label": str, "score": float, "chop": bool, "ext": str|None, "ema_bias": str}
