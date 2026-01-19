@@ -477,6 +477,7 @@ def _mk_signal_msg(
 
 def _mk_exec_msg(tag: str, symbol: str, tid: str, **kv: Any) -> str:
     base = f"*⚙️ {_tg_escape(tag)}* — *{_tg_escape(symbol)}*\n" + f"tid: `{_tg_escape(tid)}`\n"
+
     lines: List[str] = []
     for k, v in kv.items():
         if v is None:
