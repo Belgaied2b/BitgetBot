@@ -1346,6 +1346,37 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     except Exception:
         pass
 
+    # meta/tick
+    try:
+        meta_dbg = await asyncio.wait_for(trader.debug_meta(sym), timeout=META_TIMEOUT_S)
+    except Exception:
+        meta_dbg = {}
+
+    tick_meta = await _get_tick_cached(trader, sym)
+    tick_used = _sanitize_tick(sym, entry, tick_meta, tid)
+    q_entry = _q_entry(entry, tick_used, side)
+
+    min_entry_usdt = float(os.getenv("MIN_ENTRY_USDT", "5"))
+    min_margin_needed = float(min_entry_usdt) / max(float(lev), 1e-9)
+    if min_margin_needed > base_margin:
+        await stats.inc("exec_failed", 1)
+        await stats.add_reason("entry_below_min_notional")
+        await send_telegram(
+            _mk_exec_msg(
+                "EXEC_SKIPPED",
+                sym,
+                tid,
+                reason="min_notional_exceeds_base_margin",
+                min_notional=min_entry_usdt,
+                base_margin=round(base_margin, 4),
+            )
+        )
+        return
+
+    if margin_used < min_margin_needed:
+        margin_used = float(min_margin_needed)
+        notional = float(margin_used) * float(lev)
+
     # risk gate (reserve -> confirm/cancel)
     allowed, rreason, risk_rid = await RISK.reserve_trade(
         symbol=sym,
@@ -1360,16 +1391,6 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
         await stats.add_reason(f"risk:{rreason}")
         await send_telegram(_mk_exec_msg("EXEC_SKIPPED", sym, tid, reason=f"risk:{rreason}", opt_regime=str(opt_ctx.get("regime"))))
         return
-
-    # meta/tick
-    try:
-        meta_dbg = await asyncio.wait_for(trader.debug_meta(sym), timeout=META_TIMEOUT_S)
-    except Exception:
-        meta_dbg = {}
-
-    tick_meta = await _get_tick_cached(trader, sym)
-    tick_used = _sanitize_tick(sym, entry, tick_meta, tid)
-    q_entry = _q_entry(entry, tick_used, side)
 
     # ---- TRADE fingerprint (real tick, prevents duplicates) ----
     q_sl_fp = _q_sl(sl, tick_used, direction)
