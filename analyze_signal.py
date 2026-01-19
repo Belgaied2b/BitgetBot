@@ -1794,13 +1794,19 @@ class SignalAnalyzer:
             # =================================================================
             # Bar-close safety (best-effort): drop potentially unclosed last bar
             # =================================================================
+            h1_bar_meta = {"enabled": bool(BAR_CLOSE_ONLY), "dropped": False, "before": len(df_h1), "after": len(df_h1)}
+            h4_bar_meta = {"enabled": bool(BAR_CLOSE_ONLY), "dropped": False, "before": len(df_h4), "after": len(df_h4)}
             if BAR_CLOSE_ONLY:
                 before1 = len(df_h1)
                 before4 = len(df_h4)
                 df_h1 = _drop_incomplete_last_bar(df_h1)
                 df_h4 = _drop_incomplete_last_bar(df_h4)
-                if len(df_h1) != before1 or len(df_h4) != before4:
-                    LOGGER.info("[EVAL_PRE] %s bar_close_guard dropped_last h1:%s->%s h4:%s->%s", symbol, before1, len(df_h1), before4, len(df_h4))
+                after1 = len(df_h1)
+                after4 = len(df_h4)
+                h1_bar_meta.update({"before": before1, "after": after1, "dropped": bool(after1 < before1)})
+                h4_bar_meta.update({"before": before4, "after": after4, "dropped": bool(after4 < before4)})
+                if after1 != before1 or after4 != before4:
+                    LOGGER.info("[EVAL_PRE] %s bar_close_guard dropped_last h1:%s->%s h4:%s->%s", symbol, before1, after1, before4, after4)
 
             # =================================================================
             # Session filter (institutional killzones)
