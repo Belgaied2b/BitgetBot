@@ -40,7 +40,7 @@ except Exception:  # pragma: no cover
 
 LOGGER = logging.getLogger(__name__)
 
-INST_VERSION = "UltraDesk3.1-bitget-only+funding-fallback+oi-optin+derived-2026-01-13"
+INST_VERSION = "UltraDesk3.3-bitget-only+ws-hub-max+funding+oi+robust-parse-2026-01-21"
 
 BITGET_API_BASE = str(os.getenv("BITGET_API_BASE", "https://api.bitget.com")).strip()
 
@@ -70,7 +70,6 @@ INST_DEBUG = str(os.getenv("INST_DEBUG", "0")).strip() == "1"
 INST_TRACE_HTTP = str(os.getenv("INST_TRACE_HTTP", "0")).strip() == "1"
 INST_TRACE_WS = str(os.getenv("INST_TRACE_WS", "0")).strip() == "1"
 INST_TRACE_PAYLOAD = str(os.getenv("INST_TRACE_PAYLOAD", "0")).strip() == "1"
-INST_TRACE_PARSE = str(os.getenv('INST_TRACE_PARSE', '0')).strip() == '1'
 
 # ---------------------------------------------------------------------
 # Optional external WS hub (read-only) — expected to be Bitget-based
@@ -461,6 +460,72 @@ def _compute_microprice_from_depth(depth: Dict[str, Any]) -> Optional[float]:
         return None
 
 
+
+# =====================================================================
+# Bitget response parsing helpers (robust)
+# =====================================================================
+
+def _unwrap_data_envelope(resp: Any) -> Any:
+    """Bitget v2 typically returns {code,msg,requestTime,data:<obj or list>}"""
+    if not isinstance(resp, dict):
+        return resp
+    return resp.get("data", resp)
+
+
+def _first_dict(x: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, list) and x:
+        if isinstance(x[0], dict):
+            return x[0]
+    return None
+
+
+def _to_float_safe(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        if v != v:  # NaN
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _normalize_book_side(side: Any, *, is_bids: bool) -> List[List[float]]:
+    """Normalize bids/asks to [[price, size], ...] float pairs."""
+    out: List[List[float]] = []
+    if not isinstance(side, list) or not side:
+        return out
+
+    # Common formats:
+    # 1) [[price, size], ...] where values are str/float
+    # 2) [{"price": "...", "size": "..."}, ...]
+    for row in side:
+        try:
+            if isinstance(row, (list, tuple)) and len(row) >= 2:
+                p = _to_float_safe(row[0])
+                q = _to_float_safe(row[1])
+            elif isinstance(row, dict):
+                p = _to_float_safe(row.get("price") or row.get("p"))
+                q = _to_float_safe(row.get("size") or row.get("qty") or row.get("q"))
+            else:
+                continue
+
+            if p is None or q is None:
+                continue
+            if p <= 0 or q <= 0:
+                continue
+            out.append([float(p), float(q)])
+        except Exception:
+            continue
+
+    # Ensure best-first ordering
+    if out:
+        out.sort(key=lambda x: x[0], reverse=bool(is_bids))
+    return out
+
 # =====================================================================
 # Normalization (rolling z-scores)
 # =====================================================================
@@ -643,73 +708,57 @@ def _delta(series: _Series, now_ms: int, horizon_s: float) -> Optional[float]:
 # Bitget confirmed endpoints
 # =====================================================================
 
-def _unwrap_data_envelope(resp: Any) -> Any:
-    # Bitget v2 endpoints usually return: {code,msg,requestTime,data:<obj or list>}
-    # Some callers may already pass the inner data.
-    if not isinstance(resp, dict):
-        return resp
-    if 'data' in resp:
-        return resp.get('data')
-    return resp
-
-
-def _first_dict(x: Any) -> Optional[Dict[str, Any]]:
-    if isinstance(x, dict):
-        return x
-    if isinstance(x, list) and x:
-        if isinstance(x[0], dict):
-            return x[0]
-    return None
-
-
-def _to_float_safe(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        v = float(x)
-        if v != v:  # NaN
-            return None
-        return v
-    except Exception:
-        return None
-
-
-
 async def _fetch_merge_depth(symbol: str) -> Optional[Dict[str, Any]]:
-    data = await _http_get(
+    resp = await _http_get(
         "/api/v2/mix/market/merge-depth",
         params={"productType": INST_BITGET_PRODUCT_TYPE, "symbol": symbol},
         symbol=symbol,
     )
-    if not isinstance(data, dict):
+    if not isinstance(resp, dict):
         if INST_TRACE_PARSE:
-            LOGGER.info('[INST_PARSE] merge-depth sym=%s unexpected_type=%s', symbol, type(data).__name__)
+            LOGGER.info("[INST_PARSE] merge-depth sym=%s unexpected_type=%s", symbol, type(resp).__name__)
         return None
 
-    inner = _unwrap_data_envelope(data)
+    inner = _unwrap_data_envelope(resp)
     d0 = _first_dict(inner)
     if d0 is None:
         if INST_TRACE_PARSE:
-            LOGGER.info('[INST_PARSE] merge-depth sym=%s inner_type=%s', symbol, type(inner).__name__)
+            LOGGER.info("[INST_PARSE] merge-depth sym=%s inner_type=%s", symbol, type(inner).__name__)
         return None
 
-    bids = d0.get('bids') or d0.get('bid')
-    asks = d0.get('asks') or d0.get('ask')
+    bids = d0.get("bids") or d0.get("bid")
+    asks = d0.get("asks") or d0.get("ask")
+
+    # Some variants wrap book under another key
+    if (not isinstance(bids, list) or not isinstance(asks, list)) and isinstance(d0.get("data"), dict):
+        dd = d0.get("data") or {}
+        bids = bids if isinstance(bids, list) else (dd.get("bids") or dd.get("bid"))
+        asks = asks if isinstance(asks, list) else (dd.get("asks") or dd.get("ask"))
+
     if not isinstance(bids, list) or not isinstance(asks, list):
         if INST_TRACE_PARSE:
-            LOGGER.info('[INST_PARSE] merge-depth sym=%s bids_type=%s asks_type=%s keys=%s', symbol, type(bids).__name__, type(asks).__name__, list(d0.keys())[:20])
+            LOGGER.info(
+                "[INST_PARSE] merge-depth sym=%s bids_type=%s asks_type=%s keys=%s",
+                symbol,
+                type(bids).__name__,
+                type(asks).__name__,
+                list(d0.keys())[:24],
+            )
         return None
 
-    # Normalize to [[price, size], ...] floats to keep downstream robust.
     bids_n = _normalize_book_side(bids, is_bids=True)
     asks_n = _normalize_book_side(asks, is_bids=False)
     if not bids_n or not asks_n:
         if INST_TRACE_PARSE:
-            LOGGER.info('[INST_PARSE] merge-depth sym=%s normalized_empty bids_raw_len=%s asks_raw_len=%s', symbol, len(bids) if isinstance(bids, list) else None, len(asks) if isinstance(asks, list) else None)
+            LOGGER.info(
+                "[INST_PARSE] merge-depth sym=%s normalized_empty bids_raw_len=%s asks_raw_len=%s",
+                symbol,
+                len(bids),
+                len(asks),
+            )
         return None
 
-    return {'bids': bids_n, 'asks': asks_n}
-
+    return {"bids": bids_n, "asks": asks_n}
 
 async def _fetch_funding_history(symbol: str, limit: int = 30) -> Optional[List[Dict[str, Any]]]:
     data = await _http_get(
@@ -744,32 +793,31 @@ async def _fetch_current_funding_rate(symbol: str) -> Tuple[Optional[float], Opt
         if (now_s - ts_s) <= float(_FUNDING_TTL_S):
             return float(fr), next_ms
 
-    data = await _http_get(
+    resp = await _http_get(
         "/api/v2/mix/market/current-fund-rate",
         params={"productType": INST_BITGET_PRODUCT_TYPE, "symbol": symbol},
         symbol=symbol,
     )
-    if not isinstance(data, dict):
+    if not isinstance(resp, dict):
         if INST_TRACE_PARSE:
-            LOGGER.info('[INST_PARSE] current-fund-rate sym=%s unexpected_type=%s', symbol, type(data).__name__)
+            LOGGER.info("[INST_PARSE] current-fund-rate sym=%s unexpected_type=%s", symbol, type(resp).__name__)
         return None, None
 
-    inner = _unwrap_data_envelope(data)
+    inner = _unwrap_data_envelope(resp)
     d0 = _first_dict(inner)
-    if d0 is None:
-        # some responses have data={...}
-        if isinstance(inner, dict):
-            d0 = inner
-        else:
-            if INST_TRACE_PARSE:
-                LOGGER.info('[INST_PARSE] current-fund-rate sym=%s inner_type=%s', symbol, type(inner).__name__)
-            return None, None
+    if d0 is None and isinstance(inner, dict):
+        d0 = inner
 
-    fr = _to_float_safe(d0.get('fundingRate'))
+    if not isinstance(d0, dict):
+        if INST_TRACE_PARSE:
+            LOGGER.info("[INST_PARSE] current-fund-rate sym=%s inner_type=%s", symbol, type(inner).__name__)
+        return None, None
+
+    fr = _to_float_safe(d0.get("fundingRate"))
     if fr is None:
-        fr = _to_float_safe(d0.get('funding_rate'))
+        fr = _to_float_safe(d0.get("funding_rate"))
     if fr is None:
-        fr = _to_float_safe(d0.get('funding'))
+        fr = _to_float_safe(d0.get("funding"))
 
     next_ms = _parse_next_update_ms(d0)
 
@@ -777,7 +825,6 @@ async def _fetch_current_funding_rate(symbol: str) -> Tuple[Optional[float], Opt
         _FUNDING_CACHE[symbol] = (float(fr), now_s, next_ms)
 
     return (float(fr) if fr is not None else None), next_ms
-
 
 
 async def _fetch_open_interest(symbol: str) -> Optional[float]:
@@ -788,52 +835,48 @@ async def _fetch_open_interest(symbol: str) -> Optional[float]:
         if (now_s - ts_s) <= float(_OI_TTL_S):
             return float(oi)
 
-    data = await _http_get(
+    resp = await _http_get(
         "/api/v2/mix/market/open-interest",
         params={"productType": INST_BITGET_PRODUCT_TYPE, "symbol": symbol},
         symbol=symbol,
     )
-    if not isinstance(data, dict):
+    if not isinstance(resp, dict):
         if INST_TRACE_PARSE:
-            LOGGER.info('[INST_PARSE] open-interest sym=%s unexpected_type=%s', symbol, type(data).__name__)
+            LOGGER.info("[INST_PARSE] open-interest sym=%s unexpected_type=%s", symbol, type(resp).__name__)
         return None
 
-    inner = _unwrap_data_envelope(data)
+    inner = _unwrap_data_envelope(resp)
 
-    # Bitget formats vary: sometimes data is dict with openInterestList, sometimes list, sometimes dict with size/openInterest.
-    d0 = None
+    d0: Optional[Dict[str, Any]] = None
     if isinstance(inner, dict):
         # Preferred: openInterestList
-        lst = inner.get('openInterestList')
-        if isinstance(lst, list) and lst:
-            if isinstance(lst[0], dict):
-                d0 = lst[0]
+        lst = inner.get("openInterestList")
+        if isinstance(lst, list) and lst and isinstance(lst[0], dict):
+            d0 = lst[0]
         if d0 is None:
             d0 = inner
-    elif isinstance(inner, list) and inner:
-        if isinstance(inner[0], dict):
-            d0 = inner[0]
+    elif isinstance(inner, list) and inner and isinstance(inner[0], dict):
+        d0 = inner[0]
 
     if not isinstance(d0, dict):
         if INST_TRACE_PARSE:
-            LOGGER.info('[INST_PARSE] open-interest sym=%s inner_type=%s', symbol, type(inner).__name__)
+            LOGGER.info("[INST_PARSE] open-interest sym=%s inner_type=%s", symbol, type(inner).__name__)
         return None
 
-    oi = _to_float_safe(d0.get('size'))
+    oi = _to_float_safe(d0.get("size"))
     if oi is None:
-        oi = _to_float_safe(d0.get('openInterest'))
+        oi = _to_float_safe(d0.get("openInterest"))
     if oi is None:
-        oi = _to_float_safe(d0.get('open_interest'))
+        oi = _to_float_safe(d0.get("open_interest"))
     if oi is None:
-        oi = _to_float_safe(d0.get('openInterestAmount'))
+        oi = _to_float_safe(d0.get("openInterestAmount"))
     if oi is None:
-        oi = _to_float_safe(d0.get('openInterestValue'))
+        oi = _to_float_safe(d0.get("openInterestValue"))
 
     if oi is not None:
         _OI_CACHE[symbol] = (float(oi), now_s)
 
     return float(oi) if oi is not None else None
-
 
 def _compute_funding_stats_bitget(hist: Optional[List[Dict[str, Any]]]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     try:
