@@ -34,6 +34,12 @@ log = get_logger("institutional_ws_hub")
 # Bitget WebSocket v2 (public)
 INST_WS_URL = os.getenv("INST_WS_URL", "wss://ws.bitget.com/v2/ws/public")
 
+# Auto-start (opt-in). Useful when other modules (e.g., institutional_data) only read snapshots.
+# If enabled, the controller can start itself lazily (best-effort) on first subscribe/get_snapshot.
+INST_WS_AUTO_START = os.getenv("INST_WS_AUTO_START", "1").strip() == "1"
+INST_WS_AUTO_SUBSCRIBE = os.getenv("INST_WS_AUTO_SUBSCRIBE", "1").strip() == "1"
+
+
 # Bitget contract WS v2 expects instType like: USDT-FUTURES / COIN-FUTURES / USDC-FUTURES
 _INST_TYPE_RAW = os.getenv("INST_WS_INST_TYPE") or os.getenv("INST_PRODUCT_TYPE_WS") or "USDT-FUTURES"
 
@@ -72,10 +78,6 @@ INST_WS_MAX_LIFETIME_S = float(os.getenv("INST_WS_MAX_LIFETIME_S", str(23 * 3600
 
 # How “fresh” a snapshot must be to be considered available (seconds)
 INST_WS_STALE_S = float(os.getenv("INST_WS_STALE_S", "15"))
-
-# Treat a symbol as "partially stale" if only some channels are fresh.
-# This is useful for institutional-grade monitoring: book may be fresh while ticker is stale, etc.
-INST_WS_PARTIAL_STALE_S = float(os.getenv("INST_WS_PARTIAL_STALE_S", str(max(5.0, INST_WS_STALE_S / 2.0))))
 
 # Tape window for delta computation
 TAPE_WINDOW_S = float(os.getenv("INST_TAPE_WINDOW_S", "300"))  # 5 minutes
@@ -117,34 +119,10 @@ def _norm_symbol(sym: str) -> str:
 
 
 def _candidate_inst_ids(sym: str, product_type: str) -> List[str]:
-    """Return candidate instId values for WS subscription.
-
-    Bitget has historically used multiple instId conventions across versions and products.
-    WS v2 commonly uses plain symbols (e.g. BTCUSDT), but some deployments return
-    suffix forms (e.g. BTCUSDT_UMCBL). We subscribe to a small set of common variants
-    to increase robustness without inflating channel count too much.
-    """
+    # For Bitget Futures WS v2, instId is typically like "BTCUSDT"
+    _ = product_type  # reserved if you want per-product variants later
     s = _norm_symbol(sym)
-    if not s:
-        return []
-
-    pt = _normalize_inst_type(product_type)
-    out = [s]
-    # Common suffixes seen on Bitget Mix instruments.
-    if pt == "USDT-FUTURES":
-        out.append(f"{s}_UMCBL")
-    elif pt == "COIN-FUTURES":
-        out.append(f"{s}_DMCBL")
-    elif pt == "USDC-FUTURES":
-        out.append(f"{s}_CMCBL")
-    # Deduplicate while preserving order.
-    seen = set()
-    uniq: List[str] = []
-    for x in out:
-        if x and x not in seen:
-            seen.add(x)
-            uniq.append(x)
-    return uniq
+    return [s] if s else []
 
 
 def _depth_usd(levels: List[Any], topn: int = 5) -> Optional[float]:
@@ -203,11 +181,9 @@ def _decode_ws_payload(msg: aiohttp.WSMessage) -> Optional[str]:
 class _BookState:
     best_bid: Optional[float] = None
     best_ask: Optional[float] = None
-    mid: Optional[float] = None
     bid_depth_usd: Optional[float] = None
     ask_depth_usd: Optional[float] = None
     spread: Optional[float] = None  # relative (not bps)
-    spread_bps: Optional[float] = None
     ts_ms: int = field(default_factory=_now_ms)
 
 
@@ -262,13 +238,6 @@ class InstitutionalWSHubShard:
         self._last_send_monotonic = 0.0
         self._conn_started_monotonic = 0.0
 
-        # Health metrics (institutional observability)
-        self._connect_count = 0
-        self._reconnect_count = 0
-        self._error_count = 0
-        self._last_error: Optional[str] = None
-        self._last_connect_ms: Optional[int] = None
-
     def is_running(self) -> bool:
         return bool(self._started) and (self._ws is not None) and (not self._ws.closed)
 
@@ -293,6 +262,23 @@ class InstitutionalWSHubShard:
             s += float(v)
         return float(s)
 
+    @staticmethod
+    def _quality_score(*, fields: List[str], age_s: float) -> int:
+        """Quick 0..100 snapshot quality indicator (heuristic)."""
+        score = 100
+        try:
+            if age_s is not None and age_s > 0:
+                score -= int(min(45.0, (float(age_s) / float(STALE_SEC)) * 45.0))
+        except Exception:
+            pass
+        want = {"book", "ticker", "trades"}
+        try:
+            missing = want - set(fields or [])
+            score -= 15 * len(missing)
+        except Exception:
+            score -= 20
+        return max(0, min(100, int(score)))
+
     def snapshot(self, symbol: str) -> Dict[str, Any]:
         sym = _norm_symbol(symbol)
         st = self._states.get(sym)
@@ -300,38 +286,11 @@ class InstitutionalWSHubShard:
             return {"available": False, "ts": None, "symbol": sym, "reason": "unknown_symbol"}
 
         with self._state_lock:
-            now_ms = _now_ms()
             latest_ms = self._latest_ts_ms(st)
-
-            # Per-channel freshness (institutional-grade diagnostics)
-            age_book_s = (now_ms - int(st.book.ts_ms)) / 1000.0
-            age_trade_s = (now_ms - int(st.trade.ts_ms)) / 1000.0
-            age_ticker_s = (now_ms - int(st.ticker.ts_ms)) / 1000.0
-
-            stale_thr = float(INST_WS_STALE_S)
-            partial_thr = float(INST_WS_PARTIAL_STALE_S)
-
-            book_fresh = age_book_s <= partial_thr
-            trade_fresh = age_trade_s <= partial_thr
-            ticker_fresh = age_ticker_s <= stale_thr
-
-            # "available" is kept conservative for institutional_data:
-            # it typically needs funding/openInterest from ticker, so require ticker freshness.
-            available = bool(ticker_fresh)
-
-            quality_flags: List[str] = []
-            if not ticker_fresh:
-                quality_flags.append("ticker_stale")
-            if not book_fresh:
-                quality_flags.append("book_stale")
-            if not trade_fresh:
-                quality_flags.append("trade_stale")
+            age_s = (_now_ms() - latest_ms) / 1000.0
+            available = age_s <= float(INST_WS_STALE_S)
 
             tape_5m = self._compute_tape_delta_5m_locked(st)
-            tape_samples = len(st.tape) if st.tape else 0
-            tape_age_s: Optional[float] = None
-            if st.tape:
-                tape_age_s = (now_ms - int(st.tape[-1][0])) / 1000.0
 
             return {
                 "available": bool(available),
@@ -347,20 +306,11 @@ class InstitutionalWSHubShard:
                 # extra debug/info
                 "best_bid": st.book.best_bid,
                 "best_ask": st.book.best_ask,
-                "mid": st.book.mid,
                 "spread": st.book.spread,
-                "spread_bps": st.book.spread_bps,
                 "bid_depth_usd": st.book.bid_depth_usd,
                 "ask_depth_usd": st.book.ask_depth_usd,
                 "mark_price": st.ticker.mark_price,
                 "index_price": st.ticker.index_price,
-                "age_s": float((now_ms - latest_ms) / 1000.0),
-                "age_book_s": float(age_book_s),
-                "age_trade_s": float(age_trade_s),
-                "age_ticker_s": float(age_ticker_s),
-                "tape_samples": int(tape_samples),
-                "tape_age_s": tape_age_s,
-                "quality_flags": quality_flags,
                 "book_ts": st.book.ts_ms,
                 "trade_ts": st.trade.ts_ms,
                 "ticker_ts": st.ticker.ts_ms,
@@ -470,8 +420,6 @@ class InstitutionalWSHubShard:
                     autoping=False,
                     max_msg_size=0,
                 )
-                self._connect_count += 1
-                self._last_connect_ms = _now_ms()
                 self._conn_started_monotonic = time.monotonic()
                 self._last_msg_monotonic = time.monotonic()
 
@@ -498,8 +446,6 @@ class InstitutionalWSHubShard:
                     await self._handle_text(txt)
 
             except Exception as e:
-                self._error_count += 1
-                self._last_error = str(e)
                 log.warning(f"[WS_HUB:hub{self.shard_id}] ws error: {e}")
             finally:
                 if ping_task:
@@ -512,9 +458,6 @@ class InstitutionalWSHubShard:
 
             if self._stop.is_set():
                 break
-
-            # Count reconnect attempts (excluding clean stop)
-            self._reconnect_count += 1
 
             sleep_s = min(backoff, backoff_max)
             sleep_s *= 0.75 + random.random() * 0.5
@@ -535,10 +478,8 @@ class InstitutionalWSHubShard:
                 log.warning(f"[WS_HUB:hub{self.shard_id}] ws event error: {payload}")
             return
 
-        arg = payload.get("arg") or payload.get("argument") or {}
-        data = payload.get("data") or payload.get("dataList") or []
-        if isinstance(data, dict):
-            data = [data]
+        arg = payload.get("arg") or {}
+        data = payload.get("data") or []
         if not arg or not data:
             return
 
@@ -578,12 +519,8 @@ class InstitutionalWSHubShard:
 
                 if st.book.best_bid is not None and st.book.best_ask is not None and st.book.best_ask > 0:
                     st.book.spread = (st.book.best_ask - st.book.best_bid) / st.book.best_ask
-                    st.book.spread_bps = float(st.book.spread) * 10000.0 if st.book.spread is not None else None
-                    st.book.mid = (st.book.best_bid + st.book.best_ask) / 2.0
                 else:
                     st.book.spread = None
-                    st.book.spread_bps = None
-                    st.book.mid = None
 
                 st.book.bid_depth_usd = _depth_usd(bids, topn=5)
                 st.book.ask_depth_usd = _depth_usd(asks, topn=5)
