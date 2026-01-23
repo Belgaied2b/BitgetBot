@@ -24,6 +24,8 @@ from collections import deque
 import aiohttp
 
 from logger import get_logger
+import math
+import traceback
 
 log = get_logger("institutional_ws_hub")
 
@@ -33,12 +35,6 @@ log = get_logger("institutional_ws_hub")
 
 # Bitget WebSocket v2 (public)
 INST_WS_URL = os.getenv("INST_WS_URL", "wss://ws.bitget.com/v2/ws/public")
-
-# Auto-start (opt-in). Useful when other modules (e.g., institutional_data) only read snapshots.
-# If enabled, the controller can start itself lazily (best-effort) on first subscribe/get_snapshot.
-INST_WS_AUTO_START = os.getenv("INST_WS_AUTO_START", "1").strip() == "1"
-INST_WS_AUTO_SUBSCRIBE = os.getenv("INST_WS_AUTO_SUBSCRIBE", "1").strip() == "1"
-
 
 # Bitget contract WS v2 expects instType like: USDT-FUTURES / COIN-FUTURES / USDC-FUTURES
 _INST_TYPE_RAW = os.getenv("INST_WS_INST_TYPE") or os.getenv("INST_PRODUCT_TYPE_WS") or "USDT-FUTURES"
@@ -63,6 +59,15 @@ INST_PRODUCT_TYPE = _normalize_inst_type(_INST_TYPE_RAW)
 
 # Sharding (multiple WS connections)
 INST_WS_SHARDS = int(float(os.getenv("INST_WS_SHARDS", "4")))
+
+# ---------------------------------------------------------------------
+# Extra debug/telemetry flags (WS hub)
+# ---------------------------------------------------------------------
+INST_WS_AUTOSTART = str(os.getenv('INST_WS_AUTOSTART', '1')).strip() == '1'
+INST_WS_AUTO_SHARDS = str(os.getenv('INST_WS_AUTO_SHARDS', '1')).strip() == '1'
+INST_WS_SHARDS_FORCE = str(os.getenv('INST_WS_SHARDS_FORCE', '0')).strip() == '1'
+INST_WS_LOG_STACK = str(os.getenv('INST_WS_LOG_STACK', '1')).strip() == '1'
+INST_WS_HEALTH_LOG_SEC = float(os.getenv('INST_WS_HEALTH_LOG_SEC', '0'))  # 0 disables periodic health logs
 
 # Recommended by Bitget: keep <50 channels per connection for stability
 # We subscribe 3 channels per symbol -> with batch=50 args, you still may have >50 channels overall, but you control via shards.
@@ -241,6 +246,21 @@ class InstitutionalWSHubShard:
     def is_running(self) -> bool:
         return bool(self._started) and (self._ws is not None) and (not self._ws.closed)
 
+
+def status(self) -> Dict[str, Any]:
+    with self._lock:
+        return {
+            "shard_id": int(self.shard_id),
+            "running": bool(self.is_running()),
+            "started": bool(self._started),
+            "symbols": int(len(self._symbols)),
+            "ws_url": str(self.ws_url),
+            "last_msg_ts": float(self._last_msg_ts) if self._last_msg_ts else None,
+            "last_error": str(self._last_error) if self._last_error else None,
+            "reconnects": int(self._reconnects),
+            "symbol_states": int(len(self._state)),
+        }
+
     def _latest_ts_ms(self, st: _SymbolState) -> int:
         return int(max(st.book.ts_ms, st.trade.ts_ms, st.ticker.ts_ms))
 
@@ -261,23 +281,6 @@ class InstitutionalWSHubShard:
         for _, v in st.tape:
             s += float(v)
         return float(s)
-
-    @staticmethod
-    def _quality_score(*, fields: List[str], age_s: float) -> int:
-        """Quick 0..100 snapshot quality indicator (heuristic)."""
-        score = 100
-        try:
-            if age_s is not None and age_s > 0:
-                score -= int(min(45.0, (float(age_s) / float(STALE_SEC)) * 45.0))
-        except Exception:
-            pass
-        want = {"book", "ticker", "trades"}
-        try:
-            missing = want - set(fields or [])
-            score -= 15 * len(missing)
-        except Exception:
-            score -= 20
-        return max(0, min(100, int(score)))
 
     def snapshot(self, symbol: str) -> Dict[str, Any]:
         sym = _norm_symbol(symbol)
@@ -588,6 +591,22 @@ class InstitutionalWSHub:
         self._shards: List[InstitutionalWSHubShard] = []
         self._started = False
 
+
+def status(self) -> Dict[str, Any]:
+    shards = [s.status() for s in self.shards]
+    return {
+        "started": bool(self._started),
+        "running": bool(self.is_running()),
+        "inst_type": str(self.inst_type),
+        "ws_url": str(self.ws_url),
+        "symbols": int(len(self._symbols)),
+        "shards_total": int(len(shards)),
+        "shards_running": int(sum(1 for x in shards if x.get("running"))),
+        "last_msg_ts": max([x.get("last_msg_ts") for x in shards if x.get("last_msg_ts")], default=None),
+        "last_error": [x.get("last_error") for x in shards if x.get("last_error")][-1] if any(x.get("last_error") for x in shards) else None,
+        "shards": shards,
+    }
+
     def is_running(self) -> bool:
         if not self._started or not self._shards:
             return False
@@ -643,16 +662,36 @@ class _HubController:
     def is_running(self) -> bool:
         return bool(self._hub is not None and self._hub.is_running())
 
+
+    def status(self) -> Dict[str, Any]:
+        if self._hub is None:
+            return {'available': False, 'running': False, 'reason': 'hub_none'}
+        try:
+            st = self._hub.status()
+            st['available'] = True
+            return st
+        except Exception as e:
+            return {'available': True, 'running': bool(self.is_running()), 'reason': f'status_error:{type(e).__name__}:{e}'}
+
     async def start(self, symbols: List[str], shards: int = INST_WS_SHARDS) -> None:
         syms = tuple(sorted({_norm_symbol(s) for s in (symbols or []) if _norm_symbol(s)}))
+        if INST_WS_AUTO_SHARDS and not INST_WS_SHARDS_FORCE:
+            required = int(max(1, math.ceil(len(syms) / float(MAX_SYMBOLS_PER_SHARD))))
+            if required > int(shards):
+                log.info('[WS_HUB] autoscale_shards from=%s to=%s symbols=%s max_per_shard=%s', int(shards), int(required), len(syms), int(MAX_SYMBOLS_PER_SHARD))
+                shards = int(required)
         if not syms:
             log.warning("[WS_HUB] start called with empty symbols list -> not starting")
             return
 
         async with self._lock:
+            log.info('[WS_HUB_START] symbols=%s shards=%s', len(syms), int(shards))
             # already started with same universe
-            if self._hub is not None and self._symbols_fingerprint == syms and self._hub.is_running():
-                return
+            if self._hub is not None and self._symbols_fingerprint == syms:
+                if self._hub.is_running():
+                    return
+                else:
+                    log.warning('[WS_HUB_START] restart_needed reason=hub_not_running status=%s', _jex(self._hub.status(), 500))
 
             # stop previous hub if any
             if self._hub is not None:
@@ -662,11 +701,14 @@ class _HubController:
                     pass
 
             self._hub = InstitutionalWSHub(list(syms), shards=shards)
+            log.info('[WS_HUB_START] hub_created status=%s', _jex(self._hub.status(), 500))
             self._symbols_fingerprint = syms
             await self._hub.start()
+            log.info('[WS_HUB_START] hub_started running=%s status=%s', self._hub.is_running(), _jex(self._hub.status(), 500))
 
     async def stop(self) -> None:
         async with self._lock:
+            log.info('[WS_HUB_START] symbols=%s shards=%s', len(syms), int(shards))
             if self._hub is not None:
                 try:
                     await self._hub.stop()
