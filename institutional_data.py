@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import os
 import time
 from collections import deque
@@ -41,7 +40,7 @@ except Exception:  # pragma: no cover
 
 LOGGER = logging.getLogger(__name__)
 
-INST_VERSION = "UltraDesk3.4-bitget-only+ws-hub-max+funding+oi+microstructure-bands-2026-01-23"
+INST_VERSION = "UltraDesk3.1-bitget-only+funding-fallback+oi-optin+derived-2026-01-13"
 
 BITGET_API_BASE = str(os.getenv("BITGET_API_BASE", "https://api.bitget.com")).strip()
 
@@ -126,25 +125,6 @@ INST_DERIVED_ENABLED = str(os.getenv("INST_DERIVED_ENABLED", "1")).strip() == "1
 INST_DERIVED_MAX_AGE_S = float(os.getenv("INST_DERIVED_MAX_AGE_S", "10800"))  # 3h
 INST_DERIVED_MAXLEN = int(float(os.getenv("INST_DERIVED_MAXLEN", "480")))     # ~8 min sampling @1s; or ~8h @60s
 
-
-# ---------------------------------------------------------------------
-# Orderbook bands (bps) for multi-band liquidity + imbalance
-# ---------------------------------------------------------------------
-def _parse_bps_list(s: str, default: str = "10,25,50,100") -> List[float]:
-    raw = (s or default).strip()
-    out: List[float] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            out.append(float(part))
-        except Exception:
-            continue
-    return out or [10.0, 25.0, 50.0, 100.0]
-
-INST_OB_BANDS_BPS: List[float] = _parse_bps_list(str(os.getenv("INST_OB_BANDS_BPS", "10,25,50,100")))
-INST_OB_PRIMARY_BPS: float = float(os.getenv("INST_OB_PRIMARY_BPS", "25"))
 # ---------------------------------------------------------------------
 # Global rate limiting + retries
 # ---------------------------------------------------------------------
@@ -171,10 +151,6 @@ _SESSION_LOCK = asyncio.Lock()
 # ---------------------------------------------------------------------
 _FUNDING_CACHE: Dict[str, Tuple[float, float, Optional[int]]] = {}  # sym -> (funding_rate, ts_s, next_update_ms)
 _OI_CACHE: Dict[str, Tuple[float, float]] = {}  # sym -> (oi_size, ts_s)
-
-# Depth cache (orderbook) — reduces REST load (pass2 / multi-stage eval)
-_DEPTH_CACHE: Dict[str, Tuple[Dict[str, Any], float]] = {}  # sym -> (depth_dict, ts_s)
-_DEPTH_TTL_S = float(os.getenv("INST_DEPTH_TTL_S", "3.0"))
 
 _FUNDING_TTL_S = float(os.getenv("INST_FUNDING_TTL_S", "45"))
 _OI_TTL_S = float(os.getenv("INST_OI_TTL_S", "45"))
@@ -372,7 +348,11 @@ def _ws_snapshot(symbol: str) -> Optional[Dict[str, Any]]:
     try:
         if not _ws_hub_running():
             if INST_TRACE_WS:
-                LOGGER.info("[INST_WS] sym=%s hub_not_running", symbol)
+                try:
+                    st = _WS_HUB.status() if hasattr(_WS_HUB, "status") else None
+                except Exception as _e:
+                    st = {"status_error": f"{type(_e).__name__}:{_e}"}
+                LOGGER.info("[INST_WS] sym=%s hub_not_running status=%s", symbol, st)
             return None
 
         snap = _WS_HUB.get_snapshot(symbol)
@@ -483,72 +463,6 @@ def _compute_microprice_from_depth(depth: Dict[str, Any]) -> Optional[float]:
     except Exception:
         return None
 
-
-
-# =====================================================================
-# Bitget response parsing helpers (robust)
-# =====================================================================
-
-def _unwrap_data_envelope(resp: Any) -> Any:
-    """Bitget v2 typically returns {code,msg,requestTime,data:<obj or list>}"""
-    if not isinstance(resp, dict):
-        return resp
-    return resp.get("data", resp)
-
-
-def _first_dict(x: Any) -> Optional[Dict[str, Any]]:
-    if isinstance(x, dict):
-        return x
-    if isinstance(x, list) and x:
-        if isinstance(x[0], dict):
-            return x[0]
-    return None
-
-
-def _to_float_safe(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        v = float(x)
-        if v != v:  # NaN
-            return None
-        return v
-    except Exception:
-        return None
-
-
-def _normalize_book_side(side: Any, *, is_bids: bool) -> List[List[float]]:
-    """Normalize bids/asks to [[price, size], ...] float pairs."""
-    out: List[List[float]] = []
-    if not isinstance(side, list) or not side:
-        return out
-
-    # Common formats:
-    # 1) [[price, size], ...] where values are str/float
-    # 2) [{"price": "...", "size": "..."}, ...]
-    for row in side:
-        try:
-            if isinstance(row, (list, tuple)) and len(row) >= 2:
-                p = _to_float_safe(row[0])
-                q = _to_float_safe(row[1])
-            elif isinstance(row, dict):
-                p = _to_float_safe(row.get("price") or row.get("p"))
-                q = _to_float_safe(row.get("size") or row.get("qty") or row.get("q"))
-            else:
-                continue
-
-            if p is None or q is None:
-                continue
-            if p <= 0 or q <= 0:
-                continue
-            out.append([float(p), float(q)])
-        except Exception:
-            continue
-
-    # Ensure best-first ordering
-    if out:
-        out.sort(key=lambda x: x[0], reverse=bool(is_bids))
-    return out
 
 # =====================================================================
 # Normalization (rolling z-scores)
@@ -731,71 +645,25 @@ def _delta(series: _Series, now_ms: int, horizon_s: float) -> Optional[float]:
 # =====================================================================
 # Bitget confirmed endpoints
 # =====================================================================
-
 async def _fetch_merge_depth(symbol: str) -> Optional[Dict[str, Any]]:
-    now_s = time.time()
-    c = _DEPTH_CACHE.get(symbol)
-    if c is not None:
-        depth_cached, ts_s = c
-        if (now_s - ts_s) <= float(_DEPTH_TTL_S):
-            return depth_cached
-
-    resp = await _http_get(
-
+    data = await _http_get(
         "/api/v2/mix/market/merge-depth",
         params={"productType": INST_BITGET_PRODUCT_TYPE, "symbol": symbol},
         symbol=symbol,
     )
-    if not isinstance(resp, dict):
-        if INST_TRACE_PARSE:
-            LOGGER.info("[INST_PARSE] merge-depth sym=%s unexpected_type=%s", symbol, type(resp).__name__)
+    if not isinstance(data, dict):
+        return None
+    d = data.get("data")
+    if not isinstance(d, dict):
         return None
 
-    inner = _unwrap_data_envelope(resp)
-    d0 = _first_dict(inner)
-    if d0 is None:
-        if INST_TRACE_PARSE:
-            LOGGER.info("[INST_PARSE] merge-depth sym=%s inner_type=%s", symbol, type(inner).__name__)
-        return None
-
-    bids = d0.get("bids") or d0.get("bid")
-    asks = d0.get("asks") or d0.get("ask")
-
-    # Some variants wrap book under another key
-    if (not isinstance(bids, list) or not isinstance(asks, list)) and isinstance(d0.get("data"), dict):
-        dd = d0.get("data") or {}
-        bids = bids if isinstance(bids, list) else (dd.get("bids") or dd.get("bid"))
-        asks = asks if isinstance(asks, list) else (dd.get("asks") or dd.get("ask"))
-
+    bids = d.get("bids")
+    asks = d.get("asks")
     if not isinstance(bids, list) or not isinstance(asks, list):
-        if INST_TRACE_PARSE:
-            LOGGER.info(
-                "[INST_PARSE] merge-depth sym=%s bids_type=%s asks_type=%s keys=%s",
-                symbol,
-                type(bids).__name__,
-                type(asks).__name__,
-                list(d0.keys())[:24],
-            )
         return None
 
-    bids_n = _normalize_book_side(bids, is_bids=True)
-    asks_n = _normalize_book_side(asks, is_bids=False)
-    if not bids_n or not asks_n:
-        if INST_TRACE_PARSE:
-            LOGGER.info(
-                "[INST_PARSE] merge-depth sym=%s normalized_empty bids_raw_len=%s asks_raw_len=%s",
-                symbol,
-                len(bids),
-                len(asks),
-            )
-        return None
+    return {"bids": bids, "asks": asks}
 
-    depth_out = {"bids": bids_n, "asks": asks_n}
-    try:
-        _DEPTH_CACHE[symbol] = (depth_out, now_s)
-    except Exception:
-        pass
-    return depth_out
 
 async def _fetch_funding_history(symbol: str, limit: int = 30) -> Optional[List[Dict[str, Any]]]:
     data = await _http_get(
@@ -821,7 +689,6 @@ def _parse_next_update_ms(d0: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-
 async def _fetch_current_funding_rate(symbol: str) -> Tuple[Optional[float], Optional[int]]:
     now_s = time.time()
     c = _FUNDING_CACHE.get(symbol)
@@ -830,38 +697,34 @@ async def _fetch_current_funding_rate(symbol: str) -> Tuple[Optional[float], Opt
         if (now_s - ts_s) <= float(_FUNDING_TTL_S):
             return float(fr), next_ms
 
-    resp = await _http_get(
+    data = await _http_get(
         "/api/v2/mix/market/current-fund-rate",
         params={"productType": INST_BITGET_PRODUCT_TYPE, "symbol": symbol},
         symbol=symbol,
     )
-    if not isinstance(resp, dict):
-        if INST_TRACE_PARSE:
-            LOGGER.info("[INST_PARSE] current-fund-rate sym=%s unexpected_type=%s", symbol, type(resp).__name__)
+    if not isinstance(data, dict):
         return None, None
 
-    inner = _unwrap_data_envelope(resp)
-    d0 = _first_dict(inner)
-    if d0 is None and isinstance(inner, dict):
-        d0 = inner
+    arr = data.get("data")
+    if not isinstance(arr, list) or not arr:
+        return None, None
 
+    d0 = arr[0]
     if not isinstance(d0, dict):
-        if INST_TRACE_PARSE:
-            LOGGER.info("[INST_PARSE] current-fund-rate sym=%s inner_type=%s", symbol, type(inner).__name__)
         return None, None
 
-    fr = _to_float_safe(d0.get("fundingRate"))
-    if fr is None:
-        fr = _to_float_safe(d0.get("funding_rate"))
-    if fr is None:
-        fr = _to_float_safe(d0.get("funding"))
+    fr: Optional[float]
+    try:
+        fr = float(d0.get("fundingRate"))
+    except Exception:
+        fr = None
 
     next_ms = _parse_next_update_ms(d0)
 
     if fr is not None:
         _FUNDING_CACHE[symbol] = (float(fr), now_s, next_ms)
 
-    return (float(fr) if fr is not None else None), next_ms
+    return fr, next_ms
 
 
 async def _fetch_open_interest(symbol: str) -> Optional[float]:
@@ -872,48 +735,37 @@ async def _fetch_open_interest(symbol: str) -> Optional[float]:
         if (now_s - ts_s) <= float(_OI_TTL_S):
             return float(oi)
 
-    resp = await _http_get(
+    data = await _http_get(
         "/api/v2/mix/market/open-interest",
         params={"productType": INST_BITGET_PRODUCT_TYPE, "symbol": symbol},
         symbol=symbol,
     )
-    if not isinstance(resp, dict):
-        if INST_TRACE_PARSE:
-            LOGGER.info("[INST_PARSE] open-interest sym=%s unexpected_type=%s", symbol, type(resp).__name__)
+    if not isinstance(data, dict):
         return None
 
-    inner = _unwrap_data_envelope(resp)
+    d = data.get("data")
+    if not isinstance(d, dict):
+        return None
 
-    d0: Optional[Dict[str, Any]] = None
-    if isinstance(inner, dict):
-        # Preferred: openInterestList
-        lst = inner.get("openInterestList")
-        if isinstance(lst, list) and lst and isinstance(lst[0], dict):
-            d0 = lst[0]
-        if d0 is None:
-            d0 = inner
-    elif isinstance(inner, list) and inner and isinstance(inner[0], dict):
-        d0 = inner[0]
+    lst = d.get("openInterestList")
+    if not isinstance(lst, list) or not lst:
+        return None
 
+    d0 = lst[0]
     if not isinstance(d0, dict):
-        if INST_TRACE_PARSE:
-            LOGGER.info("[INST_PARSE] open-interest sym=%s inner_type=%s", symbol, type(inner).__name__)
         return None
 
-    oi = _to_float_safe(d0.get("size"))
-    if oi is None:
-        oi = _to_float_safe(d0.get("openInterest"))
-    if oi is None:
-        oi = _to_float_safe(d0.get("open_interest"))
-    if oi is None:
-        oi = _to_float_safe(d0.get("openInterestAmount"))
-    if oi is None:
-        oi = _to_float_safe(d0.get("openInterestValue"))
+    oi: Optional[float]
+    try:
+        oi = float(d0.get("size"))
+    except Exception:
+        oi = None
 
     if oi is not None:
         _OI_CACHE[symbol] = (float(oi), now_s)
 
-    return float(oi) if oi is not None else None
+    return oi
+
 
 def _compute_funding_stats_bitget(hist: Optional[List[Dict[str, Any]]]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     try:
@@ -1042,13 +894,7 @@ def _available_components_list(payload: Dict[str, Any]) -> List[str]:
     if payload.get("spread_bps") is not None:
         out.append("spread")
     if payload.get("depth_usd_25bps") is not None:
-        out.append("depth_25")
-    if payload.get("depth_usd_50bps") is not None:
-        out.append("depth_50")
-    if payload.get("depth_usd_100bps") is not None:
-        out.append("depth_100")
-    if payload.get("liquidity_score") is not None:
-        out.append("liquidity_score")
+        out.append("depth")
     if payload.get("funding_z") is not None:
         out.append("funding_hist")
     if payload.get("ws_snapshot_used"):
@@ -1066,7 +912,6 @@ def _available_components_list(payload: Dict[str, Any]) -> List[str]:
     if payload.get("funding_change_1h") is not None:
         out.append("funding_change_1h")
     return out
-
 
 
 async def compute_full_institutional_analysis(
@@ -1120,59 +965,13 @@ async def compute_full_institutional_analysis(
     ob_25 = None
     spread_bps = None
     microprice = None
-    mid_price = None
-
     depth_bid_usd_25 = depth_ask_usd_25 = depth_usd_25 = None
 
-    # Multi-band orderbook metrics (bps -> {imb, bid_usd, ask_usd, depth_usd})
-    ob_bands: Dict[float, Dict[str, Optional[float]]] = {}
-
     if isinstance(depth, dict):
-        # mid (best bid/ask)
-        try:
-            bids0 = depth.get("bids") or []
-            asks0 = depth.get("asks") or []
-            if bids0 and asks0:
-                b0p = float(bids0[0][0])
-                a0p = float(asks0[0][0])
-                if b0p > 0 and a0p > 0:
-                    mid_price = (b0p + a0p) / 2.0
-        except Exception:
-            mid_price = None
-
-        # compute per-band imbalance + depth notional
-        for bps in INST_OB_BANDS_BPS:
-            imb, bid_val, ask_val = _compute_orderbook_band_metrics(depth, band_bps=float(bps))
-            depth_val = None
-            if bid_val is not None and ask_val is not None:
-                try:
-                    depth_val = float(bid_val + ask_val)
-                except Exception:
-                    depth_val = None
-            ob_bands[float(bps)] = {
-                "imb": imb,
-                "bid_usd": bid_val,
-                "ask_usd": ask_val,
-                "depth_usd": depth_val,
-            }
-
-        # primary band (keeps legacy 25bps keys, but configurable)
-        try:
-            target = float(INST_OB_PRIMARY_BPS)
-        except Exception:
-            target = 25.0
-        chosen = None
-        if ob_bands:
-            if target in ob_bands:
-                chosen = target
-            else:
-                chosen = min(ob_bands.keys(), key=lambda x: abs(x - target))
-        if chosen is not None:
-            ob_25 = ob_bands[chosen].get("imb")
-            depth_bid_usd_25 = ob_bands[chosen].get("bid_usd")
-            depth_ask_usd_25 = ob_bands[chosen].get("ask_usd")
-            depth_usd_25 = ob_bands[chosen].get("depth_usd")
-
+        ob_25, b25, a25 = _compute_orderbook_band_metrics(depth, band_bps=25.0)
+        depth_bid_usd_25, depth_ask_usd_25 = b25, a25
+        if b25 is not None and a25 is not None:
+            depth_usd_25 = float(b25 + a25)
         spread_bps = _compute_spread_bps_from_depth(depth)
         microprice = _compute_microprice_from_depth(depth)
 
@@ -1270,75 +1069,12 @@ async def compute_full_institutional_analysis(
         except Exception:
             funding_flip = None
 
-    
-    # Convenience band fields (for downstream filters / debugging)
-    def _band_val(bps: float, key: str) -> Optional[float]:
-        try:
-            d = ob_bands.get(float(bps)) if 'ob_bands' in locals() else None
-            if isinstance(d, dict):
-                return d.get(key)  # type: ignore
-        except Exception:
-            return None
-        return None
-
-    ob_imb_10bps = _band_val(10.0, "imb")
-    ob_imb_50bps = _band_val(50.0, "imb")
-    ob_imb_100bps = _band_val(100.0, "imb")
-
-    depth_bid_usd_10bps = _band_val(10.0, "bid_usd")
-    depth_ask_usd_10bps = _band_val(10.0, "ask_usd")
-    depth_usd_10bps = _band_val(10.0, "depth_usd")
-
-    depth_bid_usd_50bps = _band_val(50.0, "bid_usd")
-    depth_ask_usd_50bps = _band_val(50.0, "ask_usd")
-    depth_usd_50bps = _band_val(50.0, "depth_usd")
-
-    depth_bid_usd_100bps = _band_val(100.0, "bid_usd")
-    depth_ask_usd_100bps = _band_val(100.0, "ask_usd")
-    depth_usd_100bps = _band_val(100.0, "depth_usd")
-
-    # Liquidity score combines depth + spread (log-scaled). Higher = better liquidity.
-    liquidity_score = None
-    if depth_usd_25 is not None and spread_bps is not None:
-        try:
-            d = float(depth_usd_25)
-            s = float(spread_bps)
-            if d >= 0.0 and s >= 0.0:
-                liquidity_score = float(math.log10(d + 1.0) - math.log10(s + 1.0))
-        except Exception:
-            liquidity_score = None
-
-    depth_ratio = None
-    if depth_bid_usd_25 is not None and depth_ask_usd_25 is not None:
-        try:
-            a = float(depth_ask_usd_25)
-            if a > 1e-12:
-                depth_ratio = float(float(depth_bid_usd_25) / a)
-        except Exception:
-            depth_ratio = None
     ob_imb_z = _norm_update(sym, "ob_imb", ob_25)
     spread_bps_z = _norm_update(sym, "spread_bps", spread_bps)
     depth_25_z = _norm_update(sym, "depth_25", depth_usd_25)
-    liquidity_score_z = _norm_update(sym, "liq_score", liquidity_score)
-    depth_50_z = _norm_update(sym, "depth_50", depth_usd_50bps)
-    depth_100_z = _norm_update(sym, "depth_100", depth_usd_100bps)
     oi_z = _norm_update(sym, "oi", oi_value) if oi_value is not None else None
     funding_z2 = _norm_update(sym, "funding", funding_rate) if funding_rate is not None else None
 
-
-    oi_usd = None
-    if oi_value is not None and mid_price is not None:
-        try:
-            oi_usd = float(float(oi_value) * float(mid_price))
-        except Exception:
-            oi_usd = None
-
-    funding_rate_bps = None
-    if funding_rate is not None:
-        try:
-            funding_rate_bps = float(float(funding_rate) * 10000.0)
-        except Exception:
-            funding_rate_bps = None
     funding_regime = _classify_funding(funding_rate, z=funding_z if funding_z is not None else funding_z2)
     ob_regime = _classify_orderbook(ob_25)
 
@@ -1384,14 +1120,12 @@ async def compute_full_institutional_analysis(
         "available": bool(depth is not None or ws_used or (funding_rate is not None) or (oi_value is not None)),
 
         "oi": oi_value,
-        "oi_usd": oi_usd,
         "oi_slope": oi_change_1h_pct,
 
         "cvd_slope": None,
         "cvd_notional_5m": None,
 
         "funding_rate": funding_rate,
-        "funding_rate_bps": funding_rate_bps,
         "funding_regime": funding_regime,
         "funding_mean": funding_mean,
         "funding_std": funding_std,
@@ -1412,29 +1146,6 @@ async def compute_full_institutional_analysis(
         "spread_bps": spread_bps,
         "spread_bps_z": spread_bps_z,
         "microprice": microprice,
-        "mid_price": mid_price,
-        "depth_ratio_25bps": depth_ratio,
-        "liquidity_score": liquidity_score,
-        "liquidity_score_z": liquidity_score_z,
-
-        "orderbook_imb_10bps": ob_imb_10bps,
-        "orderbook_imb_50bps": ob_imb_50bps,
-        "orderbook_imb_100bps": ob_imb_100bps,
-
-        "depth_bid_usd_10bps": depth_bid_usd_10bps,
-        "depth_ask_usd_10bps": depth_ask_usd_10bps,
-        "depth_usd_10bps": depth_usd_10bps,
-
-        "depth_bid_usd_50bps": depth_bid_usd_50bps,
-        "depth_ask_usd_50bps": depth_ask_usd_50bps,
-        "depth_usd_50bps": depth_usd_50bps,
-        "depth_50bps_z": depth_50_z,
-
-        "depth_bid_usd_100bps": depth_bid_usd_100bps,
-        "depth_ask_usd_100bps": depth_ask_usd_100bps,
-        "depth_usd_100bps": depth_usd_100bps,
-        "depth_100bps_z": depth_100_z,
-
 
         "depth_bid_usd_25bps": depth_bid_usd_25,
         "depth_ask_usd_25bps": depth_ask_usd_25,
