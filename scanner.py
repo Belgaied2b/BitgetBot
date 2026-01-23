@@ -63,6 +63,16 @@ from settings import (
 
 from bitget_client import get_client
 from bitget_trader import BitgetTrader
+# ---------------------------------------------------------------------
+# Optional Institutional WS hub (public, read-only) — auto-start from scanner
+# ---------------------------------------------------------------------
+try:
+    from institutional_ws_hub import HUB as INST_WS_HUB  # type: ignore
+except Exception:
+    INST_WS_HUB = None  # type: ignore
+
+INST_WS_AUTOSTART = str(os.getenv("INST_WS_AUTOSTART", "1")).strip() == "1"
+INST_WS_HEALTH_EVERY_SCANS = int(float(os.getenv("INST_WS_HEALTH_EVERY_SCANS", "5")))
 from analyze_signal import SignalAnalyzer
 
 from structure_utils import analyze_structure, htf_trend_ok
@@ -70,75 +80,6 @@ from structure_utils import analyze_structure, htf_trend_ok
 from duplicate_guard import DuplicateGuard, fingerprint as make_fingerprint
 from risk_manager import RiskManager
 from retry_utils import retry_async
-
-
-# ---------------------------------------------------------------------
-# Optional: Institutional WS hub (auto-start)
-# ---------------------------------------------------------------------
-try:
-    from institutional_ws_hub import HUB as WS_HUB  # type: ignore
-except Exception:  # pragma: no cover
-    WS_HUB = None  # type: ignore
-
-def _env_bool(key: str, default: bool) -> bool:
-    v = str(os.getenv(key, "1" if default else "0")).strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
-
-# If enabled, the scanner will start the WS hub once per scan (idempotent),
-# so institutional_data can consume real-time snapshots (tape/funding/OI).
-INST_USE_WS_HUB = _env_bool("INST_USE_WS_HUB", True)
-INST_WS_AUTO_START = _env_bool("INST_WS_AUTO_START", True)
-INST_WS_WARMUP_SEC = float(os.getenv("INST_WS_WARMUP_SEC", "1.2"))
-INST_WS_SHARDS = int(os.getenv("INST_WS_SHARDS", os.getenv("INST_WS_SHARDS_COUNT", "4")))
-
-_WS_HUB_FP: Optional[str] = None
-
-async def _ensure_ws_hub(symbols: List[str]) -> bool:
-    """Start the institutional WS hub (if enabled). Returns True if (re)started."""
-    global _WS_HUB_FP
-
-    if (not INST_USE_WS_HUB) or (not INST_WS_AUTO_START):
-        return False
-    if WS_HUB is None:
-        return False
-
-    # normalize + dedupe
-    syms = sorted({str(s).upper().strip() for s in (symbols or []) if str(s).strip()})
-    if not syms:
-        return False
-
-    fp = "|".join(syms)
-
-    try:
-        running_attr = getattr(WS_HUB, "is_running", False)
-        running = bool(running_attr() if callable(running_attr) else running_attr)
-    except Exception:
-        running = False
-
-    # already running with same universe: nothing to do
-    if running and (_WS_HUB_FP == fp):
-        return False
-
-    try:
-        await WS_HUB.start(
-            symbols=syms,
-            productType=str(os.getenv("INST_BITGET_PRODUCT_TYPE", "usdt-futures")).strip(),
-            shards=int(INST_WS_SHARDS),
-            baseUrl=str(os.getenv("BITGET_API_BASE", "https://api.bitget.com")).strip(),
-        )
-        _WS_HUB_FP = fp
-
-        # allow the hub to connect + subscribe before first inst calls
-        if float(INST_WS_WARMUP_SEC) > 0:
-            await asyncio.sleep(float(INST_WS_WARMUP_SEC))
-
-        logger.info("[WS_HUB] running=%s symbols=%s shards=%s", True, len(syms), int(INST_WS_SHARDS))
-        return True
-    except Exception as e:
-        logger.warning("[WS_HUB] auto_start_failed err=%s", e)
-        return False
-
-
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +119,43 @@ ENTRY_TTL_OTE_PULLBACK_S = int(os.getenv("ENTRY_TTL_OTE_PULLBACK_S", str(max(900
 RUNAWAY_ATR_MULT_MARKET = float(os.getenv("RUNAWAY_ATR_MULT_MARKET", "1.0"))
 RUNAWAY_ATR_MULT_PULLBACK = float(os.getenv("RUNAWAY_ATR_MULT_PULLBACK", "1.5"))
 
+
+
+async def _ws_hub_autostart(client: "BitgetClient") -> None:
+    """Start the institutional WS hub once, with a broad symbol universe."""
+    if not INST_WS_AUTOSTART or INST_WS_HUB is None:
+        return
+    try:
+        # Prefer the same contract list the scanner uses, so WS coverage matches scan universe.
+        symbols = await client.get_contracts_list(product_type=BITGET_PRODUCT_TYPE)
+        symbols = [s for s in (symbols or []) if isinstance(s, str) and s.endswith("USDT")]
+        if not symbols:
+            LOGGER.warning("[WS_HUB_AUTO] no_symbols -> skip")
+            return
+
+        await INST_WS_HUB.start(symbols)
+        LOGGER.info("[WS_HUB_AUTO] start_called symbols=%s running=%s status=%s", len(symbols), bool(INST_WS_HUB.is_running()), getattr(INST_WS_HUB, "status", lambda: None)())
+    except Exception as e:
+        LOGGER.error("[WS_HUB_AUTO] start_error=%s", e)
+        try:
+            import traceback as _tb
+            LOGGER.error("[WS_HUB_AUTO] trace=%s", _tb.format_exc())
+        except Exception:
+            pass
+
+
+def _ws_hub_health_log(scan_idx: int) -> None:
+    if INST_WS_HUB is None:
+        return
+    if int(INST_WS_HEALTH_EVERY_SCANS) <= 0:
+        return
+    if scan_idx % int(INST_WS_HEALTH_EVERY_SCANS) != 0:
+        return
+    try:
+        st = getattr(INST_WS_HUB, "status", lambda: None)()
+        LOGGER.info("[WS_HUB_HEALTH] scan=%s running=%s status=%s", int(scan_idx), bool(INST_WS_HUB.is_running()), st)
+    except Exception as e:
+        LOGGER.warning("[WS_HUB_HEALTH] scan=%s status_error=%s", int(scan_idx), e)
 # ✅ Runaway policy flags
 RUNAWAY_ENABLE = str(os.getenv("RUNAWAY_ENABLE", "1")).strip() == "1"
 
@@ -1670,6 +1648,7 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
 async def _watcher_loop(trader: BitgetTrader) -> None:
     logger.info("[WATCHER] started (interval=%.1fs)", WATCH_INTERVAL_S)
 
+    scan_idx = 0
     while True:
         await asyncio.sleep(WATCH_INTERVAL_S)
 
@@ -2236,15 +2215,6 @@ async def scan_once(client, trader: BitgetTrader) -> None:
         return
 
     symbols = sorted(set(map(str.upper, symbols)))[: int(TOP_N_SYMBOLS)]
-
-    # -----------------------------------------------------------------
-    # Auto-start WS hub for the symbols we are about to scan
-    # (idempotent; warms up only when it (re)starts)
-    # -----------------------------------------------------------------
-    try:
-        await _ensure_ws_hub(symbols)
-    except Exception:
-        pass
     logger.info("📊 Scan %d symboles (TOP_N_SYMBOLS=%s)", len(symbols), TOP_N_SYMBOLS)
 
     analyze_sem = asyncio.Semaphore(int(MAX_CONCURRENT_ANALYZE))
