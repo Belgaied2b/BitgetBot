@@ -29,18 +29,18 @@ import pandas as pd
 # Optional desk context (macro + options)
 # ---------------------------------------------------------------------
 try:
-    from macro_data import MacroCache  # type: ignore
+    from macro_data_improved import MacroCache  # type: ignore
 except Exception:
     MacroCache = None  # type: ignore
 
 try:
-    from options_data import OptionsCache  # type: ignore
+    from options_data_improved import OptionsCache  # type: ignore
 except Exception:
     OptionsCache = None  # type: ignore
 
 try:
-    # NEW (preferred): from improved options_data.py
-    from options_data import score_options_context  # type: ignore
+    # NEW (preferred): from improved options_data
+    from options_data_improved import score_options_context  # type: ignore
 except Exception:
     score_options_context = None  # type: ignore
 
@@ -78,7 +78,7 @@ from analyze_signal import SignalAnalyzer
 from structure_utils import analyze_structure, htf_trend_ok
 
 from duplicate_guard import DuplicateGuard, fingerprint as make_fingerprint
-from risk_manager import RiskManager
+from risk_manager_improved import RiskManager  # ← remplacez risk_manager par risk_manager_improved
 from retry_utils import retry_async
 
 logger = logging.getLogger(__name__)
