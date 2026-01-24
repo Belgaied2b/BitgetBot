@@ -1,0 +1,29 @@
+# Example settings file for BitgetBot (TOML format).
+# Values here override defaults defined in settings_improved.py.
+
+[risk]
+risk_usdt = 100.0              # USDT risk per trade
+equity_usdt = 10000.0          # Account equity
+max_gross_exposure = 100000.0  # Maximum allowable gross exposure in USD
+per_symbol_limit = 20000.0     # Maximum allowable exposure per symbol in USD
+base_notional = 1000.0         # Base notional size for a single trade
+
+[scanner]
+max_concurrent_tasks = 10      # Maximum concurrent scanning tasks
+order_timeout_sec = 5.0        # Time‑out for order placement in seconds
+
+[tp_clamp]
+momentum_coeff = 0.6           # Weight for momentum in TP calculation
+atr_coeff = 1.0                # Weight for ATR in TP calculation
+liquidity_coeff = 0.4          # Weight for liquidity in TP calculation
+rr_multiplier = 2.0            # Risk reward multiplier for TP2
+min_distance_ticks = 1.0       # Minimum distance between entry and TP
+
+[macro]
+window_size = 14               # Window size for smoothing volatility and correlation
+
+[options]
+window_size = 14               # Window size for smoothing implied volatility
+
+[analyzer]
+confidence_threshold = 0.5      # Minimum (confidence - risk_factor) to accept a signal
