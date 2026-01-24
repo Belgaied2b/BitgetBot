@@ -81,6 +81,11 @@ from duplicate_guard import DuplicateGuard, fingerprint as make_fingerprint
 from risk_manager import RiskManager
 from retry_utils import retry_async
 
+# Import de la constante publique pour les contrats Bitget (WS hub)
+from settings import INST_BITGET_PRODUCT_TYPE
+# Définition d'un alias pour la compatibilité avec l'ancien code
+BITGET_PRODUCT_TYPE = INST_BITGET_PRODUCT_TYPE
+
 logger = logging.getLogger(__name__)
 # Alias pour compatibilité : LOGGER et logger sont identiques
 LOGGER = logger
