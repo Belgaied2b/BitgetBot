@@ -17,7 +17,6 @@ import os
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, Tuple, List
-from ai_model import predict_vol_liquidity, score_signal
 
 import numpy asnp
 import pandas as pd
