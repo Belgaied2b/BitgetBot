@@ -23,6 +23,8 @@ import uuid
 from collections import Counter
 from typing import Any, Dict, Tuple, Optional, List
 
+from ai_model import predict_vol_liquidity, score_signal
+
 import pandas as pd
 
 # ---------------------------------------------------------------------
