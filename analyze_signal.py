@@ -18,7 +18,7 @@ from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, Tuple, List
 
-import numpy asnp
+import numpy as np
 import pandas as pd
 
 from structure_utils import (
