@@ -78,7 +78,7 @@ from analyze_signal import SignalAnalyzer
 from structure_utils import analyze_structure, htf_trend_ok
 
 from duplicate_guard import DuplicateGuard, fingerprint as make_fingerprint
-from risk_manager_improved import RiskManager  # ← remplacez risk_manager par risk_manager_improved
+from risk_manager import RiskManager
 from retry_utils import retry_async
 
 logger = logging.getLogger(__name__)
