@@ -82,6 +82,8 @@ from risk_manager import RiskManager
 from retry_utils import retry_async
 
 logger = logging.getLogger(__name__)
+# Alias pour compatibilité : LOGGER et logger sont identiques
+LOGGER = logger
 
 # =====================================================================
 # Runtime globals
