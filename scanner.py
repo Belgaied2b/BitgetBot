@@ -134,7 +134,7 @@ async def _ws_hub_autostart(client: "BitgetClient") -> None:
         return
     try:
         # Prefer the same contract list the scanner uses, so WS coverage matches scan universe.
-        symbols = await client.get_contracts_list(product_type=BITGET_PRODUCT_TYPE)
+        symbols = await client.get_contracts_list()
         symbols = [s for s in (symbols or []) if isinstance(s, str) and s.endswith("USDT")]
         if not symbols:
             LOGGER.warning("[WS_HUB_AUTO] no_symbols -> skip")
