@@ -90,6 +90,19 @@ TAPE_WINDOW_S = float(os.getenv("INST_TAPE_WINDOW_S", "300"))  # 5 minutes
 # Outgoing message rate limit (Bitget: <=10 msg/s). Keep margin.
 INST_WS_MAX_SEND_PER_SEC = float(os.getenv("INST_WS_MAX_SEND_PER_SEC", "8"))
 
+# Maximum number of symbols allowed per shard when automatically scaling shards.
+# If the environment variable is not provided, default to 30 symbols per shard.
+MAX_SYMBOLS_PER_SHARD = int(os.getenv("MAX_SYMBOLS_PER_SHARD", "30"))
+
+# Helper to safely JSON-serialize a Python object for logging without dumping
+# huge payloads.  Takes the first `length` characters of the JSON dump.
+def _jex(obj: Any, length: int = 500) -> str:
+    try:
+        s = json.dumps(obj, default=str)
+        return s[:length]
+    except Exception:
+        return str(obj)[:length]
+
 # Channels (Bitget Futures WS public)
 CHAN_BOOKS = "books5"
 CHAN_TRADES = "trade"
@@ -177,7 +190,6 @@ def _decode_ws_payload(msg: aiohttp.WSMessage) -> Optional[str]:
         return None
     return None
 
-
 # ========================
 # Internal states
 # ========================
@@ -219,7 +231,6 @@ class _SymbolState:
     # rolling signed notional for tape delta
     tape: Deque[Tuple[int, float]] = field(default_factory=lambda: deque(maxlen=6000))
 
-
 # ========================
 # Shard
 # ========================
@@ -243,23 +254,31 @@ class InstitutionalWSHubShard:
         self._last_send_monotonic = 0.0
         self._conn_started_monotonic = 0.0
 
+        # additional state for status reporting
+        self._lock = threading.Lock()
+        self._last_msg_ts: Optional[float] = None
+        self._last_error: Optional[str] = None
+        self._reconnects: int = 0
+        # store current ws url for status output
+        self.ws_url: str = INST_WS_URL
+
     def is_running(self) -> bool:
         return bool(self._started) and (self._ws is not None) and (not self._ws.closed)
 
-
-def status(self) -> Dict[str, Any]:
-    with self._lock:
-        return {
-            "shard_id": int(self.shard_id),
-            "running": bool(self.is_running()),
-            "started": bool(self._started),
-            "symbols": int(len(self._symbols)),
-            "ws_url": str(self.ws_url),
-            "last_msg_ts": float(self._last_msg_ts) if self._last_msg_ts else None,
-            "last_error": str(self._last_error) if self._last_error else None,
-            "reconnects": int(self._reconnects),
-            "symbol_states": int(len(self._state)),
-        }
+    def status(self) -> Dict[str, Any]:
+        """Return a summary of this shard's state for monitoring."""
+        with self._lock:
+            return {
+                "shard_id": int(self.shard_id),
+                "running": bool(self.is_running()),
+                "started": bool(self._started),
+                "symbols": int(len(self.symbols)),
+                "ws_url": str(self.ws_url),
+                "last_msg_ts": float(self._last_msg_ts) if self._last_msg_ts else None,
+                "last_error": str(self._last_error) if self._last_error else None,
+                "reconnects": int(self._reconnects),
+                "symbol_states": int(len(self._states)),
+            }
 
     def _latest_ts_ms(self, st: _SymbolState) -> int:
         return int(max(st.book.ts_ms, st.trade.ts_ms, st.ticker.ts_ms))
@@ -417,6 +436,7 @@ def status(self) -> Dict[str, Any]:
             ping_task: Optional[asyncio.Task] = None
             try:
                 log.info(f"[WS_HUB:hub{self.shard_id}] connecting {INST_WS_URL}")
+                self.ws_url = INST_WS_URL
                 self._ws = await self._session.ws_connect(
                     INST_WS_URL,
                     heartbeat=None,    # we manage ping manually
@@ -425,6 +445,8 @@ def status(self) -> Dict[str, Any]:
                 )
                 self._conn_started_monotonic = time.monotonic()
                 self._last_msg_monotonic = time.monotonic()
+                # update last_msg_ts in real time for status
+                self._last_msg_ts = float(_now_ms())
 
                 await self._subscribe()
                 ping_task = asyncio.create_task(self._ping_loop(), name=f"ws_ping_{self.shard_id}")
@@ -433,6 +455,7 @@ def status(self) -> Dict[str, Any]:
 
                 async for msg in self._ws:
                     self._last_msg_monotonic = time.monotonic()
+                    self._last_msg_ts = float(_now_ms())
 
                     # proactive reconnect before max lifetime
                     if float(INST_WS_MAX_LIFETIME_S) > 0:
@@ -449,6 +472,7 @@ def status(self) -> Dict[str, Any]:
                     await self._handle_text(txt)
 
             except Exception as e:
+                self._last_error = str(e)
                 log.warning(f"[WS_HUB:hub{self.shard_id}] ws error: {e}")
             finally:
                 if ping_task:
@@ -459,6 +483,8 @@ def status(self) -> Dict[str, Any]:
                         pass
                 await self._close_ws()
 
+            # increase reconnection count and apply backoff
+            self._reconnects += 1
             if self._stop.is_set():
                 break
 
@@ -579,7 +605,6 @@ def status(self) -> Dict[str, Any]:
                 st.ticker.ts_ms = ts_ms
                 return
 
-
 # ========================
 # Hub (sharded)
 # ========================
@@ -591,21 +616,21 @@ class InstitutionalWSHub:
         self._shards: List[InstitutionalWSHubShard] = []
         self._started = False
 
-
-def status(self) -> Dict[str, Any]:
-    shards = [s.status() for s in self.shards]
-    return {
-        "started": bool(self._started),
-        "running": bool(self.is_running()),
-        "inst_type": str(self.inst_type),
-        "ws_url": str(self.ws_url),
-        "symbols": int(len(self._symbols)),
-        "shards_total": int(len(shards)),
-        "shards_running": int(sum(1 for x in shards if x.get("running"))),
-        "last_msg_ts": max([x.get("last_msg_ts") for x in shards if x.get("last_msg_ts")], default=None),
-        "last_error": [x.get("last_error") for x in shards if x.get("last_error")][-1] if any(x.get("last_error") for x in shards) else None,
-        "shards": shards,
-    }
+    def status(self) -> Dict[str, Any]:
+        # gather status from each shard
+        shard_status = [sh.status() for sh in self._shards]
+        return {
+            "started": bool(self._started),
+            "running": bool(self.is_running()),
+            "inst_type": str(INST_PRODUCT_TYPE),
+            "ws_url": str(INST_WS_URL),
+            "symbols": int(len(self.symbols)),
+            "shards_total": int(len(shard_status)),
+            "shards_running": int(sum(1 for x in shard_status if x.get("running"))),
+            "last_msg_ts": max([x.get("last_msg_ts") for x in shard_status if x.get("last_msg_ts")], default=None),
+            "last_error": [x.get("last_error") for x in shard_status if x.get("last_error")][-1] if any(x.get("last_error") for x in shard_status) else None,
+            "shards": shard_status,
+        }
 
     def is_running(self) -> bool:
         if not self._started or not self._shards:
@@ -640,7 +665,6 @@ def status(self) -> Dict[str, Any]:
         idx = hash(sym) % len(self._shards)
         return self._shards[idx].snapshot(sym)
 
-
 # ========================
 # Controller singleton exposed as HUB (what institutional_data imports)
 # ========================
@@ -661,7 +685,6 @@ class _HubController:
 
     def is_running(self) -> bool:
         return bool(self._hub is not None and self._hub.is_running())
-
 
     def status(self) -> Dict[str, Any]:
         if self._hub is None:
@@ -708,7 +731,6 @@ class _HubController:
 
     async def stop(self) -> None:
         async with self._lock:
-            log.info('[WS_HUB_START] symbols=%s shards=%s', len(syms), int(shards))
             if self._hub is not None:
                 try:
                     await self._hub.stop()
@@ -722,7 +744,6 @@ class _HubController:
             sym = _norm_symbol(symbol)
             return {"available": False, "ts": None, "symbol": sym, "reason": "hub_none"}
         return self._hub.get_snapshot(symbol)
-
 
 # THIS is what institutional_data expects:
 HUB = _HubController()
