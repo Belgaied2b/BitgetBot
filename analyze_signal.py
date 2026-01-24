@@ -18,8 +18,10 @@ from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, Tuple, List
 
-import numpy as np
+import numpy asnp
 import pandas as pd
+
+from ai_model import predict_vol_liquidity, score_signal
 
 from structure_utils import (
     analyze_structure,
