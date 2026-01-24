@@ -2351,7 +2351,10 @@ async def start_scanner() -> None:
         logger.warning("Telegram disabled: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
 
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
-
+    
+    # Lancement automatique du hub WS avec la liste des contrats USDT
+    await _ws_hub_autostart(client)
+    
     trader = BitgetTrader(
         client,
         margin_usdt=float(MARGIN_USDT),
