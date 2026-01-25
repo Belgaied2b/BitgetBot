@@ -301,6 +301,59 @@ class InstitutionalWSHubShard:
             s += float(v)
         return float(s)
 
+    def _compute_tape_stats_locked(self, st: _SymbolState) -> Dict[str, Optional[float]]:
+        if not st.tape:
+            return {
+                "buy_notional_5m": None,
+                "sell_notional_5m": None,
+                "tape_intensity": None,
+                "buy_ratio": None,
+                "trade_count_5m": None,
+                "cvd_slope_usd_s": None,
+            }
+
+        now_ms = _now_ms()
+        cutoff = now_ms - int(TAPE_WINDOW_S * 1000.0)
+        while st.tape and st.tape[0][0] < cutoff:
+            st.tape.popleft()
+
+        if not st.tape:
+            return {
+                "buy_notional_5m": None,
+                "sell_notional_5m": None,
+                "tape_intensity": None,
+                "buy_ratio": None,
+                "trade_count_5m": None,
+                "cvd_slope_usd_s": None,
+            }
+
+        buy_notional = 0.0
+        sell_notional = 0.0
+        total_notional = 0.0
+        for _, v in st.tape:
+            val = float(v)
+            total_notional += abs(val)
+            if val >= 0:
+                buy_notional += val
+            else:
+                sell_notional += abs(val)
+
+        count = len(st.tape)
+        window_s = float(TAPE_WINDOW_S)
+        intensity = (total_notional / window_s) if window_s > 0 else None
+        buy_ratio = (buy_notional / (buy_notional + sell_notional)) if (buy_notional + sell_notional) > 0 else None
+        cvd_delta = buy_notional - sell_notional
+        cvd_slope = (cvd_delta / window_s) if window_s > 0 else None
+
+        return {
+            "buy_notional_5m": float(buy_notional),
+            "sell_notional_5m": float(sell_notional),
+            "tape_intensity": float(intensity) if intensity is not None else None,
+            "buy_ratio": float(buy_ratio) if buy_ratio is not None else None,
+            "trade_count_5m": float(count),
+            "cvd_slope_usd_s": float(cvd_slope) if cvd_slope is not None else None,
+        }
+
     def snapshot(self, symbol: str) -> Dict[str, Any]:
         sym = _norm_symbol(symbol)
         st = self._states.get(sym)
@@ -313,6 +366,7 @@ class InstitutionalWSHubShard:
             available = age_s <= float(INST_WS_STALE_S)
 
             tape_5m = self._compute_tape_delta_5m_locked(st)
+            tape_stats = self._compute_tape_stats_locked(st)
 
             return {
                 "available": bool(available),
@@ -323,6 +377,12 @@ class InstitutionalWSHubShard:
                 "funding_rate": st.ticker.funding,
                 "open_interest": st.ticker.holding,
                 "tape_delta_5m": tape_5m,
+                "buy_notional_5m": tape_stats.get("buy_notional_5m"),
+                "sell_notional_5m": tape_stats.get("sell_notional_5m"),
+                "tape_intensity": tape_stats.get("tape_intensity"),
+                "buy_ratio": tape_stats.get("buy_ratio"),
+                "trade_count_5m": tape_stats.get("trade_count_5m"),
+                "cvd_slope_usd_s": tape_stats.get("cvd_slope_usd_s"),
                 "next_funding_time_ms": st.ticker.next_funding_time_ms,
 
                 # extra debug/info
