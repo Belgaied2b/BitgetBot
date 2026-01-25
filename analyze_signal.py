@@ -1566,6 +1566,54 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
     }
 
 
+def _refine_entry_ltf(
+    entry_pick: Dict[str, Any],
+    df_m15: pd.DataFrame,
+    bias: str,
+) -> Dict[str, Any]:
+    try:
+        if not _ensure_ohlcv(df_m15) or len(df_m15) < 80:
+            return entry_pick
+
+        entry_type = str(entry_pick.get("entry_type") or "").upper()
+        if "MARKET" in entry_type:
+            return entry_pick
+
+        entry_mkt = float(entry_pick.get("entry_mkt") or 0.0)
+        entry_used = float(entry_pick.get("entry_used") or 0.0)
+        if entry_used <= 0 or entry_mkt <= 0:
+            return entry_pick
+
+        b = (bias or "").upper()
+        atr = _atr(df_m15, 14)
+
+        ltf_struct = analyze_structure(df_m15)
+        fvg_entry, fvg_note, fvg_ctx = _pick_fvg_entry(ltf_struct, entry_mkt, b, atr, max_dist_atr=2.0)
+        if fvg_entry is None or fvg_ctx is None:
+            return entry_pick
+
+        fvg_entry_f = float(fvg_entry)
+        dist_old = abs(entry_mkt - entry_used)
+        dist_new = abs(entry_mkt - fvg_entry_f)
+        if dist_new >= dist_old:
+            return entry_pick
+
+        if b == "LONG" and fvg_entry_f > entry_mkt:
+            return entry_pick
+        if b == "SHORT" and fvg_entry_f < entry_mkt:
+            return entry_pick
+
+        refined = dict(entry_pick)
+        refined["entry_used"] = fvg_entry_f
+        refined["entry_type"] = "LTF_FVG"
+        refined["entry_ctx"] = fvg_ctx
+        refined["ltf_refined"] = True
+        refined["note"] = f"{entry_pick.get('note')} | ltf_refine:{fvg_note}"
+        return refined
+    except Exception:
+        return entry_pick
+
+
 # =====================================================================
 # Institutional gate helpers (score integration)
 # =====================================================================
@@ -1879,6 +1927,7 @@ class SignalAnalyzer:
         symbol: str,
         df_h1: pd.DataFrame,
         df_h4: pd.DataFrame,
+        df_m15: Optional[pd.DataFrame] = None,
         macro: Any = None,
     ) -> Dict[str, Any]:
 
@@ -2273,6 +2322,8 @@ class SignalAnalyzer:
         liq_sweep = liq_sweep_pre
 
         entry_pick = _pick_entry(df_h1, struct, bias)
+        if df_m15 is not None and _ensure_ohlcv(df_m15):
+            entry_pick = _refine_entry_ltf(entry_pick, df_m15, bias)
         entry = float(entry_pick["entry_used"])
         entry_type = str(entry_pick["entry_type"])
         atr14 = float(entry_pick.get("atr") or _atr(df_h1, 14))
