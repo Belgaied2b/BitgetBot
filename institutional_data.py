@@ -962,16 +962,34 @@ async def compute_full_institutional_analysis(
     else:
         sources["depth"] = "bitget_rest"
 
+    ob_10 = None
     ob_25 = None
+    ob_50 = None
+    ob_100 = None
     spread_bps = None
     microprice = None
+    depth_bid_usd_10 = depth_ask_usd_10 = depth_usd_10 = None
     depth_bid_usd_25 = depth_ask_usd_25 = depth_usd_25 = None
+    depth_bid_usd_50 = depth_ask_usd_50 = depth_usd_50 = None
+    depth_bid_usd_100 = depth_ask_usd_100 = depth_usd_100 = None
 
     if isinstance(depth, dict):
+        ob_10, b10, a10 = _compute_orderbook_band_metrics(depth, band_bps=10.0)
         ob_25, b25, a25 = _compute_orderbook_band_metrics(depth, band_bps=25.0)
+        ob_50, b50, a50 = _compute_orderbook_band_metrics(depth, band_bps=50.0)
+        ob_100, b100, a100 = _compute_orderbook_band_metrics(depth, band_bps=100.0)
+        depth_bid_usd_10, depth_ask_usd_10 = b10, a10
         depth_bid_usd_25, depth_ask_usd_25 = b25, a25
+        depth_bid_usd_50, depth_ask_usd_50 = b50, a50
+        depth_bid_usd_100, depth_ask_usd_100 = b100, a100
+        if b10 is not None and a10 is not None:
+            depth_usd_10 = float(b10 + a10)
         if b25 is not None and a25 is not None:
             depth_usd_25 = float(b25 + a25)
+        if b50 is not None and a50 is not None:
+            depth_usd_50 = float(b50 + a50)
+        if b100 is not None and a100 is not None:
+            depth_usd_100 = float(b100 + a100)
         spread_bps = _compute_spread_bps_from_depth(depth)
         microprice = _compute_microprice_from_depth(depth)
 
@@ -988,7 +1006,13 @@ async def compute_full_institutional_analysis(
     funding_rate: Optional[float] = None
     next_funding_time_ms: Optional[int] = None
     tape_5m: Optional[float] = None
+    buy_notional_5m: Optional[float] = None
+    sell_notional_5m: Optional[float] = None
+    tape_intensity: Optional[float] = None
+    buy_ratio: Optional[float] = None
+    trade_count_5m: Optional[float] = None
     oi_value: Optional[float] = None
+    cvd_slope: Optional[float] = None
 
     if ws_snap is not None:
         try:
@@ -1003,6 +1027,18 @@ async def compute_full_institutional_analysis(
             if ws_snap.get("tape_delta_5m") is not None:
                 tape_5m = float(ws_snap.get("tape_delta_5m"))
                 sources["tape"] = "ws_hub"
+            if ws_snap.get("buy_notional_5m") is not None:
+                buy_notional_5m = float(ws_snap.get("buy_notional_5m"))
+            if ws_snap.get("sell_notional_5m") is not None:
+                sell_notional_5m = float(ws_snap.get("sell_notional_5m"))
+            if ws_snap.get("tape_intensity") is not None:
+                tape_intensity = float(ws_snap.get("tape_intensity"))
+            if ws_snap.get("buy_ratio") is not None:
+                buy_ratio = float(ws_snap.get("buy_ratio"))
+            if ws_snap.get("trade_count_5m") is not None:
+                trade_count_5m = float(ws_snap.get("trade_count_5m"))
+            if ws_snap.get("cvd_slope_usd_s") is not None:
+                cvd_slope = float(ws_snap.get("cvd_slope_usd_s"))
 
             if ws_snap.get("open_interest") is not None:
                 oi_value = float(ws_snap.get("open_interest"))
@@ -1071,12 +1107,44 @@ async def compute_full_institutional_analysis(
 
     ob_imb_z = _norm_update(sym, "ob_imb", ob_25)
     spread_bps_z = _norm_update(sym, "spread_bps", spread_bps)
+    depth_10_z = _norm_update(sym, "depth_10", depth_usd_10)
     depth_25_z = _norm_update(sym, "depth_25", depth_usd_25)
+    depth_50_z = _norm_update(sym, "depth_50", depth_usd_50)
+    depth_100_z = _norm_update(sym, "depth_100", depth_usd_100)
     oi_z = _norm_update(sym, "oi", oi_value) if oi_value is not None else None
     funding_z2 = _norm_update(sym, "funding", funding_rate) if funding_rate is not None else None
+    tape_delta_z = _norm_update(sym, "tape_delta_5m", tape_5m) if tape_5m is not None else None
 
     funding_regime = _classify_funding(funding_rate, z=funding_z if funding_z is not None else funding_z2)
     ob_regime = _classify_orderbook(ob_25)
+
+    flow_regime = "unknown"
+    if tape_5m is not None:
+        if tape_5m > 0:
+            flow_regime = "buy"
+        if tape_5m < 0:
+            flow_regime = "sell"
+        if tape_delta_z is not None and buy_ratio is not None:
+            if tape_delta_z >= 1.0 and buy_ratio >= 0.6:
+                flow_regime = "strong_buy"
+            if tape_delta_z <= -1.0 and buy_ratio <= 0.4:
+                flow_regime = "strong_sell"
+
+    crowding_regime = "unknown"
+    funding_z_used = funding_z if funding_z is not None else funding_z2
+    if funding_rate is not None:
+        fr = float(funding_rate)
+        if fr > 0:
+            crowding_regime = "long_bias"
+        if fr < 0:
+            crowding_regime = "short_bias"
+        if funding_z_used is not None:
+            if fr > 0 and float(funding_z_used) >= 1.5:
+                crowding_regime = "crowded_long"
+            if fr < 0 and float(funding_z_used) <= -1.5:
+                crowding_regime = "crowded_short"
+        if abs(fr) >= 0.003 or (funding_z_used is not None and abs(float(funding_z_used)) >= 2.5):
+            crowding_regime = "risky"
 
     components = {"flow": 0, "oi": 0, "crowding": 0, "orderbook": 0}
     score = 0
@@ -1122,8 +1190,14 @@ async def compute_full_institutional_analysis(
         "oi": oi_value,
         "oi_slope": oi_change_1h_pct,
 
-        "cvd_slope": None,
-        "cvd_notional_5m": None,
+        "cvd_slope": cvd_slope,
+        "cvd_slope_usd_s": cvd_slope,
+        "cvd_notional_5m": tape_5m,
+        "buy_notional_5m": buy_notional_5m,
+        "sell_notional_5m": sell_notional_5m,
+        "tape_intensity": tape_intensity,
+        "buy_ratio": buy_ratio,
+        "trade_count_5m": trade_count_5m,
 
         "funding_rate": funding_rate,
         "funding_regime": funding_regime,
@@ -1137,9 +1211,13 @@ async def compute_full_institutional_analysis(
 
         "tape_delta_1m": None,
         "tape_delta_5m": tape_5m,
+        "tape_delta_5m_z": tape_delta_z,
         "tape_regime": "unknown",
 
+        "orderbook_imb_10bps": ob_10,
         "orderbook_imb_25bps": ob_25,
+        "orderbook_imb_50bps": ob_50,
+        "orderbook_imb_100bps": ob_100,
         "orderbook_imb_25bps_z": ob_imb_z,
         "orderbook_regime": ob_regime,
 
@@ -1147,13 +1225,28 @@ async def compute_full_institutional_analysis(
         "spread_bps_z": spread_bps_z,
         "microprice": microprice,
 
+        "depth_bid_usd_10bps": depth_bid_usd_10,
+        "depth_ask_usd_10bps": depth_ask_usd_10,
+        "depth_usd_10bps": depth_usd_10,
+        "depth_10bps_z": depth_10_z,
+
         "depth_bid_usd_25bps": depth_bid_usd_25,
         "depth_ask_usd_25bps": depth_ask_usd_25,
         "depth_usd_25bps": depth_usd_25,
         "depth_25bps_z": depth_25_z,
 
-        "crowding_regime": "unknown",
-        "flow_regime": "unknown",
+        "depth_bid_usd_50bps": depth_bid_usd_50,
+        "depth_ask_usd_50bps": depth_ask_usd_50,
+        "depth_usd_50bps": depth_usd_50,
+        "depth_50bps_z": depth_50_z,
+
+        "depth_bid_usd_100bps": depth_bid_usd_100,
+        "depth_ask_usd_100bps": depth_ask_usd_100,
+        "depth_usd_100bps": depth_usd_100,
+        "depth_100bps_z": depth_100_z,
+
+        "crowding_regime": crowding_regime,
+        "flow_regime": flow_regime,
 
         "oi_change_15m_pct": oi_change_15m_pct,
         "oi_change_1h_pct": oi_change_1h_pct,
@@ -1196,7 +1289,7 @@ async def compute_full_institutional_analysis(
         "basisPct": None,
         "tapeDelta5m": tape_5m,
         "orderbookImb25bps": ob_25,
-        "cvdSlope": None,
+        "cvdSlope": cvd_slope,
     }
 
     comps = _available_components_list(payload)
