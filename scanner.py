@@ -65,6 +65,7 @@ from settings import (
     POSITION_MODE,
     snapshot,
     validate_settings,
+    INST_LIQ_MAX_SPREAD_BPS,
 )
 
 from bitget_client import get_client
@@ -140,7 +141,10 @@ async def _ws_hub_autostart(client: "BitgetClient") -> None:
         return
     try:
         # Prefer the same contract list the scanner uses, so WS coverage matches scan universe.
-        symbols = await client.get_contracts_list()
+        info = await client.get_contracts_info()
+        symbols = _filter_contracts_by_liquidity(info) if info else []
+        if not symbols:
+            symbols = await client.get_contracts_list()
         symbols = [s for s in (symbols or []) if isinstance(s, str) and s.endswith("USDT")]
         if not symbols:
             LOGGER.warning("[WS_HUB_AUTO] no_symbols -> skip")
@@ -169,6 +173,30 @@ def _ws_hub_health_log(scan_idx: int) -> None:
         LOGGER.info("[WS_HUB_HEALTH] scan=%s running=%s status=%s", int(scan_idx), bool(INST_WS_HUB.is_running()), st)
     except Exception as e:
         LOGGER.warning("[WS_HUB_HEALTH] scan=%s status_error=%s", int(scan_idx), e)
+
+
+def _filter_contracts_by_liquidity(contracts_info: List[Dict[str, Any]]) -> List[str]:
+    if not contracts_info:
+        return []
+    out: List[str] = []
+    for row in contracts_info:
+        if not isinstance(row, dict):
+            continue
+        sym = str(row.get("symbol") or "").upper()
+        if not sym:
+            continue
+        vol_24h = _safe_float(row.get("volume_24h"), None)
+        turn_24h = _safe_float(row.get("turnover_24h"), None)
+
+        if MIN_CONTRACT_TURNOVER_USDT > 0 and turn_24h is not None:
+            if float(turn_24h) < float(MIN_CONTRACT_TURNOVER_USDT):
+                continue
+        if MIN_CONTRACT_VOLUME_24H > 0 and vol_24h is not None:
+            if float(vol_24h) < float(MIN_CONTRACT_VOLUME_24H):
+                continue
+
+        out.append(sym)
+    return out
 # ✅ Runaway policy flags
 RUNAWAY_ENABLE = str(os.getenv("RUNAWAY_ENABLE", "1")).strip() == "1"
 
@@ -198,6 +226,14 @@ RUNAWAY_MIN_TICKS = int(os.getenv("RUNAWAY_MIN_TICKS", "20"))
 PRICE_CHECK_INTERVAL_S = float(os.getenv("PRICE_CHECK_INTERVAL_S", "6"))
 HEAVY_CHECK_INTERVAL_S = float(os.getenv("HEAVY_CHECK_INTERVAL_S", "45"))
 
+# Break-even policy (institutional)
+BE_SOFT_R = float(os.getenv("BE_SOFT_R", "0.7"))
+BE_STRICT_R = float(os.getenv("BE_STRICT_R", "1.0"))
+BE_SOFT_BUFFER_R = float(os.getenv("BE_SOFT_BUFFER_R", "-0.1"))
+BE_LIQ_MIN_DEPTH_USD = float(os.getenv("BE_LIQ_MIN_DEPTH_USD", "5000"))
+BE_MAX_SPREAD_BPS = float(os.getenv("BE_MAX_SPREAD_BPS", str(INST_LIQ_MAX_SPREAD_BPS)))
+BE_POS_REDUCED_THRESHOLD = float(os.getenv("BE_POS_REDUCED_THRESHOLD", "0.8"))
+
 REJECT_DEBUG_SAMPLES = 25
 
 ARM_MAX_ATTEMPTS = 40
@@ -219,6 +255,10 @@ _MIN_RE = re.compile(r"minimum price limit:\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
 # Alert policy (spam control)
 ALERT_MODE = str(os.getenv("ALERT_MODE", "TOP_RANK")).strip().upper()  # TOP_RANK | ALL_VALID | EXEC_ONLY | NONE
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", str(max(5, int(MAX_ORDERS_PER_SCAN) * 2))))
+
+# Universe prefilter (liquidity)
+MIN_CONTRACT_TURNOVER_USDT = float(os.getenv("MIN_CONTRACT_TURNOVER_USDT", "0"))
+MIN_CONTRACT_VOLUME_24H = float(os.getenv("MIN_CONTRACT_VOLUME_24H", "0"))
 
 # Pending persistence
 PENDING_STATE_FILE = os.getenv("PENDING_STATE_FILE", "pending_state.json")
@@ -1046,6 +1086,103 @@ async def _get_position_total(trader: BitgetTrader, symbol: str, direction: str)
     return 0.0
 
 
+async def _get_position_avg_entry(trader: BitgetTrader, symbol: str, direction: str) -> Optional[float]:
+    sym = str(symbol).upper()
+    hold = _hold_side(direction)
+    try:
+        resp = await trader.get_single_position(sym, timeout=10)
+    except Exception:
+        try:
+            resp = await trader.client._request(
+                "GET",
+                "/api/v2/mix/position/single-position",
+                params={
+                    "productType": trader.product_type,
+                    "symbol": sym,
+                    "marginCoin": trader.margin_coin,
+                },
+                auth=True,
+            )
+        except Exception:
+            return None
+
+    if not _is_ok(resp):
+        return None
+
+    data = resp.get("data") or []
+    if isinstance(data, dict):
+        data = data.get("list") or data.get("data") or []
+    if not isinstance(data, list):
+        return None
+
+    def _pick_avg(row: Dict[str, Any]) -> Optional[float]:
+        keys = ["openPriceAvg", "openAvgPrice", "avgPrice", "avgEntryPrice", "openPrice"]
+        for k in keys:
+            v = row.get(k)
+            if v is None:
+                continue
+            try:
+                f = float(v)
+                if f > 0 and math.isfinite(f):
+                    return float(f)
+            except Exception:
+                continue
+        return None
+
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        hs = str(row.get("holdSide") or row.get("posSide") or row.get("positionSide") or "").lower()
+        if hs and hs != hold:
+            continue
+        avg = _pick_avg(row)
+        if avg is not None:
+            return avg
+
+    for row in data:
+        if isinstance(row, dict):
+            avg = _pick_avg(row)
+            if avg is not None:
+                return avg
+
+    return None
+
+
+def _be_market_ok(sym: str) -> Tuple[bool, str]:
+    if INST_WS_HUB is None or not bool(INST_WS_HUB.is_running()):
+        return True, "ws_unavailable"
+    try:
+        snap = INST_WS_HUB.get_snapshot(sym)
+    except Exception:
+        return True, "ws_snapshot_error"
+    if not isinstance(snap, dict) or not snap.get("available"):
+        return True, "ws_snapshot_unavailable"
+
+    spread = snap.get("spread")
+    depth_bid = snap.get("bid_depth_usd")
+    depth_ask = snap.get("ask_depth_usd")
+
+    depth_min = None
+    try:
+        if depth_bid is not None and depth_ask is not None:
+            depth_min = min(float(depth_bid), float(depth_ask))
+    except Exception:
+        depth_min = None
+
+    if depth_min is not None and BE_LIQ_MIN_DEPTH_USD > 0 and depth_min < float(BE_LIQ_MIN_DEPTH_USD):
+        return False, "liq_low"
+
+    if spread is not None:
+        try:
+            spread_bps = float(spread) * 10000.0
+            if BE_MAX_SPREAD_BPS > 0 and spread_bps > float(BE_MAX_SPREAD_BPS):
+                return False, "spread_wide"
+        except Exception:
+            pass
+
+    return True, "ok"
+
+
 async def _fetch_last_closed_pnl(trader: BitgetTrader, symbol: str, direction: str) -> float:
     sym = str(symbol).upper()
     hold = _hold_side(direction)
@@ -1387,8 +1524,31 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
 
     base_margin = float(MARGIN_USDT)
     lev = float(LEVERAGE)
-    margin_used = max(0.0, base_margin * rf)
-    notional = float(margin_used) * float(lev)
+
+    base_risk = float(RISK.risk_for_this_trade())
+    risk_budget = float(base_risk) * float(rf)
+    risk_per_unit = abs(float(entry) - float(sl))
+
+    max_margin = max(0.0, base_margin * rf)
+    max_notional = float(max_margin) * float(lev)
+
+    qty = 0.0
+    notional = 0.0
+    risk_used = 0.0
+
+    if risk_per_unit > 0 and math.isfinite(risk_per_unit):
+        qty = float(risk_budget) / float(risk_per_unit) if risk_budget > 0 else 0.0
+        notional = float(qty) * float(entry)
+        if max_notional > 0 and notional > max_notional:
+            qty = float(max_notional) / float(entry)
+            notional = float(qty) * float(entry)
+        risk_used = float(qty) * float(risk_per_unit)
+    else:
+        notional = float(max_notional)
+        qty = float(notional) / max(float(entry), 1e-12)
+        risk_used = float(qty) * float(max(abs(float(entry) - float(sl)), 0.0))
+
+    margin_used = float(notional) / max(float(lev), 1e-12)
 
     post_only_entry = str(entry_type).upper() != "MARKET"
 
@@ -1418,7 +1578,7 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
 
     min_entry_usdt = float(os.getenv("MIN_ENTRY_USDT", "5"))
     min_margin_needed = float(min_entry_usdt) / max(float(lev), 1e-9)
-    if min_margin_needed > base_margin:
+    if min_margin_needed > max_margin:
         await stats.inc("exec_failed", 1)
         await stats.add_reason("entry_below_min_notional")
         await send_telegram(
@@ -1428,20 +1588,29 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
                 tid,
                 reason="min_notional_exceeds_base_margin",
                 min_notional=min_entry_usdt,
-                base_margin=round(base_margin, 4),
+                base_margin=round(max_margin, 4),
             )
         )
         return
 
     if margin_used < min_margin_needed:
-        margin_used = float(min_margin_needed)
-        notional = float(margin_used) * float(lev)
+        await stats.inc("exec_failed", 1)
+        await stats.add_reason("entry_below_min_notional")
+        await send_telegram(_mk_exec_msg("EXEC_SKIPPED", sym, tid, reason="min_notional_exceeds_risk_budget", min_notional=min_entry_usdt, notional=round(notional, 2)))
+        return
+
+    if qty <= 0 or notional <= 0:
+        await stats.inc("exec_failed", 1)
+        await stats.add_reason("entry_qty_zero")
+        await send_telegram(_mk_exec_msg("EXEC_SKIPPED", sym, tid, reason="qty_zero", qty=qty, notional=round(notional, 2)))
+        return
 
     # risk gate (reserve -> confirm/cancel)
     allowed, rreason, risk_rid = await RISK.reserve_trade(
         symbol=sym,
         side=direction,
         notional=notional,
+        risk_override=risk_used,
         rr=rr if rr > 0 else None,
         inst_score=int(inst_score),
         commitment=None,
@@ -1480,6 +1649,8 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
         pos_mode=pos_mode,
         margin_used=margin_used,
         notional=round(notional, 2),
+        risk_used=round(risk_used, 4),
+        qty_target=round(qty, 6),
         opt_regime=str(opt_ctx.get("regime") or "unknown"),
         opt_rf=float(rf),
         meta_pricePlace=meta_dbg.get("pricePlace"),
@@ -1495,12 +1666,13 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
         return
 
     await stats.inc("exec_sent", 1)
-    desk_log(logging.INFO, "EXEC", sym, tid, action="entry_send", entry=q_entry, margin_used=round(margin_used, 2), notional=round(notional, 2), setup=setup)
+    desk_log(logging.INFO, "EXEC", sym, tid, action="entry_send", entry=q_entry, margin_used=round(margin_used, 2), notional=round(notional, 2), risk_used=round(risk_used, 4), setup=setup)
     await send_telegram(_mk_exec_msg(
         "ENTRY_SEND", sym, tid,
         entry=q_entry,
         margin_used=round(margin_used, 2),
         notional=round(notional, 2),
+        risk_used=round(risk_used, 4),
         setup=setup,
         opt_regime=str(opt_ctx.get("regime") or "unknown"),
         opt_rf=float(rf),
@@ -1511,30 +1683,9 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
     factors = [1.0, 0.5, 0.25]
     entry_resp: Dict[str, Any] = {}
 
-    # temporary override: BitgetTrader uses trader.margin_usdt when size=None
-    orig_margin = getattr(trader, "margin_usdt", float(MARGIN_USDT))
-    try:
-        setattr(trader, "margin_usdt", float(margin_used))
-    except Exception:
-        pass
-
     for k, f in enumerate(factors):
         async def _place_entry():
-            if f >= 0.999:
-                return await trader.place_limit(
-                    symbol=sym,
-                    side=side.lower(),
-                    price=q_entry,
-                    size=None,
-                    client_oid=entry_client_oid,
-                    trade_side="open",
-                    reduce_only=False,
-                    post_only=post_only_entry,
-                    tick_hint=tick_used,
-                    debug_tag="ENTRY",
-                )
-
-            raw_qty = (notional * float(f)) / max(q_entry, 1e-12)
+            raw_qty = float(qty) * float(f)
             return await trader.place_limit(
                 symbol=sym,
                 side=side.lower(),
@@ -1560,12 +1711,6 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
             continue
         else:
             break
-
-    # restore margin_usdt
-    try:
-        setattr(trader, "margin_usdt", float(orig_margin))
-    except Exception:
-        pass
 
     if not _is_ok(entry_resp):
         await stats.inc("exec_failed", 1)
@@ -1603,11 +1748,13 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
             "inst_score": inst_score,
             "rr": rr,
             "notional": float(notional),
+            "risk_used": float(risk_used),
             "risk_rid": str(risk_rid),
             "risk_confirmed": True,
             "freeze_until": 0.0,
             "entry": q_entry,
             "sl": sl,
+            "sl_init": float(sl),
             "tp1": tp1,
             "qty_total": qty_total,
             "qty_tp1": 0.0,
@@ -1618,6 +1765,7 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
             "tp1_order_id": None,
             "armed": False,
             "be_done": False,
+            "be_soft_done": False,
             "created_ts": time.time(),
             "arm_attempts": 0,
             "last_arm_fail_ts": 0.0,
@@ -2093,12 +2241,14 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                     continue
 
                 # =========================================================
-                # Phase 2: BE after TP1 filled (v4 strict)
+                # Phase 2: BE (2 steps, R-multiple)
                 # =========================================================
-                if bool(st.get("armed", False)) and (not bool(st.get("be_done", False))):
+                if bool(st.get("armed", False)):
                     pos_total = await _get_position_total(trader, sym, direction)
+                    if pos_total < 0:
+                        continue
                     if pos_total >= 0 and pos_total <= 0:
-                        await _risk_close_trade(trader, sym, direction, reason="position_closed_before_tp1")
+                        await _risk_close_trade(trader, sym, direction, reason="position_closed_before_be")
                         async with PENDING_LOCK:
                             PENDING.pop(tid, None)
                         dirty = True
@@ -2106,24 +2256,6 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         await send_telegram(_mk_exec_msg("DONE", sym, tid, reason="position_closed"))
                         continue
 
-                    tp1_order_id = st.get("tp1_order_id")
-                    if not tp1_order_id or tp1_order_id == "ok":
-                        continue
-
-                    try:
-                        tp1_detail = await asyncio.wait_for(trader.get_order_detail(sym, order_id=tp1_order_id), timeout=DETAIL_TIMEOUT_S)
-                    except Exception as e:
-                        st["last_arm_fail_ts"] = time.time()
-                        dirty = True
-                        desk_log(logging.WARNING, "BE", sym, tid, step="tp1_detail_exc", err=str(e))
-                        continue
-
-                    # v4: TP1 MUST be fully filled (strict)
-                    expected_tp1 = float(st.get("qty_tp1") or 0.0)
-                    if not _is_filled_strict(trader, tp1_detail, expected_qty=expected_tp1 if expected_tp1 > 0 else None):
-                        continue
-
-                    # v4: qty_rem derived from REAL remaining position (pos_total)
                     tick_used = float(st.get("tick_used") or 0.0)
                     if tick_used <= 0:
                         tick_meta = await _get_tick_cached(trader, sym)
@@ -2131,75 +2263,177 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
                         st["tick_used"] = float(tick_used)
                         dirty = True
 
-                    qty_rem = _q_qty_floor(float(pos_total), float(st.get("qty_step") or 1.0))
-                    min_qty = float(st.get("min_qty") or 0.0)
-                    if min_qty > 0 and qty_rem < min_qty:
-                        qty_rem = 0.0
+                    avg_entry = await _get_position_avg_entry(trader, sym, direction)
+                    if avg_entry is None or avg_entry <= 0:
+                        avg_entry = float(entry)
 
-                    if qty_rem <= 0:
-                        await _risk_close_trade(trader, sym, direction, reason="tp1_full_close_or_dust")
-                        async with PENDING_LOCK:
-                            PENDING.pop(tid, None)
-                        dirty = True
-                        await _pending_save(force=True)
-                        await send_telegram(_mk_exec_msg("DONE", sym, tid, reason="tp1_full_close"))
+                    sl_init = float(st.get("sl_init") or st.get("sl") or 0.0)
+                    r_unit = abs(float(avg_entry) - float(sl_init))
+                    if r_unit <= 0:
                         continue
 
-                    be_ticks = int(BE_FEE_BUFFER_TICKS or 0)
-                    be_delta = float(be_ticks) * float(tick_used)
+                    last_price_ts = float(st.get("last_price_ts") or 0.0)
+                    last_price = float(st.get("last_price") or 0.0)
+                    now = time.time()
+                    if (now - last_price_ts) >= float(PRICE_CHECK_INTERVAL_S) or last_price <= 0:
+                        px = await _get_last_price(trader, sym)
+                        if px > 0:
+                            st["last_price"] = float(px)
+                            st["last_price_ts"] = now
+                            last_price = float(px)
+                            dirty = True
 
-                    be_raw = (entry + be_delta) if direction == "LONG" else (entry - be_delta)
-                    be_q = _q_sl(be_raw, tick_used, direction)
+                    if last_price <= 0:
+                        continue
 
-                    # cancel old SL plan
-                    old_plan = st.get("sl_plan_id")
-                    if old_plan and old_plan not in ("ok", ""):
-                        try:
-                            # v4 safer: explicit object list for v2
-                            await asyncio.wait_for(
-                                trader.cancel_plan_orders(sym, [{"orderId": str(old_plan), "clientOid": ""}]),
-                                timeout=ORDER_TIMEOUT_S
+                    if direction == "LONG":
+                        r_mult = (float(last_price) - float(avg_entry)) / float(r_unit)
+                    else:
+                        r_mult = (float(avg_entry) - float(last_price)) / float(r_unit)
+
+                    qty_total = float(st.get("qty_total") or 0.0)
+                    pos_reduced = bool(qty_total > 0 and float(pos_total) < float(qty_total) * float(BE_POS_REDUCED_THRESHOLD))
+
+                    be_ok, be_reason = _be_market_ok(sym)
+                    if not be_ok:
+                        st["be_blocked_reason"] = str(be_reason)
+                        dirty = True
+                        continue
+
+                    # Stage 1: soft BE at +0.7R -> SL to -0.1R
+                    if (not bool(st.get("be_soft_done", False))) and float(r_mult) >= float(BE_SOFT_R) and (not pos_reduced):
+                        soft_delta = float(BE_SOFT_BUFFER_R) * float(r_unit)
+                        if direction == "LONG":
+                            soft_raw = float(avg_entry) + soft_delta
+                        else:
+                            soft_raw = float(avg_entry) - soft_delta
+                        soft_q = _q_sl(soft_raw, tick_used, direction)
+
+                        old_plan = st.get("sl_plan_id")
+                        if old_plan and old_plan not in ("ok", ""):
+                            try:
+                                await asyncio.wait_for(
+                                    trader.cancel_plan_orders(sym, [{"orderId": str(old_plan), "clientOid": ""}]),
+                                    timeout=ORDER_TIMEOUT_S,
+                                )
+                            except Exception:
+                                pass
+
+                        qty_soft = _q_qty_floor(float(pos_total), float(st.get("qty_step") or 1.0))
+                        if qty_soft > 0:
+                            async def _place_soft():
+                                return await trader.place_stop_market_sl(
+                                    symbol=sym,
+                                    close_side=close_side.lower(),
+                                    trigger_price=soft_q,
+                                    qty=qty_soft,
+                                    client_oid=_oid("slbe_soft", tid, 0),
+                                    trigger_type=_trigger_type_sl(),
+                                    tick_hint=tick_used,
+                                    debug_tag="SL_BE_SOFT",
+                                )
+
+                            try:
+                                soft_resp = await asyncio.wait_for(retry_async(_place_soft, retries=2, base_delay=0.35), timeout=ORDER_TIMEOUT_S)
+                            except Exception as e:
+                                soft_resp = {"code": "EXC", "msg": str(e)}
+
+                            if _is_ok(soft_resp):
+                                new_plan = (
+                                    (soft_resp.get("data") or {}).get("orderId")
+                                    or (soft_resp.get("data") or {}).get("planOrderId")
+                                    or soft_resp.get("orderId")
+                                )
+                                st["sl_plan_id"] = str(new_plan) if new_plan else st.get("sl_plan_id")
+                                st["be_soft_done"] = True
+                                dirty = True
+                                await send_telegram(_mk_exec_msg("BE_SOFT_OK", sym, tid, be=soft_q, planId=new_plan))
+
+                    # Stage 2: strict BE at +1.0R or TP1 filled
+                    if not bool(st.get("be_done", False)):
+                        tp1_filled = False
+                        tp1_order_id = st.get("tp1_order_id")
+                        if tp1_order_id and tp1_order_id != "ok":
+                            try:
+                                tp1_detail = await asyncio.wait_for(trader.get_order_detail(sym, order_id=tp1_order_id), timeout=DETAIL_TIMEOUT_S)
+                                expected_tp1 = float(st.get("qty_tp1") or 0.0)
+                                tp1_filled = _is_filled_strict(trader, tp1_detail, expected_qty=expected_tp1 if expected_tp1 > 0 else None)
+                            except Exception as e:
+                                st["last_arm_fail_ts"] = time.time()
+                                dirty = True
+                                desk_log(logging.WARNING, "BE", sym, tid, step="tp1_detail_exc", err=str(e))
+
+                        if float(r_mult) >= float(BE_STRICT_R) or tp1_filled:
+                            if pos_reduced and (not tp1_filled):
+                                continue
+
+                            qty_rem = _q_qty_floor(float(pos_total), float(st.get("qty_step") or 1.0))
+                            min_qty = float(st.get("min_qty") or 0.0)
+                            if min_qty > 0 and qty_rem < min_qty:
+                                qty_rem = 0.0
+
+                            if qty_rem <= 0:
+                                await _risk_close_trade(trader, sym, direction, reason="tp1_full_close_or_dust")
+                                async with PENDING_LOCK:
+                                    PENDING.pop(tid, None)
+                                dirty = True
+                                await _pending_save(force=True)
+                                await send_telegram(_mk_exec_msg("DONE", sym, tid, reason="tp1_full_close"))
+                                continue
+
+                            be_ticks = int(BE_FEE_BUFFER_TICKS or 0)
+                            be_delta = float(be_ticks) * float(tick_used)
+
+                            be_raw = (float(avg_entry) + be_delta) if direction == "LONG" else (float(avg_entry) - be_delta)
+                            be_q = _q_sl(be_raw, tick_used, direction)
+
+                            old_plan = st.get("sl_plan_id")
+                            if old_plan and old_plan not in ("ok", ""):
+                                try:
+                                    await asyncio.wait_for(
+                                        trader.cancel_plan_orders(sym, [{"orderId": str(old_plan), "clientOid": ""}]),
+                                        timeout=ORDER_TIMEOUT_S
+                                    )
+                                except Exception:
+                                    pass
+
+                            async def _place_be():
+                                return await trader.place_stop_market_sl(
+                                    symbol=sym,
+                                    close_side=close_side.lower(),
+                                    trigger_price=be_q,
+                                    qty=qty_rem,
+                                    client_oid=_oid("slbe", tid, 0),
+                                    trigger_type=_trigger_type_sl(),
+                                    tick_hint=tick_used,
+                                    debug_tag="SL_BE",
+                                )
+
+                            try:
+                                sl_be_resp = await asyncio.wait_for(retry_async(_place_be, retries=2, base_delay=0.35), timeout=ORDER_TIMEOUT_S)
+                            except Exception as e:
+                                sl_be_resp = {"code": "EXC", "msg": str(e)}
+
+                            if not _is_ok(sl_be_resp):
+                                st["last_arm_fail_ts"] = time.time()
+                                dirty = True
+                                await send_telegram(_mk_exec_msg("BE_FAIL", sym, tid, code=sl_be_resp.get("code"), msg=sl_be_resp.get("msg")))
+                                continue
+
+                            new_plan = (
+                                (sl_be_resp.get("data") or {}).get("orderId")
+                                or (sl_be_resp.get("data") or {}).get("planOrderId")
+                                or sl_be_resp.get("orderId")
                             )
-                        except Exception:
-                            pass
 
-                    async def _place_be():
-                        return await trader.place_stop_market_sl(
-                            symbol=sym,
-                            close_side=close_side.lower(),
-                            trigger_price=be_q,
-                            qty=qty_rem,
-                            client_oid=_oid("slbe", tid, 0),
-                            trigger_type=_trigger_type_sl(),
-                            tick_hint=tick_used,
-                            debug_tag="SL_BE",
-                        )
+                            st["sl_plan_id"] = str(new_plan) if new_plan else st.get("sl_plan_id")
+                            st["be_done"] = True
+                            st["runner_monitor"] = True
+                            st["runner_qty"] = float(qty_rem)
+                            dirty = True
 
-                    try:
-                        sl_be_resp = await asyncio.wait_for(retry_async(_place_be, retries=2, base_delay=0.35), timeout=ORDER_TIMEOUT_S)
-                    except Exception as e:
-                        sl_be_resp = {"code": "EXC", "msg": str(e)}
-
-                    if not _is_ok(sl_be_resp):
-                        st["last_arm_fail_ts"] = time.time()
-                        dirty = True
-                        await send_telegram(_mk_exec_msg("BE_FAIL", sym, tid, code=sl_be_resp.get("code"), msg=sl_be_resp.get("msg")))
-                        continue
-
-                    new_plan = (
-                        (sl_be_resp.get("data") or {}).get("orderId")
-                        or (sl_be_resp.get("data") or {}).get("planOrderId")
-                        or sl_be_resp.get("orderId")
-                    )
-
-                    st["sl_plan_id"] = str(new_plan) if new_plan else st.get("sl_plan_id")
-                    st["be_done"] = True
-                    st["runner_monitor"] = True
-                    st["runner_qty"] = float(qty_rem)
-                    dirty = True
-
-                    await send_telegram(_mk_exec_msg("BE_OK", sym, tid, be=be_q, planId=new_plan, runner_qty=float(qty_rem)))
-                    continue
+                            await send_telegram(_mk_exec_msg("BE_OK", sym, tid, be=be_q, planId=new_plan, runner_qty=float(qty_rem)))
+                            continue
 
             except Exception as e:
                 logger.exception("[WATCHER] tid=%s error=%s", tid, e)
@@ -2222,7 +2456,10 @@ async def scan_once(client, trader: BitgetTrader) -> None:
     stats = ScanStats()
     t_scan0 = time.time()
 
-    symbols = await client.get_contracts_list()
+    contracts_info = await client.get_contracts_info()
+    symbols = _filter_contracts_by_liquidity(contracts_info) if contracts_info else []
+    if not symbols:
+        symbols = await client.get_contracts_list()
     if not symbols:
         logger.warning("⚠️ get_contracts_list() vide")
         return
