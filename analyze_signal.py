@@ -1102,6 +1102,7 @@ def _compute_exits(
     setup: Optional[str] = None,
     entry_type: Optional[str] = None,
     htf_df: Optional[pd.DataFrame] = None,
+    entry_ctx: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if bias == "LONG":
         sl, meta = protective_stop_long(
@@ -1112,6 +1113,7 @@ def _compute_exits(
             setup=setup,
             entry_type=entry_type,
             htf_df=htf_df,
+            entry_ctx=entry_ctx,
         )
     else:
         sl, meta = protective_stop_short(
@@ -1178,13 +1180,14 @@ def _pick_fvg_entry(
     bias: str,
     atr: float,
     max_dist_atr: float = 4.0,
-) -> Tuple[Optional[float], str]:
+) -> Tuple[Optional[float], str, Optional[Dict[str, Any]]]:
     zones = struct.get("fvg_zones") or []
     if not zones:
-        return None, "no_fvg"
+        return None, "no_fvg", None
 
     best_mid = None
     best_dist = 1e18
+    best_zone: Optional[Dict[str, Any]] = None
     b = (bias or "").upper()
 
     for z in zones:
@@ -1206,23 +1209,122 @@ def _pick_fvg_entry(
         if dist < best_dist:
             best_dist = dist
             best_mid = mid
+            best_zone = dict(z)
 
     if best_mid is None:
-        return None, "no_fvg_parse"
+        return None, "no_fvg_parse", None
 
     try:
         if atr > 0 and best_dist > 0:
             if b == "LONG" and float(best_mid) > float(entry_mkt) + 0.1 * atr:
-                return None, "fvg_not_better_side_long"
+                return None, "fvg_not_better_side_long", None
             if b == "SHORT" and float(best_mid) < float(entry_mkt) - 0.1 * atr:
-                return None, "fvg_not_better_side_short"
+                return None, "fvg_not_better_side_short", None
     except Exception:
         pass
 
     if atr > 0 and best_dist > float(max_dist_atr) * atr:
-        return None, f"fvg_too_far dist={best_dist:.6g} atr={atr:.6g} max_atr={max_dist_atr}"
+        return None, f"fvg_too_far dist={best_dist:.6g} atr={atr:.6g} max_atr={max_dist_atr}", None
 
-    return float(best_mid), f"fvg_ok dist={best_dist:.6g} atr={atr:.6g} max_atr={max_dist_atr}"
+    ctx = None
+    if best_zone:
+        try:
+            zl = float(best_zone.get("low"))
+            zh = float(best_zone.get("high"))
+            if np.isfinite(zl) and np.isfinite(zh) and zh > zl:
+                ctx = {
+                    "type": "FVG",
+                    "low": zl,
+                    "high": zh,
+                    "direction": best_zone.get("direction") or best_zone.get("type"),
+                    "source": "struct_fvg",
+                    "zone": best_zone,
+                }
+        except Exception:
+            ctx = None
+
+    return float(best_mid), f"fvg_ok dist={best_dist:.6g} atr={atr:.6g} max_atr={max_dist_atr}", ctx
+
+
+def _struct_ote_from_swings(
+    struct: Dict[str, Any],
+    bias: str,
+    entry_mkt: float,
+    atr: float,
+) -> Optional[Dict[str, Any]]:
+    try:
+        swings = struct.get("swings") or {}
+        highs = swings.get("highs", []) or []
+        lows = swings.get("lows", []) or []
+        if not highs or not lows:
+            return None
+
+        b = (bias or "").upper()
+        swing_high = None
+        swing_low = None
+
+        if b == "LONG":
+            for hi_idx, hi_val in reversed(highs):
+                lo_pick = None
+                for lo_idx, lo_val in reversed(lows):
+                    if int(lo_idx) < int(hi_idx):
+                        lo_pick = (lo_idx, lo_val)
+                        break
+                if lo_pick is not None:
+                    swing_high = float(hi_val)
+                    swing_low = float(lo_pick[1])
+                    break
+        else:
+            for lo_idx, lo_val in reversed(lows):
+                hi_pick = None
+                for hi_idx, hi_val in reversed(highs):
+                    if int(hi_idx) < int(lo_idx):
+                        hi_pick = (hi_idx, hi_val)
+                        break
+                if hi_pick is not None:
+                    swing_high = float(hi_pick[1])
+                    swing_low = float(lo_val)
+                    break
+
+        if swing_high is None or swing_low is None:
+            return None
+
+        hi = float(swing_high)
+        lo = float(swing_low)
+        if not (np.isfinite(hi) and np.isfinite(lo)) or hi <= lo:
+            return None
+
+        diff = hi - lo
+        if b == "LONG":
+            fib_62 = hi - 0.62 * diff
+            fib_705 = hi - 0.705 * diff
+        else:
+            fib_62 = lo + 0.62 * diff
+            fib_705 = lo + 0.705 * diff
+
+        ote_low = float(min(fib_62, fib_705))
+        ote_high = float(max(fib_62, fib_705))
+        entry = float((ote_low + ote_high) / 2.0)
+        in_zone = bool(ote_low <= entry_mkt <= ote_high)
+        dist = 0.0 if in_zone else (float(ote_low - entry_mkt) if entry_mkt < ote_low else float(entry_mkt - ote_high))
+
+        return {
+            "entry": entry,
+            "entry_price": entry,
+            "in_zone": in_zone,
+            "ok": in_zone,
+            "dist": dist,
+            "in_ote": in_zone,
+            "ote_low": ote_low,
+            "ote_high": ote_high,
+            "swing_high": hi,
+            "swing_low": lo,
+            "last": float(entry_mkt),
+            "bias": b,
+            "note": f"struct_ote swing_hi={hi:.6g} swing_lo={lo:.6g} atr={atr:.6g}",
+        }
+    except Exception:
+        return None
 
 
 def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[str, Any]:
@@ -1235,6 +1337,25 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
             raid_entry = float(raid["entry"])
             dist = abs(entry_mkt - raid_entry)
             if atr <= 0 or dist <= 2.8 * atr:
+                zone = raid.get("zone") if isinstance(raid.get("zone"), dict) else None
+                entry_ctx = None
+                if zone:
+                    zl = zone.get("low")
+                    zh = zone.get("high")
+                    try:
+                        zl_f = float(zl)
+                        zh_f = float(zh)
+                        if np.isfinite(zl_f) and np.isfinite(zh_f) and zh_f > zl_f:
+                            entry_ctx = {
+                                "type": "FVG",
+                                "low": zl_f,
+                                "high": zh_f,
+                                "direction": zone.get("direction") or zone.get("type"),
+                                "source": "raid_displacement",
+                                "zone": zone,
+                            }
+                    except Exception:
+                        entry_ctx = None
                 return {
                     "entry_used": raid_entry,
                     "entry_type": "RAID_FVG",
@@ -1244,6 +1365,93 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
                     "entry_mkt": entry_mkt,
                     "atr": atr,
                     "raid": raid,
+                    "entry_ctx": entry_ctx,
+                }
+    except Exception:
+        pass
+
+    # BOS retest (broken level)
+    broken_level = struct.get("broken_level")
+    try:
+        bos = bool(struct.get("bos"))
+        bos_bias = str(struct.get("bos_bias") or "").upper()
+        if bos and bos_bias == str(bias or "").upper() and broken_level is not None:
+            bl = float(broken_level)
+            dist = abs(entry_mkt - bl)
+            if atr <= 0 or dist <= 3.5 * atr:
+                if bias == "LONG" and bl <= entry_mkt:
+                    return {
+                        "entry_used": float(bl),
+                        "entry_type": "BOS_RETEST",
+                        "order_type": "LIMIT",
+                        "in_zone": True,
+                        "note": f"bos_retest level={bl:.6g} dist={dist:.6g} atr={atr:.6g}",
+                        "entry_mkt": entry_mkt,
+                        "atr": atr,
+                        "entry_ctx": {"type": "LEVEL", "level": float(bl), "kind": "BOS_RETEST"},
+                    }
+                if bias == "SHORT" and bl >= entry_mkt:
+                    return {
+                        "entry_used": float(bl),
+                        "entry_type": "BOS_RETEST",
+                        "order_type": "LIMIT",
+                        "in_zone": True,
+                        "note": f"bos_retest level={bl:.6g} dist={dist:.6g} atr={atr:.6g}",
+                        "entry_mkt": entry_mkt,
+                        "atr": atr,
+                        "entry_ctx": {"type": "LEVEL", "level": float(bl), "kind": "BOS_RETEST"},
+                    }
+    except Exception:
+        pass
+
+    # OB mitigation (order block)
+    try:
+        ob = struct.get("order_blocks") or {}
+        ob_side = ob.get("bullish") if str(bias or "").upper() == "LONG" else ob.get("bearish")
+        if isinstance(ob_side, dict):
+            ob_low = float(ob_side.get("low"))
+            ob_high = float(ob_side.get("high"))
+            if np.isfinite(ob_low) and np.isfinite(ob_high) and ob_high > ob_low:
+                ob_mid = float((ob_low + ob_high) / 2.0)
+                dist = abs(entry_mkt - ob_mid)
+                if atr <= 0 or dist <= 4.0 * atr:
+                    return {
+                        "entry_used": ob_mid,
+                        "entry_type": "OB_MITIGATION",
+                        "order_type": "LIMIT",
+                        "in_zone": False,
+                        "note": f"ob_mitigation low={ob_low:.6g} high={ob_high:.6g} dist={dist:.6g} atr={atr:.6g}",
+                        "entry_mkt": entry_mkt,
+                        "atr": atr,
+                        "entry_ctx": {
+                            "type": "OB",
+                            "low": ob_low,
+                            "high": ob_high,
+                            "direction": ob_side.get("direction"),
+                            "source": "order_block",
+                            "zone": ob_side,
+                        },
+                    }
+    except Exception:
+        pass
+
+    # BOS continuation (institutional)
+    try:
+        bos = bool(struct.get("bos"))
+        bos_bias = str(struct.get("bos_bias") or "").upper()
+        if bos and bos_bias == str(bias or "").upper() and broken_level is not None:
+            bl = float(broken_level)
+            dist = abs(entry_mkt - bl)
+            if atr <= 0 or dist <= 1.5 * atr:
+                return {
+                    "entry_used": float(entry_mkt),
+                    "entry_type": "BOS_CONT",
+                    "order_type": "LIMIT",
+                    "in_zone": True,
+                    "note": f"bos_cont level={bl:.6g} dist={dist:.6g} atr={atr:.6g}",
+                    "entry_mkt": entry_mkt,
+                    "atr": atr,
+                    "entry_ctx": {"type": "LEVEL", "level": float(bl), "kind": "BOS_CONT"},
                 }
     except Exception:
         pass
@@ -1253,7 +1461,9 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
     ote_in_zone = False
     ote_note = "ote_unavailable"
     try:
-        ote = compute_ote(df_h1, bias)
+        ote = _struct_ote_from_swings(struct, bias, entry_mkt, atr)
+        if ote is None:
+            ote = compute_ote(df_h1, bias)
 
         if isinstance(ote, dict) and ("in_ote" in ote or "ote_low" in ote or "ote_high" in ote):
             in_ote = bool(ote.get("in_ote", False))
@@ -1267,6 +1477,8 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
                     ote_in_zone = in_ote
                     dist = abs(entry_mkt - ote_entry)
                     ote_note = f"ote(in_ote={ote_in_zone}) low={lo} high={hi} dist={dist:.6g} atr={atr:.6g}"
+                    if isinstance(ote, dict) and ote.get("note"):
+                        ote_note = f"{ote_note} {ote.get('note')}"                
                 else:
                     ote_note = f"ote_bad_bounds low={lo} high={hi} atr={atr:.6g}"
             else:
@@ -1295,6 +1507,7 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
             "note": ote_note,
             "entry_mkt": entry_mkt,
             "atr": atr,
+            "entry_ctx": {"type": "OTE"},
         }
 
     # OTE pullback (même si pas in-zone)
@@ -1310,6 +1523,7 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
                     "note": f"{ote_note} (pullback dist={dist:.6g} atr={atr:.6g})",
                     "entry_mkt": entry_mkt,
                     "atr": atr,
+                    "entry_ctx": {"type": "OTE"},
                 }
             if bias == "SHORT" and float(ote_entry) >= float(entry_mkt) and (atr <= 0 or dist <= 4.0 * atr):
                 return {
@@ -1320,12 +1534,13 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
                     "note": f"{ote_note} (pullback dist={dist:.6g} atr={atr:.6g})",
                     "entry_mkt": entry_mkt,
                     "atr": atr,
+                    "entry_ctx": {"type": "OTE"},
                 }
         except Exception:
             pass
 
     # FVG
-    fvg_entry, fvg_note = _pick_fvg_entry(struct, entry_mkt, bias, atr, max_dist_atr=4.0)
+    fvg_entry, fvg_note, fvg_ctx = _pick_fvg_entry(struct, entry_mkt, bias, atr, max_dist_atr=4.0)
     if fvg_entry is not None:
         return {
             "entry_used": float(fvg_entry),
@@ -1335,6 +1550,7 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
             "note": fvg_note,
             "entry_mkt": entry_mkt,
             "atr": atr,
+            "entry_ctx": fvg_ctx,
         }
 
     # fallback
@@ -1346,6 +1562,7 @@ def _pick_entry(df_h1: pd.DataFrame, struct: Dict[str, Any], bias: str) -> Dict[
         "note": "no_zone_entry",
         "entry_mkt": entry_mkt,
         "atr": atr,
+        "entry_ctx": None,
     }
 
 
@@ -2059,6 +2276,7 @@ class SignalAnalyzer:
         entry = float(entry_pick["entry_used"])
         entry_type = str(entry_pick["entry_type"])
         atr14 = float(entry_pick.get("atr") or _atr(df_h1, 14))
+        entry_ctx = entry_pick.get("entry_ctx") if isinstance(entry_pick.get("entry_ctx"), dict) else None
 
         # ---------------------------------------------------------------
         # TrendGuard
@@ -2136,6 +2354,7 @@ class SignalAnalyzer:
             setup=setup_hint,
             entry_type=entry_type,
             htf_df=df_h4,
+            entry_ctx=entry_ctx,
         )
 
         sl = float(exits["sl"])
