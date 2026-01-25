@@ -647,22 +647,48 @@ def volatility_regime(df: pd.DataFrame, atr_length: int = 14) -> str:
     except Exception:
         return "UNKNOWN"
 
+def rolling_vwap(df: pd.DataFrame, window: int = 24) -> pd.Series:
+    df = _maybe_drop_live_bar_df(df)
+    """
+    Rolling VWAP (H1-friendly).
+    Returns a Series aligned with df.
+    """
+    if df is None or df.empty or len(df) < max(5, int(window)) or not _has_cols(df, ("high", "low", "close", "volume")):
+        return pd.Series(dtype=float)
+
+    w = int(max(3, window))
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    vol = df["volume"].astype(float)
+
+    tp = (high + low + close) / 3.0
+    pv = tp * vol
+    pv_roll = pv.rolling(window=w, min_periods=max(3, int(w / 3))).sum()
+    vol_roll = vol.rolling(window=w, min_periods=max(3, int(w / 3))).sum()
+
+    vwap = pv_roll / vol_roll.replace(0, np.nan)
+    return vwap
+
 def extension_signal(df: pd.DataFrame, ema_fast_len: int = 20, ema_slow_len: int = 50) -> Optional[str]:
     df = _maybe_drop_live_bar_df(df)
     """
     Overextension detection:
       - distance vs EMA slow (dynamic threshold)
       - RSI extreme
+      - VWAP distance (rolling)
     """
     if df is None or df.empty or len(df) < max(int(ema_slow_len), 40) or not _has_cols(df, ("close", "high", "low")):
         return None
 
     close = df["close"].astype(float)
     ema_slow = ema(close, int(ema_slow_len))
+    ema_fast = ema(close, int(ema_fast_len))
     r = rsi(close, 14)
 
     last_close = float(close.iloc[-1])
     last_ema = float(ema_slow.iloc[-1])
+    last_ema_fast = float(ema_fast.iloc[-1])
     last_rsi = float(r.iloc[-1])
 
     if not np.isfinite(last_close) or not np.isfinite(last_ema) or last_ema <= 0:
@@ -673,9 +699,18 @@ def extension_signal(df: pd.DataFrame, ema_fast_len: int = 20, ema_slow_len: int
     ap = _nan_to(_safe_last(atr_pct(df, 14), np.nan), 0.02)
     thr = _clamp(2.5 * ap, 0.045, 0.12)  # desk: ~4.5%..12%
 
-    if dist_pct > thr and last_rsi > 70:
+    vwap_roll = rolling_vwap(df, window=24)
+    vwap_last = _safe_last(vwap_roll, np.nan)
+    vwap_dist = None
+    if vwap_last is not None and np.isfinite(float(vwap_last)) and float(vwap_last) > 0:
+        vwap_dist = float((last_close - float(vwap_last)) / float(vwap_last))
+
+    ema_trend_ok = bool(last_close > last_ema_fast) if np.isfinite(last_ema_fast) else True
+    ema_trend_down = bool(last_close < last_ema_fast) if np.isfinite(last_ema_fast) else True
+
+    if dist_pct > thr and last_rsi > 68 and ema_trend_ok and (vwap_dist is None or vwap_dist > 0.8 * thr):
         return "OVEREXTENDED_LONG"
-    if dist_pct < -thr and last_rsi < 30:
+    if dist_pct < -thr and last_rsi < 32 and ema_trend_down and (vwap_dist is None or vwap_dist < -0.8 * thr):
         return "OVEREXTENDED_SHORT"
     return None
 
