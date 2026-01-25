@@ -470,6 +470,7 @@ class RiskManager:
         volatility_atr_pct: Optional[float] = None,
         corr_btc: Optional[float] = None,
         cluster: Optional[str] = None,
+        risk_override: Optional[float] = None,
         **_extra: Any,
     ) -> Tuple[bool, str, Optional[str]]:
         async with self._lock:
@@ -495,7 +496,13 @@ class RiskManager:
             if not allowed:
                 return False, str(reason), None
 
-            risk_used = self.risk_for_this_trade(volatility_atr_pct=volatility_atr_pct)
+            if risk_override is not None:
+                try:
+                    risk_used = float(risk_override)
+                except Exception:
+                    risk_used = self.risk_for_this_trade(volatility_atr_pct=volatility_atr_pct)
+            else:
+                risk_used = self.risk_for_this_trade(volatility_atr_pct=volatility_atr_pct)
 
             rid = uuid.uuid4().hex[:12]
             self._reservations[rid] = Reservation(
