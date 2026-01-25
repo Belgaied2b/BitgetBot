@@ -1273,16 +1273,17 @@ async def _bootstrap_risk_open_positions(trader: BitgetTrader) -> None:
 # Fetch
 # =====================================================================
 
-async def _fetch_dfs(client, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+async def _fetch_dfs(client, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
     async def _do():
         df_h1 = await client.get_klines_df(symbol, TF_H1, CANDLE_LIMIT)
         df_h4 = await client.get_klines_df(symbol, TF_H4, CANDLE_LIMIT)
-        return df_h1, df_h4
+        df_m15 = await client.get_klines_df(symbol, TF_M15, 240) if LTF_REFINE_ENABLE else None
+        return df_h1, df_h4, df_m15
 
     try:
         return await asyncio.wait_for(retry_async(_do, retries=2, base_delay=0.4), timeout=FETCH_TIMEOUT_S)
     except Exception:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), None
 
 
 # =====================================================================
@@ -1339,7 +1340,7 @@ async def analyze_symbol(
 
     async with analyze_sem:
         t0 = time.time()
-        df_h1, df_h4 = await _fetch_dfs(client, sym)
+        df_h1, df_h4, df_m15 = await _fetch_dfs(client, sym)
         fetch_ms = int((time.time() - t0) * 1000)
 
         if df_h1 is None or df_h4 is None or getattr(df_h1, "empty", True) or getattr(df_h4, "empty", True):
@@ -1356,7 +1357,7 @@ async def analyze_symbol(
         t1 = time.time()
         try:
             result = await asyncio.wait_for(
-                analyzer.analyze(sym, df_h1, df_h4, macro=(macro_ctx or {})),
+                analyzer.analyze(sym, df_h1, df_h4, df_m15=df_m15, macro=(macro_ctx or {})),
                 timeout=ANALYZE_TIMEOUT_S
             )
         except asyncio.TimeoutError:
@@ -1402,7 +1403,49 @@ async def analyze_symbol(
 
         inst_micro = result.get("inst_micro") if isinstance(result.get("inst_micro"), dict) else {}
         inst_liq_rf = _sanitize_risk_factor(inst_micro.get("liquidity_risk_factor", 1.0))
-        combined_rf = _sanitize_risk_factor(opt_rf * inst_liq_rf)
+        ai_rf = 1.0
+        ai_score = 0
+        ai_prob = 0.0
+        ai_veto = False
+        ai_reason = ""
+        try:
+            inst = result.get("institutional") if isinstance(result.get("institutional"), dict) else {}
+            payload = {
+                "direction": direction,
+                "inst_score": inst_score_eff,
+                "best_bid": inst.get("best_bid") or inst.get("bid"),
+                "best_ask": inst.get("best_ask") or inst.get("ask"),
+                "spread_bps": inst.get("spread_bps"),
+                "spread": inst.get("spread"),
+                "bid_depth_usd": inst.get("depth_bid_usd_25bps") or inst.get("depth_bid_usd"),
+                "ask_depth_usd": inst.get("depth_ask_usd_25bps") or inst.get("depth_ask_usd"),
+                "tape_delta_5m": inst.get("tape_delta_5m"),
+                "funding_rate": inst.get("funding_rate"),
+                "oi_change_1h": inst.get("oi_change_1h_pct"),
+                "atr_pct": float(atr14) / float(entry) if entry > 0 else 0.0,
+                "momentum_label": result.get("momentum"),
+                "momentum_composite_score": comp_score,
+                "htf_ok": bool(result.get("htf_ok", True)),
+                "bos": bool((result.get("structure") or {}).get("bos")),
+                "choch": bool((result.get("structure") or {}).get("choch")),
+                "trend": str((result.get("structure") or {}).get("trend") or ""),
+                "vol_regime": str(result.get("vol_regime") or ""),
+                "session_liquidity": 1.0,
+            }
+            ai = score_signal(payload)
+            ai_rf = _sanitize_risk_factor(ai.risk_factor)
+            ai_score = int(ai.ai_score)
+            ai_prob = float(ai.ai_prob)
+            ai_veto = bool(ai.veto)
+            ai_reason = str(ai.veto_reason or "")
+        except Exception:
+            ai_rf = 1.0
+
+        combined_rf = _sanitize_risk_factor(opt_rf * inst_liq_rf * ai_rf)
+        if ai_veto and AI_HARD_VETO:
+            await stats.inc("skips", 1)
+            await stats.add_reason(f"ai_veto:{ai_reason or 'veto'}")
+            return None
 
         desk_log(
             logging.INFO,
@@ -1421,6 +1464,8 @@ async def analyze_symbol(
             opt_regime=opt_regime,
             opt_rf=opt_rf,
             inst_liq_rf=inst_liq_rf,
+            ai_rf=ai_rf,
+            ai_score=ai_score,
             risk_rf=combined_rf,
             fetch_ms=fetch_ms,
             analyze_ms=analyze_ms,
@@ -1470,6 +1515,11 @@ async def analyze_symbol(
             "opt_regime": opt_regime,
             "opt_score": opt_score,
             "inst_liq_risk_factor": float(inst_liq_rf),
+            "ai_risk_factor": float(ai_rf),
+            "ai_score": int(ai_score),
+            "ai_prob": float(ai_prob),
+            "ai_veto": bool(ai_veto),
+            "ai_veto_reason": str(ai_reason),
             "risk_factor": float(combined_rf),
         }
 
@@ -1782,6 +1832,7 @@ async def execute_candidate(candidate: Dict[str, Any], client, trader: BitgetTra
             "last_price_ts": 0.0,
             "last_price": 0.0,
             "last_heavy_ts": 0.0,
+            "last_trail_ts": 0.0,
 
             "tick_used": float(tick_used),
             "min_price_seen": 0.0,
@@ -2434,6 +2485,60 @@ async def _watcher_loop(trader: BitgetTrader) -> None:
 
                             await send_telegram(_mk_exec_msg("BE_OK", sym, tid, be=be_q, planId=new_plan, runner_qty=float(qty_rem)))
                             continue
+
+                    # Trailing SL (structure) after BE
+                    if TRAIL_STRUCT_ENABLE and bool(st.get("be_done", False)):
+                        last_trail = float(st.get("last_trail_ts") or 0.0)
+                        now = time.time()
+                        if (now - last_trail) >= float(TRAIL_STRUCT_INTERVAL_S):
+                            st["last_trail_ts"] = now
+                            dirty = True
+
+                            cur_sl = float(st.get("sl") or 0.0)
+                            trail_sl = await _trail_structural_sl(trader, sym, direction, entry, cur_sl, tick_used)
+                            if trail_sl is not None:
+                                old_plan = st.get("sl_plan_id")
+                                if old_plan and old_plan not in ("ok", ""):
+                                    try:
+                                        await asyncio.wait_for(
+                                            trader.cancel_plan_orders(sym, [{"orderId": str(old_plan), "clientOid": ""}]),
+                                            timeout=ORDER_TIMEOUT_S,
+                                        )
+                                    except Exception:
+                                        pass
+
+                                qty_trail = _q_qty_floor(float(pos_total), float(st.get("qty_step") or 1.0))
+                                if qty_trail > 0:
+                                    async def _place_trail():
+                                        return await trader.place_stop_market_sl(
+                                            symbol=sym,
+                                            close_side=close_side.lower(),
+                                            trigger_price=trail_sl,
+                                            qty=qty_trail,
+                                            client_oid=_oid("sltrail", tid, 0),
+                                            trigger_type=_trigger_type_sl(),
+                                            tick_hint=tick_used,
+                                            debug_tag="SL_TRAIL",
+                                        )
+
+                                    try:
+                                        trail_resp = await asyncio.wait_for(
+                                            retry_async(_place_trail, retries=2, base_delay=0.35),
+                                            timeout=ORDER_TIMEOUT_S,
+                                        )
+                                    except Exception as e:
+                                        trail_resp = {"code": "EXC", "msg": str(e)}
+
+                                    if _is_ok(trail_resp):
+                                        new_plan = (
+                                            (trail_resp.get("data") or {}).get("orderId")
+                                            or (trail_resp.get("data") or {}).get("planOrderId")
+                                            or trail_resp.get("orderId")
+                                        )
+                                        st["sl_plan_id"] = str(new_plan) if new_plan else st.get("sl_plan_id")
+                                        st["sl"] = float(trail_sl)
+                                        dirty = True
+                                        await send_telegram(_mk_exec_msg("SL_TRAIL_OK", sym, tid, sl=trail_sl, planId=new_plan))
 
             except Exception as e:
                 logger.exception("[WATCHER] tid=%s error=%s", tid, e)
