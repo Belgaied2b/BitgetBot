@@ -183,6 +183,154 @@ class BitgetClient:
         except Exception:
             mi = 0.0
         if mi <= 0:
+            return
+
+        async with self._pace_lock:
+            now = time.time()
+            dt = now - float(self._last_req_ts)
+            wait_s = float(mi) - float(dt)
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+            self._last_req_ts = time.time()
+
+    def _sign(self, ts: str, method: str, path: str, query: str, body: str) -> str:
+        msg = f"{ts}{method}{path}{query}{body}"
+        mac = hmac.new(self.api_secret, msg.encode(), hashlib.sha256).digest()
+        return base64.b64encode(mac).decode()
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        auth: bool = True,
+        timeout_s: int = int(BITGET_HTTP_TIMEOUT_S),
+        retries: int = int(BITGET_HTTP_RETRIES),
+        base_delay: float = 0.35,
+    ) -> Dict[str, Any]:
+        """
+        Robust wrapper:
+          - stable query ordering
+          - retries on: network, timeout, 5xx, HTTP429, and "too frequent" messages
+          - returns dict with: ok, code, msg, _http_status, _latency_ms
+        """
+        await self._ensure_session()
+
+        params = params or {}
+        data = data or {}
+
+        # stable query order (signature-safe)
+        query = ""
+        if params:
+            items = sorted(params.items(), key=lambda kv: kv[0])
+            query = "?" + "&".join(f"{k}={v}" for k, v in items)
+
+        url = self.BASE + path + query
+        body = json.dumps(data, separators=(",", ":")) if data else ""
+
+        async def _do() -> Dict[str, Any]:
+            ts = str(_now_ms())
+            headers: Dict[str, str] = {
+                "Content-Type": "application/json",
+                "User-Agent": "desk-bot/bitget-client",
+            }
+
+            if auth:
+                sig = self._sign(ts, method.upper(), path, query, body)
+                headers.update(
+                    {
+                        "ACCESS-KEY": self.api_key,
+                        "ACCESS-SIGN": sig,
+                        "ACCESS-TIMESTAMP": ts,
+                        "ACCESS-PASSPHRASE": self.api_passphrase,
+                    }
+                )
+
+            # Concurrency + pacing gate
+            async with self._req_sem:
+                await self._pace()
+
+                t0 = time.time()
+                try:
+                    async with self.session.request(
+                        method.upper(),
+                        url,
+                        headers=headers,
+                        data=body if data else None,
+                        timeout=aiohttp.ClientTimeout(total=timeout_s),
+                    ) as resp:
+                        txt = await resp.text()
+                        status = resp.status
+                        latency_ms = int((time.time() - t0) * 1000)
+
+                        # HTTP 429 / 5xx => retry
+                        if status == 429:
+                            LOGGER.warning("HTTP 429 %s %s query=%s", method, path, query)
+                            raise _Retryable("HTTP 429 Too Many Requests")
+                        if 500 <= status <= 599:
+                            LOGGER.warning("HTTP %s %s %s query=%s raw=%s", status, method, path, query, txt[:300])
+                            raise _Retryable(f"HTTP {status}")
+
+                        # 4xx (except 429) => no retry (hard error)
+                        if status >= 400:
+                            return {
+                                "ok": False,
+                                "code": str(status),
+                                "msg": "http_error",
+                                "raw": txt,
+                                "_http_status": status,
+                                "_latency_ms": latency_ms,
+                                "_path": path,
+                            }
+
+                        # parse JSON
+                        try:
+                            js = json.loads(txt) if txt else {}
+                        except Exception:
+                            return {
+                                "ok": False,
+                                "code": "NONJSON",
+                                "msg": "json_decode_error",
+                                "raw": txt,
+                                "_http_status": status,
+                                "_latency_ms": latency_ms,
+                                "_path": path,
+                            }
+
+                        code = str(js.get("code", ""))
+                        msg = str(js.get("msg", ""))
+
+                        js["ok"] = (code == "00000")
+                        js["_http_status"] = status
+                        js["_latency_ms"] = latency_ms
+                        js["_path"] = path
+
+                        # Bitget sometimes rate-limits via code/msg even with HTTP 200
+                        if (not js["ok"]) and ("too many" in msg.lower() or "frequency" in msg.lower() or code in {"429"}):
+                            raise _Retryable(f"API rate limited code={code} msg={msg}")
+
+                        return js
+
+                except _Retryable:
+                    raise
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    raise _Retryable(str(e))
+
+        # retry with jitter via retry_async (raises if final fail)
+        async def _wrapped():
+            try:
+                return await _do()
+            except _Retryable as e:
+                # small jitter to de-sync bursts
+                await asyncio.sleep(random.random() * 0.08)
+                raise e
+
+        try:
+            return await retry_async(_wrapped, retries=retries, base_delay=base_delay)
+        except Exception as e:
+            return {
                 "ok": False,
                 "code": "EXC",
                 "msg": str(e),
