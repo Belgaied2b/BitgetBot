@@ -183,7 +183,6 @@ class BitgetClient:
         except Exception:
             mi = 0.0
         if mi <= 0:
-@@ -332,78 +334,117 @@ class BitgetClient:
                 "ok": False,
                 "code": "EXC",
                 "msg": str(e),
