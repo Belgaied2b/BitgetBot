@@ -328,6 +328,30 @@ def _cap_by_atr(sl: float, entry: float, atr: float, side: str) -> Tuple[float, 
 
 
 # =====================================================================
+# Entry context helpers (FVG / OB / LEVEL)
+# =====================================================================
+
+def _ctx_bounds(entry_ctx: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[float], Optional[float], Optional[float]]:
+    """
+    Returns (ctx_type, low, high, level).
+    """
+    if not isinstance(entry_ctx, dict):
+        return None, None, None, None
+    ctx_type = str(entry_ctx.get("type") or "").upper()
+    low = high = level = None
+    try:
+        if entry_ctx.get("low") is not None:
+            low = float(entry_ctx.get("low"))
+        if entry_ctx.get("high") is not None:
+            high = float(entry_ctx.get("high"))
+        if entry_ctx.get("level") is not None:
+            level = float(entry_ctx.get("level"))
+    except Exception:
+        low = high = level = None
+    return ctx_type, low, high, level
+
+
+# =====================================================================
 # Policy (setup/entry_type)
 # =====================================================================
 
@@ -340,7 +364,7 @@ def _parse_policy(s: str) -> List[str]:
     return parts
 
 
-def _sl_policy(setup: Optional[str], entry_type: Optional[str]) -> List[str]:
+def _sl_policy(setup: Optional[str], entry_type: Optional[str], entry_ctx: Optional[Dict[str, Any]] = None) -> List[str]:
     """
     Returns an ordered list of preferred groups: LIQ / SWING / ATR
     """
@@ -348,6 +372,13 @@ def _sl_policy(setup: Optional[str], entry_type: Optional[str]) -> List[str]:
     et = str(entry_type or "").upper()
 
     default_pol = str(SL_POLICY_DEFAULT or "TIGHT").upper().strip()
+
+    ctx_type = str((entry_ctx or {}).get("type") or "").upper()
+    if ctx_type in {"FVG", "OB", "LEVEL"}:
+        base = _parse_policy(SL_POLICY_BOS if "BOS" in su else SL_POLICY_DEFAULT)
+        if not base:
+            base = ["LIQ", "SWING", "ATR"]
+        return ["STRUCT"] + [p for p in base if p != "STRUCT"]
 
     if "BOS" in su:
         return _parse_policy(SL_POLICY_BOS)
@@ -366,6 +397,8 @@ def _sl_policy(setup: Optional[str], entry_type: Optional[str]) -> List[str]:
 
 def _group_of_candidate(key: str) -> str:
     k = str(key or "").upper()
+    if "FVG" in k or "OB" in k or "LEVEL" in k:
+        return "STRUCT"
     if "LIQ" in k:
         return "LIQ"
     if "SWING" in k:
@@ -400,33 +433,6 @@ def _pick_best_in_group(side: str, entry: float, candidates: Dict[str, float], g
             valid.append((k, slf))
 
     if not valid:
-        return None
-
-    if side_u == "LONG":
-        return sorted(valid, key=lambda x: x[1], reverse=True)[0]
-    return sorted(valid, key=lambda x: x[1])[0]
-
-
-def _pick_tightest_any(side: str, entry: float, candidates: Dict[str, float]) -> Tuple[str, float]:
-    """
-    Legacy behavior: choose tightest valid among all candidates.
-    """
-    entry_f = float(entry)
-    side_u = str(side).upper()
-
-    valid: List[Tuple[str, float]] = []
-    for k, sl in candidates.items():
-        if sl is None:
-            continue
-        slf = float(sl)
-        if not np.isfinite(slf):
-            continue
-        if side_u == "LONG" and slf < entry_f:
-            valid.append((k, slf))
-        if side_u == "SHORT" and slf > entry_f:
-            valid.append((k, slf))
-
-    if not valid:
         return ("FALLBACK_PCT", (entry_f * 0.96) if side_u == "LONG" else (entry_f * 1.04))
 
     if side_u == "LONG":
@@ -448,7 +454,7 @@ def _choose_sl(side: str, entry: float, candidates: Dict[str, float], policy: Li
         return float(sl), str(k)
 
     for grp in policy:
-        if grp in ("LIQ", "SWING", "ATR"):
+        if grp in ("STRUCT", "LIQ", "SWING", "ATR"):
             picked = _pick_best_in_group(side, entry, candidates, grp)
             if picked:
                 k, sl = picked
@@ -467,7 +473,8 @@ def _build_long_candidates(
     entry: float,
     tick: float,
     atr_v: float,
-    htf_df: Optional[pd.DataFrame] = None
+    htf_df: Optional[pd.DataFrame] = None,
+    entry_ctx: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
     entry_f = float(entry)
 
@@ -493,6 +500,14 @@ def _build_long_candidates(
     if liq is not None and np.isfinite(liq):
         cands["LIQ"] = float(liq) - liq_buf
 
+    ctx_type, ctx_low, ctx_high, ctx_level = _ctx_bounds(entry_ctx)
+    if ctx_type == "FVG" and ctx_low is not None and np.isfinite(ctx_low):
+        cands["FVG_INV"] = float(ctx_low) - gen_buf
+    if ctx_type == "OB" and ctx_low is not None and np.isfinite(ctx_low):
+        cands["OB_INV"] = float(ctx_low) - gen_buf
+    if ctx_type == "LEVEL" and ctx_level is not None and np.isfinite(ctx_level):
+        cands["LEVEL_INV"] = float(ctx_level) - gen_buf
+
     if htf_df is not None and _ensure_ohlcv(htf_df) and len(htf_df) >= 40:
         swing_htf = _last_swing_low_below(htf_df, entry_f)
         liq_htf = _liq_low_below(htf_df, entry_f)
@@ -513,7 +528,8 @@ def _build_short_candidates(
     entry: float,
     tick: float,
     atr_v: float,
-    htf_df: Optional[pd.DataFrame] = None
+    htf_df: Optional[pd.DataFrame] = None,
+    entry_ctx: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
     entry_f = float(entry)
 
@@ -538,6 +554,14 @@ def _build_short_candidates(
 
     if liq is not None and np.isfinite(liq):
         cands["LIQ"] = float(liq) + liq_buf
+
+    ctx_type, ctx_low, ctx_high, ctx_level = _ctx_bounds(entry_ctx)
+    if ctx_type == "FVG" and ctx_high is not None and np.isfinite(ctx_high):
+        cands["FVG_INV"] = float(ctx_high) + gen_buf
+    if ctx_type == "OB" and ctx_high is not None and np.isfinite(ctx_high):
+        cands["OB_INV"] = float(ctx_high) + gen_buf
+    if ctx_type == "LEVEL" and ctx_level is not None and np.isfinite(ctx_level):
+        cands["LEVEL_INV"] = float(ctx_level) + gen_buf
 
     if htf_df is not None and _ensure_ohlcv(htf_df) and len(htf_df) >= 40:
         swing_htf = _last_swing_high_above(htf_df, entry_f)
@@ -567,6 +591,7 @@ def protective_stop_long(
     setup: Optional[str] = None,
     entry_type: Optional[str] = None,
     htf_df: Optional[pd.DataFrame] = None,
+    entry_ctx: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     """
     Desk Lead protective stop for LONG.
@@ -604,9 +629,9 @@ def protective_stop_long(
             return (float(sl_final), meta) if return_meta else (float(sl_final), {})
 
         atr_v = _get_atr_value(df, length=int(ATR_LEN))
-        policy = _sl_policy(setup, entry_type)
+        policy = _sl_policy(setup, entry_type, entry_ctx)
 
-        cands = _build_long_candidates(df, entry_f, t, atr_v, htf_df=htf_df)
+        cands = _build_long_candidates(df, entry_f, t, atr_v, htf_df=htf_df, entry_ctx=entry_ctx)
         sl_raw, chosen = _choose_sl("LONG", entry_f, cands, policy)
 
         sl_raw2, did_cap = _cap_by_atr(sl_raw, entry_f, atr_v, side="LONG")
@@ -639,6 +664,7 @@ def protective_stop_long(
             "entry_type": str(entry_type or ""),
             "policy": policy,
             "chosen": chosen,
+            "entry_ctx": entry_ctx,
             "entry": entry_f,
             "tick": t,
             "atr": float(atr_v),
@@ -683,6 +709,7 @@ def protective_stop_short(
     setup: Optional[str] = None,
     entry_type: Optional[str] = None,
     htf_df: Optional[pd.DataFrame] = None,
+    entry_ctx: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     """
     Desk Lead protective stop for SHORT.
@@ -720,9 +747,9 @@ def protective_stop_short(
             return (float(sl_final), meta) if return_meta else (float(sl_final), {})
 
         atr_v = _get_atr_value(df, length=int(ATR_LEN))
-        policy = _sl_policy(setup, entry_type)
+        policy = _sl_policy(setup, entry_type, entry_ctx)
 
-        cands = _build_short_candidates(df, entry_f, t, atr_v, htf_df=htf_df)
+        cands = _build_short_candidates(df, entry_f, t, atr_v, htf_df=htf_df, entry_ctx=entry_ctx)
         sl_raw, chosen = _choose_sl("SHORT", entry_f, cands, policy)
 
         sl_raw2, did_cap = _cap_by_atr(sl_raw, entry_f, atr_v, side="SHORT")
@@ -755,6 +782,7 @@ def protective_stop_short(
             "entry_type": str(entry_type or ""),
             "policy": policy,
             "chosen": chosen,
+            "entry_ctx": entry_ctx,
             "entry": entry_f,
             "tick": t,
             "atr": float(atr_v),
