@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -30,6 +31,21 @@ from retry_utils import retry_async
 from settings import PRODUCT_TYPE, BITGET_HTTP_CONCURRENCY, BITGET_MIN_INTERVAL_SEC, BITGET_HTTP_TIMEOUT_S, BITGET_HTTP_RETRIES
 
 LOGGER = logging.getLogger(__name__)
+
+# Klines empty log budget (avoid flooding logs when many symbols return empty)
+_KLINES_EMPTY_LOG_BUDGET = int(float(os.getenv("KLINES_EMPTY_LOG_BUDGET", "12")))
+_KLINES_EMPTY_LOG_COUNT = 0
+
+def _log_klines_empty(symbol: str, interval: str, api: str, code: Any, msg: Any) -> None:
+    """Log only the first N empty-candle events to keep logs readable."""
+    global _KLINES_EMPTY_LOG_COUNT
+    try:
+        if _KLINES_EMPTY_LOG_COUNT >= _KLINES_EMPTY_LOG_BUDGET:
+            return
+        _KLINES_EMPTY_LOG_COUNT += 1
+        LOGGER.warning("⚠️ KLINES EMPTY %s(%s) api=%s code=%s msg=%s", symbol, interval, api, code, msg)
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------
 # Symbol normalization
@@ -444,13 +460,20 @@ class BitgetClient:
         """
         sym = normalize_symbol(symbol)
 
+        cat = str(PRODUCT_TYPE or "USDT-FUTURES").strip().upper()
+        ctype = str(candle_type or "market").strip().lower()
+        if ctype not in {"market", "mark", "index", "premium"}:
+            ctype = "market"
+        lim = int(max(1, min(int(limit), 1000)))
+        
         params: Dict[str, Any] = {
-            "category": str(PRODUCT_TYPE or "USDT-FUTURES"),
+            "category": cat,
             "symbol": sym,
             "interval": interval,          # doc param
-            "type": candle_type,
-            "limit": str(int(limit)),
+            "type": ctype,
+            "limit": str(lim),
         }
+        
         if end_time is not None:
             params["endTime"] = str(int(end_time))
 
@@ -472,105 +495,159 @@ class BitgetClient:
 
         return js
 
+    async def _candles_page_v2(
+    self,
+    *,
+    symbol: str,
+    granularity: str,
+    limit: int,
+    end_time: Optional[int] = None,
+    start_time: Optional[int] = None,
+    kline_type: str = "MARKET",
+) -> Dict[str, Any]:
+    """
+    Futures-native candles endpoint (v2 mix).
+    Docs: GET /api/v2/mix/market/candles (productType+granularity).
+    """
+    sym = normalize_symbol(symbol)
+    pt = str(PRODUCT_TYPE or "USDT-FUTURES").strip()
+    lim = int(max(1, min(int(limit), 1000)))
+
+    params: Dict[str, Any] = {
+        "symbol": sym,
+        "productType": pt,
+        "granularity": granularity,
+        "limit": str(lim),
+    }
+    if start_time is not None:
+        params["startTime"] = str(int(start_time))
+    if end_time is not None:
+        params["endTime"] = str(int(end_time))
+    kt = str(kline_type or "MARKET").strip().upper()
+    if kt in {"MARKET", "MARK", "INDEX"}:
+        params["kLineType"] = kt
+
+    js = await self._request("GET", "/api/v2/mix/market/candles", params=params, auth=False)
+    return js
+
     async def get_klines_df(
-        self,
-        symbol: str,
-        tf: str = "1H",
-        limit: int = 200,
-    ) -> pd.DataFrame:
-        """
-        Candles v3:
-          - can fetch up to 1000 (per docs; limit behavior can vary)
-          - supports endTime for pagination
-        """
-        interval = _normalize_interval(tf)
-        if not interval:
-            LOGGER.error("❌ INVALID INTERVAL %s (symbol=%s)", tf, symbol)
-            return pd.DataFrame()
+    self,
+    symbol: str,
+    tf: str = "1H",
+    limit: int = 200,
+) -> pd.DataFrame:
+    """
+    Fetch candles as a DataFrame.
 
-        want = max(10, int(limit))
-        want = min(want, 1200)  # hard cap to protect memory
+    Primary: v2 mix futures candles (/api/v2/mix/market/candles).
+    Fallback: v3 UTA candles (/api/v3/market/candles) if v2 errors.
 
-        # try single shot first (best for latency)
-        # (docs say up to 1000; but some deployments cap lower; we'll paginate if needed)
-        per_page = min(want, 1000)
+    NOTE: Bitget may return code=00000 with data=[] when no candles exist for the query.
+    """
+    interval = _normalize_interval(tf)
+    if not interval:
+        LOGGER.error("❌ INVALID INTERVAL %s (symbol=%s)", tf, symbol)
+        return pd.DataFrame()
 
-        out: List[List[Any]] = []
-        seen_ts = set()
+    want = max(10, int(limit))
+    want = min(want, 1200)  # hard cap to protect memory
 
-        end_time: Optional[int] = None
-        safety_loops = 0
+    per_page = min(want, 1000)
 
-        while len(out) < want and safety_loops < 10:
-            safety_loops += 1
+    out: List[List[Any]] = []
+    seen_ts = set()
 
-            js = await self._candles_page(
+    end_time: Optional[int] = None
+    safety_loops = 0
+
+    while len(out) < want and safety_loops < 10:
+        safety_loops += 1
+
+        # v2 (mix) first
+        js = await self._candles_page_v2(
+            symbol=symbol,
+            granularity=interval,
+            limit=per_page,
+            end_time=end_time,
+            kline_type="MARKET",
+        )
+
+        api_used = "v2"
+
+        if not isinstance(js, dict):
+            LOGGER.error("❌ NON-DICT RESPONSE candles %s(%s) api=%s → %s", symbol, interval, api_used, js)
+            break
+
+        code = str(js.get("code"))
+        data = js.get("data") or []
+
+        # If v2 errors, try v3 once for this page
+        if code != "00000":
+            js3 = await self._candles_page(
                 symbol=symbol,
                 interval=interval,
-                limit=per_page,
+                limit=min(per_page, 1000),
                 end_time=end_time,
                 candle_type="market",
                 try_granularity_fallback=True,
             )
+            if isinstance(js3, dict) and str(js3.get("code")) == "00000" and (js3.get("data") or []):
+                js = js3
+                api_used = "v3"
+                code = str(js.get("code"))
+                data = js.get("data") or []
 
-            if not isinstance(js, dict):
-                LOGGER.error("❌ NON-DICT RESPONSE candles %s(%s) → %s", symbol, interval, js)
-                break
+        if code != "00000":
+            LOGGER.warning("⚠️ KLINES ERROR %s(%s) api=%s code=%s msg=%s", symbol, interval, api_used, js.get("code"), js.get("msg"))
+            break
 
-            if str(js.get("code")) != "00000" or not js.get("data"):
-                # don't spam logs for normal "no data"
-                LOGGER.warning("⚠️ KLINES ERROR/EMPTY %s(%s) code=%s msg=%s", symbol, interval, js.get("code"), js.get("msg"))
-                break
+        if not isinstance(data, list) or not data:
+            # code=00000 but no data (normal for new/delisted symbols) -> keep logs readable
+            _log_klines_empty(symbol, interval, api_used, js.get("code"), js.get("msg"))
+            break
 
-            data = js.get("data") or []
-            if not isinstance(data, list) or not data:
-                break
-
-            # collect unique candles
-            added = 0
-            for row in data:
-                if not isinstance(row, list) or len(row) < 6:
-                    continue
-                try:
-                    ts = int(float(row[0]))
-                except Exception:
-                    continue
-                if ts in seen_ts:
-                    continue
-                seen_ts.add(ts)
-                out.append(row)
-                added += 1
-
-            if added == 0:
-                break
-
-            # paginate older: endTime = earliest_ts - 1
+        # collect unique candles
+        added = 0
+        for row in data:
+            if not isinstance(row, list) or len(row) < 6:
+                continue
             try:
-                earliest = min(int(float(r[0])) for r in data if isinstance(r, list) and r)
-                end_time = int(earliest) - 1
+                ts = int(float(row[0]))
             except Exception:
-                break
+                continue
+            if ts in seen_ts:
+                continue
+            seen_ts.add(ts)
+            out.append(row)
+            added += 1
 
-            # if the API gives you less than per_page, likely no more history
-            if len(data) < max(10, min(per_page, 100)):
-                # soft break: still parse what we have
-                break
+        if added == 0:
+            break
 
-        # parse to DF
+        # paginate older: endTime = earliest_ts - 1
         try:
-            df = _parse_candles_rows(out)
-            if df.empty:
-                return df
+            earliest = min(int(float(r[0])) for r in data if isinstance(r, list) and r)
+            end_time = int(earliest) - 1
+        except Exception:
+            break
 
-            # keep last 'want'
-            if len(df) > want:
-                df = df.tail(want).reset_index(drop=True)
+        if len(data) < max(10, min(per_page, 100)):
+            break
 
+    # parse to DF
+    try:
+        df = _parse_candles_rows(out)
+        if df.empty:
             return df
 
-        except Exception as exc:
-            LOGGER.exception("❌ PARSE ERROR candles %s(%s): %s", symbol, interval, exc)
-            return pd.DataFrame()
+        if len(df) > want:
+            df = df.tail(want).reset_index(drop=True)
+
+        return df
+
+    except Exception as exc:
+        LOGGER.exception("❌ PARSE ERROR candles %s(%s): %s", symbol, interval, exc)
+        return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------
