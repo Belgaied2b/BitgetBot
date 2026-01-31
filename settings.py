@@ -133,7 +133,7 @@ BITGET_MIX_WS_URL = _get_str("BITGET_MIX_WS_URL", "wss://ws.bitget.com/mix/v1/st
 
 # Product / margin (used by private endpoints / trader)
 # NOTE: keep PRODUCT_TYPE consistent across bitget_client + bitget_trader
-PRODUCT_TYPE = _get_str("PRODUCT_TYPE", "USDT-FUTURES").strip()
+PRODUCT_TYPE = _get_str("PRODUCT_TYPE", "USDT-FUTURES").strip().upper()
 MARGIN_COIN = _get_str("MARGIN_COIN", "USDT").strip()
 
 
