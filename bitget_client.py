@@ -8,6 +8,8 @@
 # ✅ Fix interval case: minutes must be "1m" not "1M"
 # ✅ Stable query ordering (signature-safe)
 # ✅ Contracts cache + normalize symbols
+# ✅ v2 mix candles (futures-native) + v3 fallback
+# ✅ Klines empty log budget (anti-flood)
 # =====================================================================
 
 from __future__ import annotations
@@ -28,28 +30,46 @@ from typing import Any, Dict, Optional, List, Tuple
 import pandas as pd
 
 from retry_utils import retry_async
-from settings import PRODUCT_TYPE, BITGET_HTTP_CONCURRENCY, BITGET_MIN_INTERVAL_SEC, BITGET_HTTP_TIMEOUT_S, BITGET_HTTP_RETRIES
+from settings import (
+    PRODUCT_TYPE,
+    BITGET_BASE_URL,
+    BITGET_HTTP_CONCURRENCY,
+    BITGET_MIN_INTERVAL_SEC,
+    BITGET_HTTP_TIMEOUT_S,
+    BITGET_HTTP_RETRIES,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 # Klines empty log budget (avoid flooding logs when many symbols return empty)
 _KLINES_EMPTY_LOG_BUDGET = int(float(os.getenv("KLINES_EMPTY_LOG_BUDGET", "12")))
+_KLINES_EMPTY_LOG_RESET_SEC = float(os.getenv("KLINES_EMPTY_LOG_RESET_SEC", "120"))
 _KLINES_EMPTY_LOG_COUNT = 0
+_KLINES_EMPTY_LOG_LAST_RESET = 0.0
+
 
 def _log_klines_empty(symbol: str, interval: str, api: str, code: Any, msg: Any) -> None:
-    """Log only the first N empty-candle events to keep logs readable."""
-    global _KLINES_EMPTY_LOG_COUNT
+    """Log only the first N empty-candle events per window to keep logs readable."""
+    global _KLINES_EMPTY_LOG_COUNT, _KLINES_EMPTY_LOG_LAST_RESET
     try:
+        now = time.time()
+        if _KLINES_EMPTY_LOG_LAST_RESET == 0.0 or (now - _KLINES_EMPTY_LOG_LAST_RESET) >= _KLINES_EMPTY_LOG_RESET_SEC:
+            _KLINES_EMPTY_LOG_LAST_RESET = now
+            _KLINES_EMPTY_LOG_COUNT = 0
+
         if _KLINES_EMPTY_LOG_COUNT >= _KLINES_EMPTY_LOG_BUDGET:
             return
+
         _KLINES_EMPTY_LOG_COUNT += 1
         LOGGER.warning("⚠️ KLINES EMPTY %s(%s) api=%s code=%s msg=%s", symbol, interval, api, code, msg)
     except Exception:
         pass
 
+
 # ---------------------------------------------------------------------
 # Symbol normalization
 # ---------------------------------------------------------------------
+
 
 def normalize_symbol(sym: str) -> str:
     """
@@ -70,6 +90,7 @@ def normalize_symbol(sym: str) -> str:
 # Internal retryable exception
 # ---------------------------------------------------------------------
 
+
 class _Retryable(Exception):
     pass
 
@@ -77,6 +98,7 @@ class _Retryable(Exception):
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -98,7 +120,7 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 
 def _normalize_interval(tf: str) -> Optional[str]:
     """
-    Bitget v3 candles expects:
+    Bitget candles expects:
       minutes => "1m","3m","5m","15m","30m"
       hours   => "1H","4H","6H","12H"
       day     => "1D"
@@ -116,9 +138,6 @@ def _normalize_interval(tf: str) -> Optional[str]:
     # ex: "1M" -> "1m"
     if t.endswith("M") and t[:-1].isdigit():
         t = t[:-1] + "m"
-    if t.endswith("m") and t[:-1].isdigit():
-        # ok already
-        pass
 
     valid = {"1m", "3m", "5m", "15m", "30m", "1H", "4H", "6H", "12H", "1D"}
     return t if t in valid else None
@@ -158,8 +177,9 @@ def _parse_candles_rows(data: Any) -> pd.DataFrame:
 # Bitget Client
 # ---------------------------------------------------------------------
 
+
 class BitgetClient:
-    BASE = "https://api.bitget.com"
+    BASE = str(BITGET_BASE_URL or "https://api.bitget.com")
 
     def __init__(self, api_key: str, api_secret: str, passphrase: str):
         self.api_key = api_key
@@ -176,7 +196,6 @@ class BitgetClient:
         self._contracts_info_ts: float = 0.0
 
         # HTTP pacing / concurrency control (institutional hygiene)
-        # NOTE: uses settings BITGET_HTTP_CONCURRENCY + BITGET_MIN_INTERVAL_SEC
         self._req_sem = asyncio.Semaphore(int(max(1, BITGET_HTTP_CONCURRENCY)))
         self._pace_lock = asyncio.Lock()
         self._min_interval = float(max(0.0, BITGET_MIN_INTERVAL_SEC))
@@ -334,13 +353,11 @@ class BitgetClient:
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     raise _Retryable(str(e))
 
-        # retry with jitter via retry_async (raises if final fail)
         async def _wrapped():
             try:
                 return await _do()
             except _Retryable as e:
-                # small jitter to de-sync bursts
-                await asyncio.sleep(random.random() * 0.08)
+                await asyncio.sleep(random.random() * 0.08)  # jitter
                 raise e
 
         try:
@@ -441,7 +458,7 @@ class BitgetClient:
             return info
 
     # =================================================================
-    # CANDLES (v3) — supports pagination via endTime
+    # CANDLES (v3) + v2 mix (preferred)
     # =================================================================
 
     async def _candles_page(
@@ -465,7 +482,7 @@ class BitgetClient:
         if ctype not in {"market", "mark", "index", "premium"}:
             ctype = "market"
         lim = int(max(1, min(int(limit), 1000)))
-        
+
         params: Dict[str, Any] = {
             "category": cat,
             "symbol": sym,
@@ -473,7 +490,6 @@ class BitgetClient:
             "type": ctype,
             "limit": str(lim),
         }
-        
         if end_time is not None:
             params["endTime"] = str(int(end_time))
 
@@ -483,170 +499,195 @@ class BitgetClient:
         if try_granularity_fallback and (not js.get("ok")):
             msg = str(js.get("msg") or "")
             code = str(js.get("code") or "")
-            # generic parameter error heuristics
             if ("parameter" in msg.lower()) or ("param" in msg.lower()) or code in {"400", "40000", "60006"}:
                 params2 = dict(params)
                 params2.pop("interval", None)
-                params2["granularity"] = interval  # example param
+                params2["granularity"] = interval
                 js2 = await self._request("GET", "/api/v3/market/candles", params=params2, auth=False)
-                # if better, use it
                 if js2.get("ok") or js2.get("data"):
                     js = js2
 
         return js
-        
-        async def _candles_page_v2(
-            self,
-            *,
-            symbol: str,
-            granularity: str,
-            limit: int,
-            end_time: Optional[int] = None,
-            start_time: Optional[int] = None,
-            kline_type: str = "MARKET",
-        ) -> Dict[str, Any]:
-            """
-            Futures-native candles endpoint (v2 mix).
-            Docs: GET /api/v2/mix/market/candles (productType+granularity).
-            """
-            sym = normalize_symbol(symbol)
-            pt = str(PRODUCT_TYPE or "USDT-FUTURES").strip()
-            lim = int(max(1, min(int(limit), 1000)))
-            
+
+    async def _candles_page_v2(
+        self,
+        *,
+        symbol: str,
+        granularity: str,
+        limit: int,
+        end_time: Optional[int] = None,
+        start_time: Optional[int] = None,
+        kline_type: str = "MARKET",
+    ) -> Dict[str, Any]:
+        """
+        Futures-native candles endpoint (v2 mix).
+
+        Endpoint:
+          GET /api/v2/mix/market/candles
+
+        Notes:
+        - Bitget may return code=00000 with data=[] when no data exists.
+        - productType casing can vary; we attempt PRODUCT_TYPE as-is and a lowercase fallback on param errors.
+        """
+        sym = normalize_symbol(symbol)
+        lim = int(max(1, min(int(limit), 1000)))
+        gran = str(granularity or "").strip()
+        if not gran:
+            return {"ok": False, "code": "BAD_PARAM", "msg": "missing_granularity", "data": []}
+
+        def _mk_params(pt: str) -> Dict[str, Any]:
             params: Dict[str, Any] = {
                 "symbol": sym,
-                "productType": pt,
-                "granularity": granularity,
+                "productType": str(pt or "USDT-FUTURES").strip(),
+                "granularity": gran,
                 "limit": str(lim),
             }
             if start_time is not None:
                 params["startTime"] = str(int(start_time))
             if end_time is not None:
                 params["endTime"] = str(int(end_time))
-                kt = str(kline_type or "MARKET").strip().upper()
-                if kt in {"MARKET", "MARK", "INDEX"}:
-                    params["kLineType"] = kt
-                    
-                js = await self._request("GET", "/api/v2/mix/market/candles", params=params, auth=False)
-                return js
-                
-                async def get_klines_df(
-                    self,
-                    symbol: str,
-                    tf: str = "1H",
-                    limit: int = 200,
-                ) -> pd.DataFrame:
-                    """
-                    Fetch candles as a DataFrame.
-                    Primary: v2 mix futures candles (/api/v2/mix/market/candles).
-                    Fallback: v3 UTA candles (/api/v3/market/candles) if v2 errors.
-                    
-                    NOTE: Bitget may return code=00000 with data=[] when no candles exist for the query.
-                    """
-                    interval = _normalize_interval(tf)
-                    if not interval:
-                        LOGGER.error("❌ INVALID INTERVAL %s (symbol=%s)", tf, symbol)
-                        return pd.DataFrame()
-                        
-                    want = max(10, int(limit))
-                    want = min(want, 1200)  # hard cap to protect memory
-                    
-                    per_page = min(want, 1000)
-                    
-                    out: List[List[Any]] = []
-                    seen_ts = set()
-                    
-                    end_time: Optional[int] = None
-                    safety_loops = 0
-                    
-                    while len(out) < want and safety_loops < 10:
-                        safety_loops += 1
-                        
-                    # v2 (mix) first
-                    js = await self._candles_page_v2(
-                        symbol=symbol,
-                        granularity=interval,
-                        limit=per_page,
-                        end_time=end_time,
-                        kline_type="MARKET",
-                    )
-            
-                    api_used = "v2"
 
-                    if not isinstance(js, dict):
-                        LOGGER.error("❌ NON-DICT RESPONSE candles %s(%s) api=%s → %s", symbol, interval, api_used, js)
-                        break
+            kt = str(kline_type or "MARKET").strip().upper()
+            if kt in {"MARKET", "MARK", "INDEX"}:
+                params["kLineType"] = kt
+            return params
 
+        pt_primary = str(PRODUCT_TYPE or "USDT-FUTURES").strip()
+        js = await self._request("GET", "/api/v2/mix/market/candles", params=_mk_params(pt_primary), auth=False)
+
+        # Retry once with lowercase productType if it looks like a parameter error
+        if isinstance(js, dict) and str(js.get("code")) != "00000":
+            msg = str(js.get("msg") or "").lower()
+            if ("parameter" in msg or "param" in msg or "producttype" in msg) and pt_primary.lower() != pt_primary:
+                js2 = await self._request("GET", "/api/v2/mix/market/candles", params=_mk_params(pt_primary.lower()), auth=False)
+                if isinstance(js2, dict) and (str(js2.get("code")) == "00000" or js2.get("data")):
+                    js = js2
+
+        return js
+
+    async def get_klines_df(
+        self,
+        symbol: str,
+        tf: str = "1H",
+        limit: int = 200,
+    ) -> pd.DataFrame:
+        """
+        Fetch candles as a DataFrame.
+
+        Primary (preferred for futures): v2 mix endpoint
+          GET /api/v2/mix/market/candles
+
+        Fallback: v3 UTA endpoint
+          GET /api/v3/market/candles
+
+        Important:
+        - Bitget can return code=00000 with data=[] (valid request but no candles).
+          We treat that as empty and skip, without spamming logs.
+        """
+        interval = _normalize_interval(tf)
+        if not interval:
+            LOGGER.error("❌ INVALID INTERVAL %s (symbol=%s)", tf, symbol)
+            return pd.DataFrame()
+
+        want = max(10, int(limit))
+        want = min(want, 1200)
+
+        per_page = min(want, 1000)
+
+        out: List[List[Any]] = []
+        seen_ts = set()
+
+        end_time: Optional[int] = None
+        safety_loops = 0
+
+        while len(out) < want and safety_loops < 10:
+            safety_loops += 1
+
+            js = await self._candles_page_v2(
+                symbol=symbol,
+                granularity=interval,
+                limit=per_page,
+                end_time=end_time,
+                kline_type="MARKET",
+            )
+            api_used = "v2"
+
+            if not isinstance(js, dict):
+                LOGGER.error("❌ NON-DICT RESPONSE candles %s(%s) api=%s → %s", symbol, interval, api_used, js)
+                break
+
+            code = str(js.get("code"))
+            data = js.get("data") or []
+
+            if code != "00000":
+                js3 = await self._candles_page(
+                    symbol=symbol,
+                    interval=interval,
+                    limit=per_page,
+                    end_time=end_time,
+                    candle_type="market",
+                    try_granularity_fallback=True,
+                )
+                if isinstance(js3, dict) and str(js3.get("code")) == "00000" and (js3.get("data") or []):
+                    js = js3
+                    api_used = "v3"
                     code = str(js.get("code"))
                     data = js.get("data") or []
 
-                    # If v2 errors, try v3 once for this page
-                    if code != "00000":
-                        js3 = await self._candles_page(
-                            symbol=symbol,
-                            interval=interval,
-                            limit=min(per_page, 1000),
-                            end_time=end_time,
-                            candle_type="market",
-                            try_granularity_fallback=True,
-                        )
-                        if isinstance(js3, dict) and str(js3.get("code")) == "00000" and (js3.get("data") or []):
-                            js = js3
-                            api_used = "v3"
-                            code = str(js.get("code"))
-                            data = js.get("data") or []
+            if code != "00000":
+                LOGGER.warning(
+                    "⚠️ KLINES ERROR %s(%s) api=%s code=%s msg=%s",
+                    symbol,
+                    interval,
+                    api_used,
+                    js.get("code"),
+                    js.get("msg"),
+                )
+                break
 
-                    if code != "00000":
-                        LOGGER.warning("⚠️ KLINES ERROR %s(%s) api=%s code=%s msg=%s", symbol, interval, api_used, js.get("code"), js.get("msg"))
-                        break
+            if not isinstance(data, list) or not data:
+                _log_klines_empty(symbol, interval, api_used, js.get("code"), js.get("msg"))
+                break
 
-                    if not isinstance(data, list) or not data:
-                        # code=00000 but no data (normal for new/delisted symbols) -> keep logs readable
-                        _log_klines_empty(symbol, interval, api_used, js.get("code"), js.get("msg"))
-                        break
-
-                    # collect unique candles
-                    added = 0
-                    for row in data:
-                        if not isinstance(row, list) or len(row) < 6:
-                            continue
-                        try:
-                            ts = int(float(row[0]))
-                        except Exception:
-                            continue
-                        if ts in seen_ts:
-                            continue
-                        seen_ts.add(ts)
-                        out.append(row)
-                        added += 1
-
-                    if added == 0:
-                        break
-
-                    # paginate older: endTime = earliest_ts - 1
-                    try:
-                        earliest = min(int(float(r[0])) for r in data if isinstance(r, list) and r)
-                        end_time = int(earliest) - 1
-                    except Exception:
-                        break
-
-                    if len(data) < max(10, min(per_page, 100)):
-                        break
-
-                # parse to DF
+            added = 0
+            for row in data:
+                if not isinstance(row, list) or len(row) < 6:
+                    continue
                 try:
-                    df = _parse_candles_rows(out)
-                    if df.empty:
-                        return df
+                    ts = int(float(row[0]))
+                except Exception:
+                    continue
+                if ts in seen_ts:
+                    continue
+                seen_ts.add(ts)
+                out.append(row)
+                added += 1
 
-                    if len(df) > want:
-                        df = df.tail(want).reset_index(drop=True)
+            if added == 0:
+                break
 
-                    return df
+            try:
+                earliest = min(int(float(r[0])) for r in data if isinstance(r, list) and r)
+                end_time = int(earliest) - 1
+            except Exception:
+                break
 
-                except Exception as exc:
-                    LOGGER.exception("❌ PARSE ERROR candles %s(%s): %s", symbol, interval, exc)
-                    return pd.DataFrame()
+            if len(data) < max(10, min(per_page, 100)):
+                break
+
+        try:
+            df = _parse_candles_rows(out)
+            if df.empty:
+                return df
+
+            if len(df) > want:
+                df = df.tail(want).reset_index(drop=True)
+
+            return df
+
+        except Exception as exc:
+            LOGGER.exception("❌ PARSE ERROR candles %s(%s): %s", symbol, interval, exc)
+            return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------
