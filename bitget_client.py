@@ -494,160 +494,159 @@ class BitgetClient:
                     js = js2
 
         return js
+        
+        async def _candles_page_v2(
+            self,
+            *,
+            symbol: str,
+            granularity: str,
+            limit: int,
+            end_time: Optional[int] = None,
+            start_time: Optional[int] = None,
+            kline_type: str = "MARKET",
+        ) -> Dict[str, Any]:
+            """
+            Futures-native candles endpoint (v2 mix).
+            Docs: GET /api/v2/mix/market/candles (productType+granularity).
+            """
+            sym = normalize_symbol(symbol)
+            pt = str(PRODUCT_TYPE or "USDT-FUTURES").strip()
+            lim = int(max(1, min(int(limit), 1000)))
+            
+            params: Dict[str, Any] = {
+                "symbol": sym,
+                "productType": pt,
+                "granularity": granularity,
+                "limit": str(lim),
+            }
+            if start_time is not None:
+                params["startTime"] = str(int(start_time))
+            if end_time is not None:
+                params["endTime"] = str(int(end_time))
+                kt = str(kline_type or "MARKET").strip().upper()
+                if kt in {"MARKET", "MARK", "INDEX"}:
+                    params["kLineType"] = kt
+                    
+                js = await self._request("GET", "/api/v2/mix/market/candles", params=params, auth=False)
+                return js
+                
+                async def get_klines_df(
+                    self,
+                    symbol: str,
+                    tf: str = "1H",
+                    limit: int = 200,
+                ) -> pd.DataFrame:
+                    """
+                    Fetch candles as a DataFrame.
+                    Primary: v2 mix futures candles (/api/v2/mix/market/candles).
+                    Fallback: v3 UTA candles (/api/v3/market/candles) if v2 errors.
+                    
+                    NOTE: Bitget may return code=00000 with data=[] when no candles exist for the query.
+                    """
+                    interval = _normalize_interval(tf)
+                    if not interval:
+                        LOGGER.error("❌ INVALID INTERVAL %s (symbol=%s)", tf, symbol)
+                        return pd.DataFrame()
+                        
+                    want = max(10, int(limit))
+                    want = min(want, 1200)  # hard cap to protect memory
+                    
+                    per_page = min(want, 1000)
+                    
+                    out: List[List[Any]] = []
+                    seen_ts = set()
+                    
+                    end_time: Optional[int] = None
+                    safety_loops = 0
+                    
+                    while len(out) < want and safety_loops < 10:
+                        safety_loops += 1
+                        
+                    # v2 (mix) first
+                    js = await self._candles_page_v2(
+                        symbol=symbol,
+                        granularity=interval,
+                        limit=per_page,
+                        end_time=end_time,
+                        kline_type="MARKET",
+                    )
+            
+                    api_used = "v2"
 
-    async def _candles_page_v2(
-    self,
-    *,
-    symbol: str,
-    granularity: str,
-    limit: int,
-    end_time: Optional[int] = None,
-    start_time: Optional[int] = None,
-    kline_type: str = "MARKET",
-) -> Dict[str, Any]:
-    """
-    Futures-native candles endpoint (v2 mix).
-    Docs: GET /api/v2/mix/market/candles (productType+granularity).
-    """
-    sym = normalize_symbol(symbol)
-    pt = str(PRODUCT_TYPE or "USDT-FUTURES").strip()
-    lim = int(max(1, min(int(limit), 1000)))
+                    if not isinstance(js, dict):
+                        LOGGER.error("❌ NON-DICT RESPONSE candles %s(%s) api=%s → %s", symbol, interval, api_used, js)
+                        break
 
-    params: Dict[str, Any] = {
-        "symbol": sym,
-        "productType": pt,
-        "granularity": granularity,
-        "limit": str(lim),
-    }
-    if start_time is not None:
-        params["startTime"] = str(int(start_time))
-    if end_time is not None:
-        params["endTime"] = str(int(end_time))
-    kt = str(kline_type or "MARKET").strip().upper()
-    if kt in {"MARKET", "MARK", "INDEX"}:
-        params["kLineType"] = kt
+                    code = str(js.get("code"))
+                    data = js.get("data") or []
 
-    js = await self._request("GET", "/api/v2/mix/market/candles", params=params, auth=False)
-    return js
+                    # If v2 errors, try v3 once for this page
+                    if code != "00000":
+                        js3 = await self._candles_page(
+                            symbol=symbol,
+                            interval=interval,
+                            limit=min(per_page, 1000),
+                            end_time=end_time,
+                            candle_type="market",
+                            try_granularity_fallback=True,
+                        )
+                        if isinstance(js3, dict) and str(js3.get("code")) == "00000" and (js3.get("data") or []):
+                            js = js3
+                            api_used = "v3"
+                            code = str(js.get("code"))
+                            data = js.get("data") or []
 
-    async def get_klines_df(
-    self,
-    symbol: str,
-    tf: str = "1H",
-    limit: int = 200,
-) -> pd.DataFrame:
-    """
-    Fetch candles as a DataFrame.
+                    if code != "00000":
+                        LOGGER.warning("⚠️ KLINES ERROR %s(%s) api=%s code=%s msg=%s", symbol, interval, api_used, js.get("code"), js.get("msg"))
+                        break
 
-    Primary: v2 mix futures candles (/api/v2/mix/market/candles).
-    Fallback: v3 UTA candles (/api/v3/market/candles) if v2 errors.
+                    if not isinstance(data, list) or not data:
+                        # code=00000 but no data (normal for new/delisted symbols) -> keep logs readable
+                        _log_klines_empty(symbol, interval, api_used, js.get("code"), js.get("msg"))
+                        break
 
-    NOTE: Bitget may return code=00000 with data=[] when no candles exist for the query.
-    """
-    interval = _normalize_interval(tf)
-    if not interval:
-        LOGGER.error("❌ INVALID INTERVAL %s (symbol=%s)", tf, symbol)
-        return pd.DataFrame()
+                    # collect unique candles
+                    added = 0
+                    for row in data:
+                        if not isinstance(row, list) or len(row) < 6:
+                            continue
+                        try:
+                            ts = int(float(row[0]))
+                        except Exception:
+                            continue
+                        if ts in seen_ts:
+                            continue
+                        seen_ts.add(ts)
+                        out.append(row)
+                        added += 1
 
-    want = max(10, int(limit))
-    want = min(want, 1200)  # hard cap to protect memory
+                    if added == 0:
+                        break
 
-    per_page = min(want, 1000)
+                    # paginate older: endTime = earliest_ts - 1
+                    try:
+                        earliest = min(int(float(r[0])) for r in data if isinstance(r, list) and r)
+                        end_time = int(earliest) - 1
+                    except Exception:
+                        break
 
-    out: List[List[Any]] = []
-    seen_ts = set()
+                    if len(data) < max(10, min(per_page, 100)):
+                        break
 
-    end_time: Optional[int] = None
-    safety_loops = 0
+                # parse to DF
+                try:
+                    df = _parse_candles_rows(out)
+                    if df.empty:
+                        return df
 
-    while len(out) < want and safety_loops < 10:
-        safety_loops += 1
+                    if len(df) > want:
+                        df = df.tail(want).reset_index(drop=True)
 
-        # v2 (mix) first
-        js = await self._candles_page_v2(
-            symbol=symbol,
-            granularity=interval,
-            limit=per_page,
-            end_time=end_time,
-            kline_type="MARKET",
-        )
+                    return df
 
-        api_used = "v2"
-
-        if not isinstance(js, dict):
-            LOGGER.error("❌ NON-DICT RESPONSE candles %s(%s) api=%s → %s", symbol, interval, api_used, js)
-            break
-
-        code = str(js.get("code"))
-        data = js.get("data") or []
-
-        # If v2 errors, try v3 once for this page
-        if code != "00000":
-            js3 = await self._candles_page(
-                symbol=symbol,
-                interval=interval,
-                limit=min(per_page, 1000),
-                end_time=end_time,
-                candle_type="market",
-                try_granularity_fallback=True,
-            )
-            if isinstance(js3, dict) and str(js3.get("code")) == "00000" and (js3.get("data") or []):
-                js = js3
-                api_used = "v3"
-                code = str(js.get("code"))
-                data = js.get("data") or []
-
-        if code != "00000":
-            LOGGER.warning("⚠️ KLINES ERROR %s(%s) api=%s code=%s msg=%s", symbol, interval, api_used, js.get("code"), js.get("msg"))
-            break
-
-        if not isinstance(data, list) or not data:
-            # code=00000 but no data (normal for new/delisted symbols) -> keep logs readable
-            _log_klines_empty(symbol, interval, api_used, js.get("code"), js.get("msg"))
-            break
-
-        # collect unique candles
-        added = 0
-        for row in data:
-            if not isinstance(row, list) or len(row) < 6:
-                continue
-            try:
-                ts = int(float(row[0]))
-            except Exception:
-                continue
-            if ts in seen_ts:
-                continue
-            seen_ts.add(ts)
-            out.append(row)
-            added += 1
-
-        if added == 0:
-            break
-
-        # paginate older: endTime = earliest_ts - 1
-        try:
-            earliest = min(int(float(r[0])) for r in data if isinstance(r, list) and r)
-            end_time = int(earliest) - 1
-        except Exception:
-            break
-
-        if len(data) < max(10, min(per_page, 100)):
-            break
-
-    # parse to DF
-    try:
-        df = _parse_candles_rows(out)
-        if df.empty:
-            return df
-
-        if len(df) > want:
-            df = df.tail(want).reset_index(drop=True)
-
-        return df
-
-    except Exception as exc:
-        LOGGER.exception("❌ PARSE ERROR candles %s(%s): %s", symbol, interval, exc)
-        return pd.DataFrame()
+                except Exception as exc:
+                    LOGGER.exception("❌ PARSE ERROR candles %s(%s): %s", symbol, interval, exc)
+                    return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------
