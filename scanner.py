@@ -61,7 +61,13 @@ from settings import (
     STOP_TRIGGER_TYPE_SL,
     BE_FEE_BUFFER_TICKS,
     POSITION_MODE,
+    PRODUCT_TYPE,
+    UNIVERSE_MODE,
+    UNIVERSE_MIN_USDT_VOLUME,
+    UNIVERSE_INCLUDE_DELIVERY,
+    UNIVERSE_TTL_S,
 )
+
 
 from bitget_client import get_client
 from bitget_trader import BitgetTrader
@@ -131,19 +137,15 @@ RUNAWAY_ATR_MULT_PULLBACK = float(os.getenv("RUNAWAY_ATR_MULT_PULLBACK", "1.5"))
 
 
 async def _ws_hub_autostart(client: "BitgetClient") -> None:
-    """Start the institutional WS hub once, with a broad symbol universe."""
     if not INST_WS_AUTOSTART or INST_WS_HUB is None:
         return
     try:
-        # Prefer the same contract list the scanner uses, so WS coverage matches scan universe.
-        symbols = await client.get_contracts_list()
-        symbols = [s for s in (symbols or []) if isinstance(s, str) and s.endswith("USDT")]
+        symbols, meta = await get_scan_universe(client, int(TOP_N_SYMBOLS))
         if not symbols:
-            LOGGER.warning("[WS_HUB_AUTO] no_symbols -> skip")
+            LOGGER.warning("[WS_HUB_AUTO] no_symbols meta=%s", meta)
             return
-
         await INST_WS_HUB.start(symbols)
-        LOGGER.info("[WS_HUB_AUTO] start_called symbols=%s running=%s status=%s", len(symbols), bool(INST_WS_HUB.is_running()), getattr(INST_WS_HUB, "status", lambda: None)())
+        LOGGER.info("[WS_HUB_AUTO] started symbols=%s meta=%s", len(symbols), meta)
     except Exception as e:
         LOGGER.error("[WS_HUB_AUTO] start_error=%s", e)
         try:
@@ -165,6 +167,77 @@ def _ws_hub_health_log(scan_idx: int) -> None:
         LOGGER.info("[WS_HUB_HEALTH] scan=%s running=%s status=%s", int(scan_idx), bool(INST_WS_HUB.is_running()), st)
     except Exception as e:
         LOGGER.warning("[WS_HUB_HEALTH] scan=%s status_error=%s", int(scan_idx), e)
+
+# =====================================================================
+# Universe selection (liquidity-first)
+# =====================================================================
+
+_UNIVERSE_LOCK = asyncio.Lock()
+_UNIVERSE_CACHE: Dict[str, Any] = {"ts": 0.0, "symbols": [], "meta": {}}
+
+
+def _is_delivery_symbol(sym: str) -> bool:
+    return "_" in str(sym)
+
+
+def _norm_sym_for_scan(sym: str) -> str:
+    return str(sym).upper().replace("-", "").replace("_", "")
+
+
+def _ticker_usdt_volume(t: Dict[str, Any]) -> float:
+    v = t.get("usdtVolume")
+    if v is None:
+        v = t.get("quoteVolume")
+    return _safe_float(v, 0.0)
+
+
+async def get_scan_universe(client, n: int) -> Tuple[List[str], Dict[str, Any]]:
+    now = time.time()
+    async with _UNIVERSE_LOCK:
+        if _UNIVERSE_CACHE.get("symbols") and (now - float(_UNIVERSE_CACHE.get("ts") or 0.0)) < float(UNIVERSE_TTL_S):
+            return list(_UNIVERSE_CACHE["symbols"]), dict(_UNIVERSE_CACHE.get("meta") or {})
+
+    meta: Dict[str, Any] = {"mode": str(UNIVERSE_MODE)}
+    symbols: List[str] = []
+
+    if str(UNIVERSE_MODE).upper() == "CONTRACTS_ALPHA":
+        syms = await client.get_contracts_list()
+        symbols = [str(s).upper() for s in (syms or []) if isinstance(s, str)]
+        symbols = sorted(set(symbols))[: max(0, int(n))]
+        meta["source"] = "contracts"
+    else:
+        tickers = await client.get_all_tickers(product_type=str(PRODUCT_TYPE))
+        rows: Dict[str, float] = {}
+        for t in (tickers or []):
+            sym_raw = t.get("symbol")
+            if not sym_raw:
+                continue
+            if (not UNIVERSE_INCLUDE_DELIVERY) and _is_delivery_symbol(sym_raw):
+                continue
+            sym = _norm_sym_for_scan(sym_raw)
+            if str(PRODUCT_TYPE).upper().startswith("USDT") and (not sym.endswith("USDT")):
+                continue
+            vol = float(_ticker_usdt_volume(t))
+            if float(UNIVERSE_MIN_USDT_VOLUME) > 0 and vol < float(UNIVERSE_MIN_USDT_VOLUME):
+                continue
+            rows[sym] = max(rows.get(sym, 0.0), vol)
+        symbols = [s for s, _ in sorted(rows.items(), key=lambda kv: kv[1], reverse=True)[: max(0, int(n))]]
+        meta["source"] = "tickers"
+        meta["kept"] = int(len(symbols))
+
+        if not symbols:
+            syms = await client.get_contracts_list()
+            symbols = [str(s).upper() for s in (syms or []) if isinstance(s, str)]
+            symbols = sorted(set(symbols))[: max(0, int(n))]
+            meta["fallback"] = "contracts"
+
+    async with _UNIVERSE_LOCK:
+        _UNIVERSE_CACHE["ts"] = time.time()
+        _UNIVERSE_CACHE["symbols"] = list(symbols)
+        _UNIVERSE_CACHE["meta"] = dict(meta)
+
+    return symbols, meta
+
 # ✅ Runaway policy flags
 RUNAWAY_ENABLE = str(os.getenv("RUNAWAY_ENABLE", "1")).strip() == "1"
 
@@ -2218,13 +2291,12 @@ async def scan_once(client, trader: BitgetTrader) -> None:
     stats = ScanStats()
     t_scan0 = time.time()
 
-    symbols = await client.get_contracts_list()
+    symbols, uni_meta = await get_scan_universe(client, int(TOP_N_SYMBOLS))
     if not symbols:
-        logger.warning("⚠️ get_contracts_list() vide")
+        logger.warning("⚠️ universe vide (mode=%s) meta=%s", UNIVERSE_MODE, uni_meta)
         return
 
-    symbols = sorted(set(map(str.upper, symbols)))[: int(TOP_N_SYMBOLS)]
-    logger.info("📊 Scan %d symboles (TOP_N_SYMBOLS=%s)", len(symbols), TOP_N_SYMBOLS)
+    logger.info("📊 Scan %d symboles | mode=%s | meta=%s", len(symbols), UNIVERSE_MODE, uni_meta)
 
     analyze_sem = asyncio.Semaphore(int(MAX_CONCURRENT_ANALYZE))
 
