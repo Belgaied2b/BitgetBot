@@ -322,6 +322,15 @@ BITGET_SYMBOLS_TTL_S = _get_int(
     max_v=24 * 3600,
 )
 
+
+# Tickers (all) cache TTL (Bitget)
+BITGET_TICKERS_TTL_S = _get_int(
+    "BITGET_TICKERS_TTL_S",
+    12,
+    min_v=1,
+    max_v=300,
+)
+
 # ---- Deprecated aliases (do not remove yet; other modules may import them) ----
 BINANCE_MIN_INTERVAL_S = BITGET_MIN_INTERVAL_SEC
 BINANCE_HTTP_TIMEOUT_S = BITGET_HTTP_TIMEOUT_S
@@ -390,6 +399,19 @@ AUTO_ORDER_MIN_PRIORITY = _get_priority("AUTO_ORDER_MIN_PRIORITY", "C")
 # Pass2 (= datafeeds/inst lourd) seulement si pre_priority >= PASS2_ONLY_FOR_PRIORITY
 PASS2_ONLY_FOR_PRIORITY = _get_priority("PASS2_ONLY_FOR_PRIORITY", "C")
 
+
+
+# =====================================================================
+# UNIVERSE SELECTION (symbols to scan)
+# =====================================================================
+
+UNIVERSE_MODE = _get_str("UNIVERSE_MODE", "TICKERS_USDTVOLUME").strip().upper()
+if UNIVERSE_MODE not in ("TICKERS_USDTVOLUME", "CONTRACTS_ALPHA"):
+    UNIVERSE_MODE = "TICKERS_USDTVOLUME"
+
+UNIVERSE_MIN_USDT_VOLUME = _get_float("UNIVERSE_MIN_USDT_VOLUME", 5_000_000.0, min_v=0.0, max_v=1e15)
+UNIVERSE_INCLUDE_DELIVERY = _get_bool("UNIVERSE_INCLUDE_DELIVERY", False)
+UNIVERSE_TTL_S = _get_int("UNIVERSE_TTL_S", 600, min_v=30, max_v=24 * 3600)
 
 # =====================================================================
 # SIGNAL TTL / RUNAWAY / PENDING POLICY
