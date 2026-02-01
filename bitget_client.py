@@ -20,6 +20,7 @@ import hmac
 import json
 import logging
 import random
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List, Tuple
@@ -27,8 +28,7 @@ from typing import Any, Dict, Optional, List, Tuple
 import pandas as pd
 
 from retry_utils import retry_async
-from settings import PRODUCT_TYPE
-
+from settings import PRODUCT_TYPE, BITGET_BASE_URL, BITGET_SYMBOLS_TTL_S, BITGET_TICKERS_TTL_S, BITGET_HTTP_TIMEOUT_S, BITGET_HTTP_RETRIES
 LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------
@@ -150,12 +150,19 @@ class BitgetClient:
         self.api_secret = (api_secret or "").encode()
         self.api_passphrase = passphrase or ""
 
+        self.base_url = str((base_url or BITGET_BASE_URL or self.BASE)).rstrip("/")
+
         self.session: Optional[aiohttp.ClientSession] = None
 
         # contracts cache
         self._contracts_cache: Optional[List[str]] = None
         self._contracts_ts: float = 0.0
         self._contracts_lock = asyncio.Lock()
+
+        # tickers cache
+        self._tickers_cache: Optional[List[Dict[str, Any]]] = None
+        self._tickers_ts: float = 0.0
+        self._tickers_lock = asyncio.Lock()
 
     async def close(self) -> None:
         if self.session and not self.session.closed:
@@ -201,7 +208,7 @@ class BitgetClient:
             items = sorted(params.items(), key=lambda kv: kv[0])
             query = "?" + "&".join(f"{k}={v}" for k, v in items)
 
-        url = self.BASE + path + query
+        url = self.base_url + path + query
         body = json.dumps(data, separators=(",", ":")) if data else ""
 
         async def _do() -> Dict[str, Any]:
@@ -319,12 +326,12 @@ class BitgetClient:
         Cached for 5 minutes.
         """
         now = time.time()
-        if self._contracts_cache and (now - self._contracts_ts) < 300:
+        if self._contracts_cache and (now - self._contracts_ts) < float(BITGET_SYMBOLS_TTL_S):
             return self._contracts_cache
 
         async with self._contracts_lock:
             now = time.time()
-            if self._contracts_cache and (now - self._contracts_ts) < 300:
+            if self._contracts_cache and (now - self._contracts_ts) < float(BITGET_SYMBOLS_TTL_S):
                 return self._contracts_cache
 
             params = {"productType": str(PRODUCT_TYPE or "USDT-FUTURES")}
@@ -354,6 +361,41 @@ class BitgetClient:
             self._contracts_cache = symbols
             self._contracts_ts = time.time()
             return symbols
+
+
+    # =================================================================
+    # TICKERS (v2) — Universe selection helper
+    # =================================================================
+
+    async def get_all_tickers(self, *, product_type: Optional[str] = None, force: bool = False) -> List[Dict[str, Any]]:
+        pt = str(product_type or PRODUCT_TYPE or "USDT-FUTURES").strip()
+        ttl_s = float(BITGET_TICKERS_TTL_S)
+        now = time.time()
+        if (not force) and self._tickers_cache and (now - self._tickers_ts) < ttl_s:
+            return self._tickers_cache
+
+        async with self._tickers_lock:
+            now = time.time()
+            if (not force) and self._tickers_cache and (now - self._tickers_ts) < ttl_s:
+                return self._tickers_cache
+
+            js = await self._request(
+                "GET",
+                "/api/v2/mix/market/tickers",
+                params={"productType": pt},
+                auth=False,
+                timeout_s=int(BITGET_HTTP_TIMEOUT_S),
+                retries=int(max(1, BITGET_HTTP_RETRIES)),
+                base_delay=0.25,
+            )
+
+            data = js.get("data") if isinstance(js, dict) else None
+            if not (isinstance(js, dict) and js.get("ok") and isinstance(data, list)):
+                return []
+
+            self._tickers_cache = [t for t in data if isinstance(t, dict)]
+            self._tickers_ts = time.time()
+            return self._tickers_cache
 
     # =================================================================
     # CANDLES (v3) — supports pagination via endTime
